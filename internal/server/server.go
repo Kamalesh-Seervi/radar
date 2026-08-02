@@ -235,6 +235,12 @@ func New(cfg Config) *Server {
 		if s.aiRuns != nil {
 			s.aiRuns.OnContextSwitch()
 		}
+		// Runtime auth-loss demotion fires ONLY this callback (quiesce in
+		// place, no switch follows), and Argo CD's private port-forward lives
+		// outside the session manager — without this it survives the
+		// demotion's teardown indefinitely. Reset is idempotent, so the
+		// second call from OnContextSwitch on a real switch is harmless.
+		argocd.Reset()
 	})
 
 	// Let the destructive cache operations (context switch, namespace rescope)
@@ -3929,12 +3935,9 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 
 	// Per-user state (permCache, namespace picks, capabilities cache) is
 	// cleared by the OnContextSwitch callback registered in New().
-
-	k8s.SetConnectionStatus(k8s.ConnectionStatus{
-		State:       k8s.StateConnected,
-		Context:     k8s.GetContextName(),
-		ClusterName: k8s.GetClusterName(),
-	})
+	// PerformContextSwitch published the connected status while still holding
+	// the context-operation lock; publishing again here would race a queued
+	// operation's teardown.
 
 	// Return the new cluster info
 	info, err := k8s.GetClusterInfo(r.Context())
@@ -3951,17 +3954,27 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConnectionStatus(w http.ResponseWriter, r *http.Request) {
 	status := k8s.GetConnectionStatus()
-	contexts, _ := k8s.GetAvailableContexts() // Always works (reads kubeconfig)
 
-	s.writeJSON(w, map[string]any{
+	response := map[string]any{
 		"state":           status.State,
 		"context":         status.Context,
 		"clusterName":     status.ClusterName,
 		"error":           status.Error,
 		"errorType":       status.ErrorType,
 		"progressMessage": status.ProgressMsg,
-		"contexts":        contexts,
-	})
+		// Lets the browser stand down its auto-retry for the whole auth-loss
+		// episode, even when the live errorType flips to non-auth values.
+		"authRecoveryOwed": k8s.RuntimeAuthRecoveryOwed(),
+	}
+	// Context enumeration re-reads kubeconfig files (under the client write
+	// lock in multi-file mode) — too expensive for the UI's perpetual
+	// fallback poll, which opts out via ?contexts=0.
+	if r.URL.Query().Get("contexts") != "0" {
+		contexts, _ := k8s.GetAvailableContexts() // Always works (reads kubeconfig)
+		response["contexts"] = contexts
+	}
+
+	s.writeJSON(w, response)
 }
 
 func (s *Server) handleConnectionRetry(w http.ResponseWriter, r *http.Request) {
@@ -3993,13 +4006,9 @@ func (s *Server) handleConnectionRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set connected state after successful reconnection
-	k8s.SetConnectionStatus(k8s.ConnectionStatus{
-		State:       k8s.StateConnected,
-		Context:     k8s.GetContextName(),
-		ClusterName: k8s.GetClusterName(),
-	})
-
+	// PerformContextSwitch published the connected status under the
+	// context-operation lock; a second publish here would race a queued
+	// operation's teardown.
 	s.writeJSON(w, k8s.GetConnectionStatus())
 }
 
@@ -4149,12 +4158,8 @@ func (s *Server) handleCAPIClusterConnect(w http.ResponseWriter, r *http.Request
 	}
 
 	// Per-user state cleared via the OnContextSwitch callback (see New()).
-
-	k8s.SetConnectionStatus(k8s.ConnectionStatus{
-		State:       k8s.StateConnected,
-		Context:     k8s.GetContextName(),
-		ClusterName: k8s.GetClusterName(),
-	})
+	// Connected status was published by PerformContextSwitch under the
+	// context-operation lock.
 
 	// Use %q on user-influenced values (context name derived from an uploaded
 	// kubeconfig YAML, temp path partly includes the system TMPDIR) so a
