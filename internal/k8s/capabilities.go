@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/skyhook-io/radar/pkg/capacityapi"
 	"github.com/skyhook-io/radar/pkg/k8score"
 )
 
@@ -93,6 +94,16 @@ type Capabilities struct {
 	Username       string                   `json:"username,omitempty"`    // Authenticated username (when auth enabled)
 	Resources      *ResourcePermissions     `json:"resources,omitempty"`   // Per-resource-type permissions
 	Visibility     *VisibilitySummary       `json:"visibility,omitempty"`  // Present when resource visibility is limited enough to make diagnostics incomplete
+	Karpenter      IntegrationCapability    `json:"karpenter"`             // Per-request Karpenter discovery + NodePool read state; populated by the HTTP layer after user SAR.
+}
+
+type IntegrationCapability struct {
+	State      capacityapi.IntegrationState `json:"state"`
+	ReasonCode string                       `json:"reasonCode,omitempty"`
+	// CacheUnavailable marks "integration detected but its cache cannot serve
+	// right now" — a distinct condition every consumer must map to unavailable
+	// coverage, never to an observed/available source.
+	CacheUnavailable bool `json:"cacheUnavailable,omitempty"`
 }
 
 type FeatureCapabilities struct {

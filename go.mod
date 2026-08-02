@@ -33,6 +33,7 @@ require (
 	k8s.io/apimachinery v0.36.3
 	k8s.io/cli-runtime v0.36.3
 	k8s.io/client-go v0.36.3
+	k8s.io/component-helpers v0.36.3
 	k8s.io/klog/v2 v2.140.0
 	modernc.org/sqlite v1.55.0
 	sigs.k8s.io/yaml v1.6.0

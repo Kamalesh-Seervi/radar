@@ -1,6 +1,7 @@
 import { useMemo, useEffect, useCallback, useState } from 'react'
 import { useQueries, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom'
+import { workloadPodAwaitsScheduling } from '../capacity/podDemandGate'
 import { clsx } from 'clsx'
 import { Terminal } from 'lucide-react'
 import {
@@ -94,6 +95,7 @@ import {
 import { useToast } from '../ui/Toast'
 import { Tooltip } from '../ui/Tooltip'
 import { PodRenderer } from '../resources/renderers/PodRenderer'
+import { KarpenterNodePoolRenderer } from '../resources/renderers/KarpenterNodePoolRenderer'
 import { NodeRenderer } from '../resources/renderers/NodeRenderer'
 import { ServiceRenderer } from '../resources/renderers/ServiceRenderer'
 import { WorkloadRenderer } from '../resources/renderers/WorkloadRenderer'
@@ -125,6 +127,7 @@ const BATCH_EXECUTION_KINDS = new Set([
 // Stable reference — web renderer wrappers inject platform hooks internally
 const rendererOverrides: RendererOverrides = {
   PodRenderer,
+  KarpenterNodePoolRenderer,
   NodeRenderer,
   ServiceRenderer,
   WorkloadRenderer,
@@ -574,7 +577,7 @@ export function WorkloadView({
 
   // RBAC
   const canUpdateSecrets = useCanUpdateSecrets()
-  const { features } = useCapabilitiesContext()
+  const { features, karpenter } = useCapabilitiesContext()
   const { canPortForward } = useNamespacedCapabilities(namespace)
   const isLocalDeployment = useIsLocalDeployment()
   const showServingPortForward = canPortForward || !isLocalDeployment
@@ -757,6 +760,9 @@ export function WorkloadView({
 
   const supportsWorkloadPods = ['deployments', 'statefulsets', 'daemonsets'].includes(apiKind)
   const workloadPodsQuery = useWorkloadPods(supportsWorkloadPods ? apiKind : '', namespace, name)
+  const workloadAwaitsCapacity =
+    karpenter?.state === 'available' &&
+    (workloadPodsQuery.data?.pods ?? []).some(workloadPodAwaitsScheduling)
   const servingRefs = useMemo(() => collectServingRefs(relationships), [relationships])
   const servingQueries = useQueries({
     queries: servingRefs.map((ref) => {
@@ -807,6 +813,14 @@ export function WorkloadView({
         certificateInfo={certificateInfo}
         hpaDiagnosis={hpaDiagnosis}
         workloadPods={supportsWorkloadPods ? workloadPodsQuery.data?.pods : undefined}
+        onEvaluateCapacity={
+          workloadAwaitsCapacity
+            ? () =>
+                navigateRouter(
+                  `/capacity/demand?owner=${encodeURIComponent(`${namespace}/${pluralToKind(apiKind)}/${name}`)}`,
+                )
+            : undefined
+        }
         workloadPodsLoading={supportsWorkloadPods ? workloadPodsQuery.isLoading : false}
         workloadPodsError={supportsWorkloadPods ? (workloadPodsQuery.error as Error | null) : null}
         servingResources={servingResources}

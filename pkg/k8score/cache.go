@@ -374,6 +374,20 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 			}
 		}
 	}
+	setups := buildInformerSetups()
+	for _, setup := range setups {
+		if !setup.isClusterScoped {
+			continue
+		}
+		scope, ok := scopes[setup.key]
+		if !ok {
+			continue
+		}
+		scope.Namespace = ""
+		scopes[setup.key] = scope
+		delete(cfg.ResourceScopeNamespaces, setup.key)
+	}
+	cfg.ResourceScopes = scopes
 
 	stopCh := make(chan struct{})
 	changes := make(chan ResourceChange, channelSize)
@@ -431,9 +445,6 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		}
 		return nsFactories[scope.Namespace]
 	}
-
-	// Table-driven informer setup — only create informers for enabled types
-	setups := buildInformerSetups()
 
 	// enabledMap is the boolean projection over `scopes` exposed via
 	// GetEnabledResources for callers that only need "is this kind on?"
@@ -1446,6 +1457,33 @@ func (rc *ResourceCache) IsKindClusterWide(resource string) bool {
 	}
 	s, ok := rc.config.ResourceScopes[resource]
 	return ok && s.Enabled && s.Namespace == "" && len(rc.config.ResourceScopeNamespaces[resource]) == 0
+}
+
+// KindNamespaces returns the namespaces covered by a namespaced informer.
+// A nil result means the kind is cluster-wide or disabled.
+func (rc *ResourceCache) KindNamespaces(resource string) []string {
+	if rc == nil {
+		return nil
+	}
+	s, ok := rc.config.ResourceScopes[resource]
+	if !ok || !s.Enabled || s.Namespace == "" {
+		return nil
+	}
+	return append([]string(nil), resourceScopeNamespaces(resource, s, rc.config.ResourceScopeNamespaces)...)
+}
+
+func (rc *ResourceCache) IsKindReady(resource string) bool {
+	if rc == nil {
+		return false
+	}
+	rc.informerMu.RLock()
+	defer rc.informerMu.RUnlock()
+	for _, status := range rc.informerStatuses {
+		if status.Key == resource {
+			return status.Synced
+		}
+	}
+	return false
 }
 
 // ChangesRaw returns the bidirectional channel for internal use.

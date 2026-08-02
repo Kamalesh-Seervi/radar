@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -62,6 +63,12 @@ func TestNewResourceCache_Basic(t *testing.T) {
 	}
 	if rc.Nodes() != nil {
 		t.Error("expected Nodes() lister to be nil (not enabled)")
+	}
+	if !rc.IsKindClusterWide(Pods) {
+		t.Error("legacy cluster-wide ResourceTypes config must report cluster-wide authority")
+	}
+	if got := rc.KindNamespaces(Pods); got != nil {
+		t.Fatalf("cluster-wide Pod namespaces = %v, want nil", got)
 	}
 }
 
@@ -1000,7 +1007,7 @@ func TestNewResourceCache_ResourceScopesMixed(t *testing.T) {
 		ResourceScopes: map[string]ResourceScope{
 			Pods:        {Enabled: true, Namespace: ns}, // namespace-scoped
 			Deployments: {Enabled: true, Namespace: ns}, // namespace-scoped
-			Nodes:       {Enabled: true, Namespace: ""}, // cluster-wide (cluster-scoped kind)
+			Nodes:       {Enabled: true, Namespace: ns}, // cluster-scoped kinds ignore namespace fallback
 			Services:    {Enabled: false},               // denied — no informer
 		},
 	})
@@ -1020,6 +1027,9 @@ func TestNewResourceCache_ResourceScopesMixed(t *testing.T) {
 	}
 	if rc.Services() != nil {
 		t.Error("Services lister should be nil — kind was disabled")
+	}
+	if !rc.IsKindClusterWide(Nodes) || rc.KindNamespaces(Nodes) != nil {
+		t.Fatal("cluster-scoped Node informer did not report its effective cluster-wide scope")
 	}
 
 	enabled := rc.GetEnabledResources()
@@ -1091,6 +1101,14 @@ func TestNewResourceCache_ResourceScopeNamespacesUnion(t *testing.T) {
 	}
 	if rc.IsKindClusterWide(Pods) {
 		t.Fatal("multi-namespace scoped Pods must not report cluster-wide authority")
+	}
+	if got := rc.KindNamespaces(Pods); !slices.Equal(got, []string{nsA, nsB}) {
+		t.Fatalf("Pod informer namespaces = %v, want [%s %s]", got, nsA, nsB)
+	}
+	got := rc.KindNamespaces(Pods)
+	got[0] = "mutated"
+	if next := rc.KindNamespaces(Pods); !slices.Equal(next, []string{nsA, nsB}) {
+		t.Fatalf("caller mutation changed Pod informer namespaces: %v", next)
 	}
 }
 

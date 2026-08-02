@@ -1,10 +1,12 @@
 import { PodRenderer as BasePodRenderer } from '@skyhook-io/k8s-ui/components/resources/renderers/PodRenderer'
 import type { CopyHandler } from '@skyhook-io/k8s-ui/components/ui/drawer-components'
 import type { PodEnvironmentRevealResponse, ResolvedEnvFrom } from '@skyhook-io/k8s-ui'
+import { useNavigate } from 'react-router-dom'
 import { useOpenTerminal, useOpenLogs } from '../../dock'
-import { useNamespacedCapabilities, useIsLocalDeployment } from '../../../contexts/CapabilitiesContext'
+import { useCapabilitiesContext, useNamespacedCapabilities, useIsLocalDeployment } from '../../../contexts/CapabilitiesContext'
 import { getVisibleLiveMetrics, isLiveMetricsUnavailable, shouldFetchLiveMetrics, usePodEnvironment, usePodMetrics, usePodMetricsHistory, usePrometheusResourceMetrics, usePrometheusStatus, useRevealPodEnvironment } from '../../../api/client'
 import { useRBACSubject } from '../../../api/rbac'
+import { podAwaitsScheduling } from '../../capacity/podDemandGate'
 import { PortForwardInlineButton } from '../../portforward/PortForwardButton'
 import { ImageFilesystemModal } from '../ImageFilesystemModal'
 import { PodFilesystemModal } from '../PodFilesystemModal'
@@ -28,6 +30,12 @@ export function PodRenderer({ data, onCopy, copied, onNavigate, onOpenLogs, reso
 
   const openTerminal = useOpenTerminal()
   const openLogsPanel = useOpenLogs()
+  const navigate = useNavigate()
+
+  // Unscheduled pod on a Karpenter cluster -> bridge into the Capacity Demand
+  // view (the purpose-built surface for "why is this pod pending").
+  const karpenterAvailable = useCapabilitiesContext().karpenter?.state === 'available'
+  const awaitsScheduling = podAwaitsScheduling(data)
 
   // Capabilities (namespace-scoped: re-checks RBAC if globally denied)
   const { canExec, canViewLogs, canPortForward } = useNamespacedCapabilities(namespace)
@@ -73,6 +81,14 @@ export function PodRenderer({ data, onCopy, copied, onNavigate, onOpenLogs, reso
       copied={copied}
       onNavigate={onNavigate}
       onOpenLogs={onOpenLogs}
+      onEvaluateCapacity={
+        karpenterAvailable && awaitsScheduling
+          ? () =>
+              navigate(
+                `/capacity/demand?pod=${encodeURIComponent(`${data.metadata?.namespace ?? ''}/${data.metadata?.name ?? ''}`)}`,
+              )
+          : undefined
+      }
       resolvedEnvFrom={resolvedEnvFrom}
       environment={environmentQuery.data}
       environmentLoading={environmentQuery.isLoading}

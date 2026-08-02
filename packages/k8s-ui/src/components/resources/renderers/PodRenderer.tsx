@@ -70,6 +70,10 @@ interface PodRendererProps {
   onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
   /** When provided, container-level Logs buttons call this instead of onOpenLogsPanel */
   onOpenLogs?: (podName: string, containerName: string) => void
+  /** Host-wired for pending pods on Karpenter clusters: opens the Capacity
+   *  Demand view, which groups pending pods by scheduling signature and
+   *  evaluates every NodePool against them. */
+  onEvaluateCapacity?: () => void
   // Platform capabilities
   canExec?: boolean
   canViewLogs?: boolean
@@ -262,6 +266,7 @@ export function PodRenderer({
   copied,
   onNavigate,
   onOpenLogs: onOpenLogsOverride,
+  onEvaluateCapacity,
   canExec,
   canViewLogs,
   canPortForward,
@@ -385,6 +390,18 @@ export function PodRenderer({
             ))}
           </ul>
         </AlertBanner>
+      )}
+
+      {onEvaluateCapacity && (
+        <div className="mb-3">
+          <button
+            type="button"
+            onClick={onEvaluateCapacity}
+            className="text-xs font-medium text-accent-text hover:underline"
+          >
+            Evaluate against Karpenter NodePools →
+          </button>
+        </div>
       )}
 
       {/* Status section */}
