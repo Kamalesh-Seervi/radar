@@ -391,6 +391,61 @@ export interface AuditResponse {
   groupedChecks?: Check[];
 }
 
+export type UpgradeReadinessVerdict = 'blocked' | 'warning' | 'review' | 'no_known_blockers' | 'unknown'
+export type UpgradeReadinessLevel = 'blocker' | 'warning' | 'review'
+export type UpgradeReadinessCheckStatus = 'passed' | 'blocked' | 'warning' | 'review' | 'unknown' | 'not_applicable'
+
+export interface UpgradeReadinessResourceRef {
+  group?: string
+  kind: string
+  namespace: string
+  name: string
+}
+
+export interface UpgradeReadinessFinding {
+  ruleID: string
+  title: string
+  level: UpgradeReadinessLevel
+  resource?: UpgradeReadinessResourceRef
+  managedBy?: UpgradeReadinessResourceRef
+  evidence: { source: string; path: string; detail?: string }
+  appliesFrom?: string
+  impact: string
+  remediation: string
+  references: { title: string; url: string }[]
+}
+
+export interface UpgradeReadinessCheck {
+  id: string
+  category: string
+  title: string
+  status: UpgradeReadinessCheckStatus
+  summary: string
+  evidenceNote?: string
+  caveat?: string
+  scope: string
+  inspected?: number
+  appliesFrom?: string
+  findings: UpgradeReadinessFinding[]
+  references?: { title: string; url: string }[]
+}
+
+export interface UpgradeReadinessResponse {
+  currentVersion: string
+  targetVersion: string
+  reviewedThrough: string
+  verdict: UpgradeReadinessVerdict
+  summary: { blocked: number; warnings: number; reviews: number; passed: number; unknown: number; notApplicable: number; findings: number }
+  checks: UpgradeReadinessCheck[]
+  coverage: {
+    source: 'live'
+    state: 'complete' | 'partial' | 'no_access'
+    unavailableKinds?: string[]
+    scopedNamespaces?: string[]
+    scopedKinds?: Record<string, string[]>
+  }
+}
+
 export interface DashboardCertificateHealth {
   total: number;
   healthy: number;
@@ -484,6 +539,18 @@ export function useAudit(namespaces: string[] = []) {
     refetchInterval: AUDIT_REFRESH_INTERVAL_MS,
     placeholderData: (prev) => prev,
   });
+}
+
+export function useUpgradeReadiness(target?: string) {
+  const params = new URLSearchParams()
+  if (target) params.set('target', target)
+  const query = params.toString()
+  return useQuery<UpgradeReadinessResponse>({
+    queryKey: ['upgrade-readiness', target ?? 'next'],
+    queryFn: ({ signal }) => fetchJSON(`/upgrade-readiness${query ? `?${query}` : ''}`, signal),
+    staleTime: 30000,
+    placeholderData: (previous) => previous,
+  })
 }
 
 // Live cluster Issues — the grouped triage queue (radar's /api/issues =

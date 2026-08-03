@@ -53,6 +53,7 @@ import (
 	"github.com/skyhook-io/radar/internal/updater"
 	"github.com/skyhook-io/radar/internal/version"
 	"github.com/skyhook-io/radar/pkg/argoapi"
+	"github.com/skyhook-io/radar/pkg/conditions"
 	"github.com/skyhook-io/radar/pkg/hpadiag"
 	"github.com/skyhook-io/radar/pkg/k8score"
 	"github.com/skyhook-io/radar/pkg/perfstats"
@@ -448,6 +449,7 @@ func (s *Server) setupRoutes() {
 			// Cluster audit
 			r.Get("/audit", s.handleAudit)
 			r.Get("/audit/resource/{kind}/{namespace}/{name}", s.handleAuditResource)
+			r.Get("/upgrade-readiness", s.handleUpgradeReadiness)
 
 			// Packages — merged "what's installed" view across Helm
 			// releases, workload labels, CRD registrations, and GitOps
@@ -1133,6 +1135,15 @@ func (s *Server) resolveHelmNamespaces(r *http.Request) ([]string, bool) {
 	}
 
 	namespaces := s.parseNamespacesForUser(r)
+	return s.resolveHelmNamespacesForScope(r, namespaces)
+}
+
+// resolveHelmNamespacesForScope applies Helm's Secret-specific RBAC and
+// no-auth fallback behavior to an already resolved workload namespace scope.
+// Callers that intentionally ignore the browsing namespace picker (such as the
+// cluster upgrade scan) can reuse the same Helm resolution without rebuilding
+// it from request query state.
+func (s *Server) resolveHelmNamespacesForScope(r *http.Request, namespaces []string) ([]string, bool) {
 	if noNamespaceAccess(namespaces) {
 		return nil, false
 	}
@@ -2595,53 +2606,36 @@ func metricsAPIServiceLookupDiagnosis(apiService *unstructured.Unstructured, err
 }
 
 func metricsAPIServiceDiagnosis(apiService *unstructured.Unstructured, includeConditionMessage bool) string {
-	conditions, found, _ := unstructured.NestedSlice(apiService.Object, "status", "conditions")
+	condition, found := conditions.Find(apiService, "Available")
 	if !found {
 		return "The v1beta1.metrics.k8s.io APIService exists but has no Available condition. Check metrics-server and API aggregation status."
 	}
-
-	for _, condition := range conditions {
-		conditionMap, ok := condition.(map[string]any)
-		if !ok {
-			continue
-		}
-		conditionType, _ := conditionMap["type"].(string)
-		if conditionType != "Available" {
-			continue
-		}
-
-		status, _ := conditionMap["status"].(string)
-		reason, _ := conditionMap["reason"].(string)
-		reasonSuffix := ""
-		if reason != "" {
-			reasonSuffix = " (" + reason + ")"
-		}
-		messageSuffix := ""
-		if includeConditionMessage {
-			messageSuffix = metricsAPIServiceConditionMessageSuffix(conditionMap)
-		}
-
-		switch status {
-		case "True":
-			return "The v1beta1.metrics.k8s.io APIService is Available, but metrics reads still fail. Check metrics-server logs and API aggregation errors."
-		case "False", "Unknown":
-			return metricsAPIServiceDiagnosisSentence(
-				"The v1beta1.metrics.k8s.io APIService is not Available"+reasonSuffix+messageSuffix,
-				"Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
-			)
-		default:
-			return metricsAPIServiceDiagnosisSentence(
-				"The v1beta1.metrics.k8s.io APIService has an unexpected Available status"+reasonSuffix+messageSuffix,
-				"Check metrics-server and API aggregation status.",
-			)
-		}
+	reasonSuffix := ""
+	if condition.Reason != "" {
+		reasonSuffix = " (" + condition.Reason + ")"
+	}
+	messageSuffix := ""
+	if includeConditionMessage {
+		messageSuffix = metricsAPIServiceConditionMessageSuffix(condition.Message)
 	}
 
-	return "The v1beta1.metrics.k8s.io APIService exists but has no Available condition. Check metrics-server and API aggregation status."
+	switch condition.Status {
+	case "True":
+		return "The v1beta1.metrics.k8s.io APIService is Available, but metrics reads still fail. Check metrics-server logs and API aggregation errors."
+	case "False", "Unknown":
+		return metricsAPIServiceDiagnosisSentence(
+			"The v1beta1.metrics.k8s.io APIService is not Available"+reasonSuffix+messageSuffix,
+			"Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
+		)
+	default:
+		return metricsAPIServiceDiagnosisSentence(
+			"The v1beta1.metrics.k8s.io APIService has an unexpected Available status"+reasonSuffix+messageSuffix,
+			"Check metrics-server and API aggregation status.",
+		)
+	}
 }
 
-func metricsAPIServiceConditionMessageSuffix(conditionMap map[string]any) string {
-	message, _ := conditionMap["message"].(string)
+func metricsAPIServiceConditionMessageSuffix(message string) string {
 	message = strings.Join(strings.Fields(message), " ")
 	message = strings.TrimRight(message, ":;,")
 	if message == "" {

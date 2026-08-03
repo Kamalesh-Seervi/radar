@@ -145,6 +145,8 @@ function getViewFromPath(pathname: string): ExtendedMainView {
 //     breakdown; a filter would only hide rows).
 //   - A GitOps detail tree spans namespaces — its controller lives in one
 //     namespace but manages workloads across many.
+//   - Upgrade impact evaluates the full readable cluster scope rather than a
+//     browsing filter.
 //   - A cluster-scoped resource kind (Nodes, PVs, ClusterRoles…) has no
 //     namespace at all.
 // The pick itself is preserved so it re-applies when the user returns to a
@@ -168,6 +170,12 @@ function namespaceFilterDisabled(
     return {
       disabled: true,
       tooltip: 'Capacity is reported across the cluster — the namespace filter doesn’t apply here.',
+    }
+  }
+  if (view === 'checks' && pathname.startsWith('/checks/upgrade')) {
+    return {
+      disabled: true,
+      tooltip: 'Upgrade impact scans every namespace you can access — the namespace filter doesn’t apply.',
     }
   }
   const segments = pathname.replace(/^\//, '').split('/')
@@ -232,6 +240,8 @@ function radarPageTitle(pathname: string, search = '', apiResources?: APIResourc
     const slash = decoded.lastIndexOf('/')
     return slash >= 0 && slash < decoded.length - 1 ? decoded.slice(slash + 1) : decoded
   }
+
+  if (view === 'checks' && pathSegments[1] === 'upgrade') return 'Upgrade impact'
 
   // The landing view reads "Overview" rather than "Home" in the tab.
   if (view === 'capacity') {
@@ -401,6 +411,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
 
   // Get mainView from URL path
   const mainView = getViewFromPath(location.pathname)
+  const upgradeReadinessRoute = location.pathname.startsWith('/checks/upgrade')
 
   // Initialize the kind→plural discovery map app-wide (not just on ResourcesView
   // mount) so the omnibar can open a CRD hit with an irregular plural from any
@@ -485,7 +496,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
   // The host's URL for the CURRENT view, if taken over. Drives the redirect
   // effect and the "Opening…" splash.
   const viewTakeoverHref =
-    mainView === 'issues' || mainView === 'gitops' || mainView === 'checks'
+    (mainView === 'issues' || mainView === 'gitops' || mainView === 'checks') && !upgradeReadinessRoute
       ? takeover[mainView]
       : undefined
   useEffect(() => {
@@ -698,6 +709,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
     newParams.delete('kind')
     newParams.delete('mode')
     newParams.delete('group')
+    newParams.delete('target')
     // Open as a normal drawer — never inherit a stale ?full=1/tab from an
     // expanded view we're navigating away from (only expand/drill set those).
     newParams.delete('full')
@@ -2285,9 +2297,9 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
           />
         )}
 
-        {/* Best practices detail view (inline only when the host hasn't taken
-            Checks over — standalone OSS, or Cloud without a checks takeover). */}
-        {mainView === 'checks' && !isViewTakenOver('checks') && (
+        {/* Checks detail view. Cloud can take over fleet best practices while
+            the target-specific upgrade route continues to render locally. */}
+        {mainView === 'checks' && (!isViewTakenOver('checks') || upgradeReadinessRoute) && (
           <AuditView
             namespaces={namespaces}
             onNavigateToResource={navigateToResourceList}

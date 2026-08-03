@@ -7,7 +7,7 @@
 
 🌐 **[radarhq.io](https://radarhq.io)** · [Docs](https://radarhq.io/docs) · [Releases](https://github.com/skyhook-io/radar/releases)
 
-Topology, resources, Helm, GitOps, traffic, audit, and MCP context for AI agents — from your laptop or in-cluster.
+Topology, resources, Helm, GitOps, traffic, audit, upgrade impact, and MCP context for AI agents — from your laptop or in-cluster.
 
 [![CI](https://github.com/skyhook-io/radar/actions/workflows/ci.yml/badge.svg)](https://github.com/skyhook-io/radar/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/skyhook-io/radar?logo=github)](https://github.com/skyhook-io/radar/releases/latest)
@@ -22,7 +22,7 @@ Topology, resources, Helm, GitOps, traffic, audit, and MCP context for AI agents
 - [Why Radar?](#why-radar)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Views](#views) — Topology · Resources · Image Filesystem · Timeline · Helm · Compare · TLS · GitOps · Traffic · Cost · Audit · RBAC · MCP · Auth
+- [Views](#views) — Topology · Resources · Image Filesystem · Timeline · Helm · Compare · TLS · GitOps · Traffic · Cost · Audit · Upgrade impact · RBAC · MCP · Auth
 - [Supported Resources](#supported-resources)
 - [Keyboard Shortcuts](#keyboard-shortcuts)
 - [Security](#security)
@@ -437,12 +437,25 @@ Proactive best-practices scanner with 31 checks across security, reliability, an
 
 - Security: privileged containers, privilege escalation, dangerous/insecure capabilities, host namespaces, container runtime socket mounts, sensitive host paths, secrets in ConfigMaps, auto-mounted service account tokens
 - Reliability: missing probes, image tag `latest`, single-replica deployments, missing PDB/topology spread, pod HA risk (all replicas on same node), orphan services/ingresses, deprecated API versions
-- Efficiency: missing CPU/memory requests and limits, orphan ConfigMaps/Secrets, resource utilization vs requests
-- Grouped-by-resource and by-namespace views with search, category/severity/framework filters
-- Each finding includes description and remediation guidance, with inline hide actions (per-check, per-category, per-namespace)
+- Efficiency: missing CPU/memory requests and limits, orphan ConfigMaps/Secrets
+- Check-grouped remediation queue with search and category, severity, and framework filters; expand a check to see affected resources
+- Each finding includes description and remediation guidance, with inline hide actions for a check or category
 - Configurable: ignored namespaces (with wildcard patterns), disabled checks, persisted across sessions
 - Framework labels: NSA/CISA, CIS benchmarks
 - MCP tool (`get_cluster_audit`) for AI-assisted cluster analysis
+
+### Kubernetes Upgrade Impact
+
+Open **Checks → Upgrade impact** before upgrading the control plane. Radar compares the current cluster with a target Kubernetes minor and orders evidenced compatibility, health, admission, drain, runtime, and configuration checks by required action. Release-specific checks appear only when their Kubernetes minor lies in the selected upgrade path; the current catalog contains 18 checks through Kubernetes 1.36.
+
+- Finds blockers such as skipped minor versions, APIs removed in the target release, unsupported kubelet or kube-proxy skew, overlapping PodDisruptionBudgets, and the `gitRepo` volume driver disabled in Kubernetes 1.36
+- Flags likely operational impact such as FlexVolume exposure and renamed control-plane metrics as warnings, while intent-dependent configuration such as deprecated Service `externalIPs` remains review
+- Inspects live resources, aggregated API availability, Helm release manifests, kubectl last-applied configuration, API server usage metrics, and PrometheusRule expressions
+- Distinguishes **Passed**, **Review**, **Warning**, **Blocked**, **Incomplete**, and **Not applicable** instead of flattening advisory findings, likely impact, and missing evidence into one state
+- Scans every namespace the current identity can read; the header namespace picker remains a browsing filter and does not narrow upgrade analysis
+- Shows the bundled catalog boundary and the evidence scope for sampled or unavailable data
+
+See the [Kubernetes upgrade impact guide](https://radarhq.io/docs/features/upgrade-impact) for the check catalog, coverage semantics, and RBAC notes.
 
 ### Access Control (RBAC visibility)
 
