@@ -63,6 +63,8 @@ type Options struct {
 	AuditSummary  *AuditSummary
 	PolicyReports PolicyReportLookup // nil = Kyverno not installed / no findings
 	AppReferences *AppReferences
+	// Attached only after the evidence Job and Pod pass the access gate.
+	ContainerCompletionSplit *ContainerCompletionSplit
 
 	// Optional kind-specific lookups. ServiceBackends is used only for
 	// Service resources to attach realized pod-selection state. The raw
@@ -272,6 +274,13 @@ func Build(ctx context.Context, obj runtime.Object, opts Options) *ResourceConte
 	rc.PVCSummary = buildPVCSummary(obj)
 	rc.JobSummary = buildJobSummary(obj)
 	rc.CronJobSummary = buildCronJobSummary(ctx, obj, opts.AccessChecker, omitted)
+	if rc.JobSummary != nil && opts.ContainerCompletionSplit != nil {
+		rc.JobSummary.ContainerCompletionSplit = gateContainerCompletionSplit(
+			ctx, opts.AccessChecker, obj, opts.ContainerCompletionSplit, "jobSummary.containerCompletionSplit", omitted)
+	} else if rc.CronJobSummary != nil && opts.ContainerCompletionSplit != nil {
+		rc.CronJobSummary.ContainerCompletionSplit = gateContainerCompletionSplit(
+			ctx, opts.AccessChecker, obj, opts.ContainerCompletionSplit, "cronJobSummary.containerCompletionSplit", omitted)
+	}
 	rc.HPASummary = buildHPASummary(obj)
 	rc.StatusSummary = buildStatusSummary(obj)
 
@@ -1474,6 +1483,30 @@ func checkRef(ctx context.Context, ac RefAccessChecker, r *ContextRef) bool {
 		return true
 	}
 	return ac.CanRead(ctx, r.Group, r.Kind, r.Namespace)
+}
+
+// gateContainerCompletionSplit requires access to both resources that establish
+// the observation; namespace access alone does not imply access to their state.
+func gateContainerCompletionSplit(ctx context.Context, ac RefAccessChecker, obj runtime.Object, obs *ContainerCompletionSplit, fieldPath string, omitted *omittedTracker) *ContainerCompletionSplit {
+	if obs == nil {
+		return nil
+	}
+	var namespace string
+	switch subject := obj.(type) {
+	case *batchv1.Job:
+		namespace = subject.Namespace
+	case *batchv1.CronJob:
+		namespace = subject.Namespace
+	default:
+		return nil
+	}
+	podRef := ContextRef{Kind: "Pod", Namespace: namespace, Name: obs.Pod}
+	jobRef := ContextRef{Kind: "Job", Group: "batch", Namespace: namespace, Name: obs.Job}
+	if !checkRef(ctx, ac, &podRef) || !checkRef(ctx, ac, &jobRef) {
+		omitted.add(fieldPath, OmittedRBACDenied)
+		return nil
+	}
+	return obs
 }
 
 // ---------------------------------------------------------------------------

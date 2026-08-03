@@ -1121,6 +1121,9 @@ func buildMCPResourceContextWithStaleChecks(ctx context.Context, obj runtime.Obj
 			k8s.FindRemovedServiceEnvChecksForObject(ctx, cache, obj),
 			staleChecks,
 		),
+		ContainerCompletionSplit: resourcecontextrefs.ContainerCompletionSplitFromShape(
+			k8s.FindContainerCompletionSplitForObject(cache, obj, time.Now()),
+		),
 		ServiceBackends: mcpServiceBackendLookup{cache: cache},
 	}
 
