@@ -26,6 +26,9 @@ import (
 	mcppkg "github.com/skyhook-io/radar/internal/mcp"
 	"github.com/skyhook-io/radar/internal/server"
 	"golang.org/x/net/http/httpguts"
+	authv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth" // Register all auth provider plugins (OIDC, GCP, Azure, etc.)
 	"k8s.io/klog/v2"
 )
@@ -262,6 +265,15 @@ func main() {
 		mcpEnabled = true
 	}
 
+	// Hub origin overrides for self-hosted control planes. When only the API
+	// origin is set, the frontend origin defaults to the same host — the
+	// self-hosted stack serves web + API from one origin; the hosted pair
+	// (api./app.radarhq.io) stays the default otherwise.
+	hubAPIURL, hubAppURL, err := cloud.ResolveHubOriginsFromEnv()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	cfg := app.AppConfig{
 		Kubeconfig:               *kubeconfig,
 		KubeconfigDirs:           app.ParseKubeconfigDirs(*kubeconfigDir),
@@ -295,6 +307,9 @@ func main() {
 		AIHistory:                *aiHistory,
 		AIHistoryDBPath:          fileCfg.AIHistoryDBPath,
 		Version:                  version,
+		HubAPIURL:                hubAPIURL,
+		HubAppURL:                hubAppURL,
+		CloudTunnelConfigured:    *cloudURL != "",
 		AuthConfig: auth.Config{
 			Mode:                      *authMode,
 			Secret:                    *authSecret,
@@ -433,16 +448,20 @@ func main() {
 			namespace := os.Getenv("MY_POD_NAMESPACE")
 			deploymentName := os.Getenv("MY_DEPLOYMENT_NAME")
 			runErr := cloud.Run(rootCtx, cloud.Config{
-				URL:          *cloudURL,
-				Token:        *cloudToken,
-				ClusterID:    *cloudClusterName,
-				ClusterName:  *cloudClusterName,
+				URL:                *cloudURL,
+				Token:              *cloudToken,
+				ClusterID:          *cloudClusterName,
+				ClusterName:        *cloudClusterName,
 				Namespace:          namespace,
 				APIServerURL:       apiServerURL,
 				InsecureSkipVerify: *cloudInsecureSkipVerify,
-				// The chart sets both env vars only when rbac.selfUpgrade is
-				// enabled. Match handleSelfUpgrade's configuration gate exactly.
-				SelfUpgradeAvailable: namespace != "" && deploymentName != "",
+				// Ask the apiserver whether this ServiceAccount may actually
+				// patch its own Deployment. Env presence is NOT the signal:
+				// identity ships on every install for read-only
+				// self-description, and a chart-set marker would go stale on
+				// exactly the path that matters — Hub's self-upgrade patches
+				// only the image, leaving an older pod template in place.
+				SelfUpgradeAvailable: func() bool { return canSelfUpgrade(rootCtx, k8s.GetClient(), namespace, deploymentName) },
 				Handler:              srv.Handler(),
 			})
 			if runErr != nil && !errors.Is(runErr, context.Canceled) {
@@ -655,4 +674,46 @@ func (h *headerFromEnvFlag) Set(raw string) error {
 	}
 	h.m[key] = envName
 	return nil
+}
+
+// canSelfUpgrade reports whether Radar's ServiceAccount may patch its own
+// Deployment, which is what rbac.selfUpgrade's Role grants. Advertising this
+// to Hub from anything other than the apiserver's own answer produces an
+// upgrade button that 403s: a chart-set env marker is invisible to an
+// image-only self-upgrade, and identity env vars ship unconditionally.
+func canSelfUpgrade(ctx context.Context, client kubernetes.Interface, namespace, deploymentName string) bool {
+	if namespace == "" || deploymentName == "" {
+		return false
+	}
+	if client == nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	// Every operation the endpoint performs, not just the mutation: it gets the
+	// Deployment, reads the Helm release manifest out of the storage Secrets,
+	// then patches. A stock chart grants these together, but a BYO-RBAC install
+	// can pass a patch-only probe and still fail mid-upgrade.
+	//
+	// The Deployment reviews MUST name it: rbac.selfUpgrade's Role is scoped
+	// with resourceNames, so an unnamed "can I patch deployments here" review
+	// answers no even where self-upgrade is correctly enabled.
+	for _, probe := range []authv1.ResourceAttributes{
+		{Namespace: namespace, Group: "apps", Resource: "deployments", Name: deploymentName, Verb: "get"},
+		{Namespace: namespace, Group: "apps", Resource: "deployments", Name: deploymentName, Verb: "patch"},
+		{Namespace: namespace, Resource: "secrets", Verb: "list"},
+	} {
+		review := &authv1.SelfSubjectAccessReview{
+			Spec: authv1.SelfSubjectAccessReviewSpec{ResourceAttributes: &probe},
+		}
+		result, err := client.AuthorizationV1().SelfSubjectAccessReviews().Create(probeCtx, review, metav1.CreateOptions{})
+		if err != nil {
+			log.Printf("[cloud] self-upgrade capability probe failed, advertising unavailable: %v", err)
+			return false
+		}
+		if !result.Status.Allowed {
+			return false
+		}
+	}
+	return true
 }
