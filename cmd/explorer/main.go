@@ -70,6 +70,7 @@ func main() {
 	namespaces := flag.String("namespaces", fileCfg.NamespacesFlag(), "Initial namespace filters as a comma-separated list (e.g. ns1,ns2,ns3). Use this when you can list resources in specific namespaces but cannot list namespaces cluster-wide.")
 	port := flag.Int("port", fileCfg.PortOr(9280), "Server port")
 	listenAddress := flag.String("listen-address", server.DefaultListenAddress, "HTTP listen address: 127.0.0.1 or localhost for local-only access; 0.0.0.0 for remote/shared access")
+	basePath := flag.String("base-path", "", "URL path prefix to serve Radar under, e.g. /radar (empty = root). Use when an ingress forwards a subpath without stripping it.")
 	noBrowser := flag.Bool("no-browser", fileCfg.NoBrowser, "Don't auto-open browser")
 	browser := flag.String("browser", fileCfg.Browser, "Browser to use when opening the UI (default: OS default browser; macOS app names supported)")
 	devMode := flag.Bool("dev", false, "Development mode (serve frontend from filesystem)")
@@ -203,6 +204,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid --listen-address %q: %v", *listenAddress, err)
 	}
+	normalizedBasePath, err := server.NormalizeBasePath(*basePath)
+	if err != nil {
+		log.Fatalf("Invalid --base-path %q: %v", *basePath, err)
+	}
+	// Radar Hub forwards root-relative paths over the tunnel and the ordinary
+	// listener is health-only at the literal /api/health, so a prefixed router
+	// would 404 both. Fail loudly instead of coming up broken. Both Cloud
+	// signals are checked because the chart sets them together but they are
+	// independent inputs, and either one alone is enough to break the prefix.
+	if normalizedBasePath != "" && (*cloudURL != "" || cloud.Mode()) {
+		log.Fatalf("--base-path is not supported in Radar Cloud mode (--cloud-url / RADAR_CLOUD_MODE): Radar Cloud owns the URL path")
+	}
 	timelineMaxSizeBytes, err := config.ParseByteSize(*timelineMaxSize)
 	if err != nil {
 		log.Fatalf("Invalid --timeline-max-size %q: %v", *timelineMaxSize, err)
@@ -257,6 +270,7 @@ func main() {
 		Port:                     *port,
 		ListenAddress:            normalizedListenAddress,
 		ShowRemoteAccessHint:     true,
+		BasePath:                 normalizedBasePath,
 		NoBrowser:                *noBrowser,
 		Browser:                  *browser,
 		DevMode:                  *devMode,
@@ -378,7 +392,10 @@ func main() {
 
 	// Open browser — server is confirmed ready to accept connections
 	if !cfg.NoBrowser {
-		targetURL := fmt.Sprintf("http://localhost:%d", cfg.Port)
+		targetURL := fmt.Sprintf("http://localhost:%d%s", cfg.Port, cfg.BasePath)
+		if cfg.BasePath != "" {
+			targetURL += "/"
+		}
 		if len(cfg.Namespaces) > 0 {
 			targetURL += "?namespaces=" + neturl.QueryEscape(strings.Join(cfg.Namespaces, ","))
 		} else if cfg.Namespace != "" {
@@ -473,7 +490,7 @@ func startServer(srv *server.Server, startupStart time.Time) (context.Context, c
 	k8s.LogTiming(" Server listening: %v (since start)", time.Since(startupStart))
 
 	// Write port file so MCP clients can discover the running server
-	app.WriteMCPPortFile(srv.ActualPort())
+	app.WriteMCPPortFile(srv.ActualPort(), srv.BasePath())
 
 	return rootCtx, rootCancel
 }

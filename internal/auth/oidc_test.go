@@ -333,7 +333,7 @@ func TestNewOIDCHandler_FailsWithSelfSignedCert(t *testing.T) {
 		OIDCClientID:     "test",
 		OIDCClientSecret: "secret",
 		OIDCRedirectURL:  "http://localhost/callback",
-	})
+	}, "")
 	if err == nil {
 		t.Fatal("expected TLS error, got nil")
 	}
@@ -353,7 +353,7 @@ func TestNewOIDCHandler_InsecureSkipVerify(t *testing.T) {
 		OIDCClientSecret:       "secret",
 		OIDCRedirectURL:        "http://localhost/callback",
 		OIDCInsecureSkipVerify: true,
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected success with InsecureSkipVerify, got: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestNewOIDCHandler_CACert(t *testing.T) {
 		OIDCClientSecret: "secret",
 		OIDCRedirectURL:  "http://localhost/callback",
 		OIDCCACert:       f.Name(),
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected success with CA cert, got: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestNewOIDCHandler_CACertTakesPrecedence(t *testing.T) {
 		OIDCRedirectURL:        "http://localhost/callback",
 		OIDCCACert:             f.Name(),
 		OIDCInsecureSkipVerify: true,
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestNewOIDCHandler_InternalIssuerUsesInternalEndpoints(t *testing.T) {
 		OIDCClientID:       "radar",
 		OIDCClientSecret:   "secret",
 		OIDCRedirectURL:    "http://localhost/callback",
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected success with internal issuer, got: %v", err)
 	}
@@ -535,7 +535,7 @@ func TestNewOIDCHandler_InternalIssuerWithOverridesKeepsDiscoveryMetadata(t *tes
 		OIDCClientID:         "radar",
 		OIDCClientSecret:     "secret",
 		OIDCRedirectURL:      "http://localhost/callback",
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected success with internal issuer and overrides, got: %v", err)
 	}
@@ -565,7 +565,7 @@ func TestNewOIDCHandler_ExplicitEndpointsDoNotRequireDiscovery(t *testing.T) {
 		OIDCClientID:         "radar",
 		OIDCClientSecret:     "secret",
 		OIDCRedirectURL:      "http://localhost/callback",
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected explicit endpoints to initialize without discovery: %v", err)
 	}
@@ -635,7 +635,7 @@ func TestNewOIDCHandler_ExplicitEndpointsVerifyES256Token(t *testing.T) {
 		OIDCClientID:         "radar",
 		OIDCClientSecret:     "secret",
 		OIDCRedirectURL:      "http://localhost/callback",
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected explicit-endpoint init to succeed: %v", err)
 	}
@@ -717,6 +717,11 @@ func (f *fakeIDP) defaultClaims() string {
 
 func (f *fakeIDP) newHandler(t *testing.T, cfg Config) *OIDCHandler {
 	t.Helper()
+	return f.newHandlerUnderBasePath(t, cfg, "")
+}
+
+func (f *fakeIDP) newHandlerUnderBasePath(t *testing.T, cfg Config, basePath string) *OIDCHandler {
+	t.Helper()
 	cfg.Mode = "oidc"
 	cfg.OIDCIssuer = f.issuer
 	if cfg.OIDCClientID == "" {
@@ -732,7 +737,7 @@ func (f *fakeIDP) newHandler(t *testing.T, cfg Config) *OIDCHandler {
 		// clock tick between issue and parse would flake the callback asserts.
 		cfg.CookieTTL = time.Hour
 	}
-	h, err := NewOIDCHandler(context.Background(), cfg)
+	h, err := NewOIDCHandler(context.Background(), cfg, basePath)
 	if err != nil {
 		t.Fatalf("NewOIDCHandler: %v", err)
 	}
@@ -927,7 +932,7 @@ func TestNewOIDCHandler_InvalidCACertPath(t *testing.T) {
 		OIDCClientSecret: "secret",
 		OIDCRedirectURL:  "http://localhost/callback",
 		OIDCCACert:       "/nonexistent/ca.pem",
-	})
+	}, "")
 	if err == nil {
 		t.Fatal("expected error for invalid CA cert path")
 	}
@@ -952,7 +957,7 @@ func TestNewOIDCHandler_InvalidCACertContent(t *testing.T) {
 		OIDCClientSecret: "secret",
 		OIDCRedirectURL:  "http://localhost/callback",
 		OIDCCACert:       f.Name(),
-	})
+	}, "")
 	if err == nil {
 		t.Fatal("expected error for invalid CA cert content")
 	}
@@ -1030,3 +1035,23 @@ func TestBackchannelLogout_CacheControlAlwaysSet(t *testing.T) {
 
 // Note: testing invalid/valid JWT verification requires a real OIDC provider
 // with JWKS. The pre-verification tests above cover all paths before Verify().
+
+// A completed login must land inside the app. Under a no-strip subpath ingress
+// only {basePath}/* is routed to Radar, so redirecting to a bare "/" would drop
+// the user onto whatever else owns the origin root right after authenticating.
+func TestHandleCallback_RedirectsUnderBasePath(t *testing.T) {
+	for _, basePath := range []string{"", "/radar", "/tools/radar"} {
+		t.Run("basePath="+basePath, func(t *testing.T) {
+			idp := newFakeIDP(t, oidc.RS256)
+			h := idp.newHandlerUnderBasePath(t, Config{}, basePath)
+			w := runCallback(h)
+
+			if w.Code != http.StatusFound {
+				t.Fatalf("status = %d, want 302 (body: %s)", w.Code, w.Body.String())
+			}
+			if got, want := w.Header().Get("Location"), basePath+"/"; got != want {
+				t.Errorf("Location = %q, want %q", got, want)
+			}
+		})
+	}
+}

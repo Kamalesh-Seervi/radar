@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"net/url"
+	pathpkg "path"
 	"reflect"
 	"runtime"
 	"slices"
@@ -68,6 +70,7 @@ type Server struct {
 	vitalsMetrics      vitalsMetricsMemo
 	port               int
 	listenAddress      string
+	basePath           string
 	startupLog         bool
 	remoteAccessHint   bool
 	devMode            bool
@@ -99,6 +102,10 @@ type Server struct {
 	// ends on another (PerformNamespaceRescope's own lock only serializes the
 	// rebuild, not this handler's persist step).
 	scopeMutationMu sync.Mutex
+
+	// rootHintOnce keeps the base-path misconfiguration hint to a single log
+	// line no matter how many requests reach the origin root.
+	rootHintOnce sync.Once
 
 	// nsPickMu serializes namespace-pick mutations: the POST handler's
 	// persist+set pair and the read-path stale-pick prune. Without it, a
@@ -147,6 +154,7 @@ type Server struct {
 type Config struct {
 	Port               int
 	ListenAddress      string         // 127.0.0.1/localhost for local-only; 0.0.0.0 for shared access
+	BasePath           string         // Optional URL path prefix for self-hosted subpath deployments
 	StartupLog         bool           // Emit the operator-facing startup block after a successful bind
 	RemoteAccessHint   bool           // Explain the explicit shared-listener opt-in (native CLI only)
 	DevMode            bool           // Serve frontend from filesystem instead of embedded
@@ -163,12 +171,16 @@ type Config struct {
 // New creates a new server instance
 func New(cfg Config) *Server {
 	cfg.AuthConfig.Defaults()
-
+	basePath, err := NormalizeBasePath(cfg.BasePath)
+	if err != nil {
+		log.Fatalf("Invalid base path %q: %v", cfg.BasePath, err)
+	}
 	s := &Server{
 		router:                chi.NewRouter(),
 		broadcaster:           NewSSEBroadcaster(),
 		port:                  cfg.Port,
 		listenAddress:         cfg.ListenAddress,
+		basePath:              basePath,
 		startupLog:            cfg.StartupLog,
 		remoteAccessHint:      cfg.RemoteAccessHint,
 		devMode:               cfg.DevMode,
@@ -212,7 +224,7 @@ func New(cfg Config) *Server {
 					store = st
 				}
 			}
-			s.aiRuns = ai.NewRunManager(d, s.ActualPort, k8s.GetContextName, store)
+			s.aiRuns = ai.NewRunManager(d, s.ActualPort, s.basePath, k8s.GetContextName, store)
 			if historyBroken {
 				// Persistence was requested but isn't working — the UI must say
 				// history won't survive a restart, not just a log line.
@@ -276,7 +288,7 @@ func New(cfg Config) *Server {
 			if s.authConfig.OIDCRedirectURL == "" {
 				log.Fatalf("[auth] --auth-oidc-redirect-url is required when auth-mode=oidc")
 			}
-			oidcHandler, err := auth.NewOIDCHandler(context.Background(), s.authConfig)
+			oidcHandler, err := auth.NewOIDCHandler(context.Background(), s.authConfig, basePath)
 			if err != nil {
 				log.Fatalf("[auth] OIDC initialization failed (issuer=%s): %v — cannot start with auth-mode=oidc", s.authConfig.OIDCIssuer, err)
 			}
@@ -306,7 +318,67 @@ func New(cfg Config) *Server {
 }
 
 func (s *Server) setupRoutes() {
-	r := s.router
+	if s.basePath != "" {
+		appRouter := chi.NewRouter()
+		s.setupAppRoutes(appRouter)
+		s.router.Get("/", func(w http.ResponseWriter, r *http.Request) {
+			s.hintRootRequestUnderBasePath()
+			http.Redirect(w, r, s.basePath+"/"+querySuffix(r), http.StatusFound)
+		})
+		s.router.Mount(s.basePath, s.basePathHandler(appRouter))
+		return
+	}
+	s.setupAppRoutes(s.router)
+}
+
+// basePathHandler adapts the prefixed public URL space to the app router, which
+// is written as if it owned the origin's root.
+//
+// The prefix MUST be stripped from r.URL.Path before any app middleware runs.
+// chi's Mount only rewrites the routing context's RoutePath and leaves
+// r.URL.Path prefixed, while the auth middleware matches on r.URL.Path and
+// treats anything outside /api, /mcp and /debug as public static content — so a
+// still-prefixed path reads as public and skips authentication entirely,
+// /debug/pprof (which dumps the whole informer cache) included. Translating once
+// here keeps that concern at the edge rather than in every path check inside.
+func (s *Server) basePathHandler(app http.Handler) http.Handler {
+	stripped := http.StripPrefix(s.basePath, app)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Canonicalize the bare prefix to a trailing slash so the app always
+		// sees a rooted path.
+		if r.URL.Path == s.basePath {
+			http.Redirect(w, r, s.basePath+"/"+querySuffix(r), http.StatusMovedPermanently)
+			return
+		}
+		stripped.ServeHTTP(w, r)
+	})
+}
+
+// hintRootRequestUnderBasePath explains, once, the misconfiguration that
+// otherwise presents only as an unexplained browser redirect loop: an ingress
+// that strips the prefix sitting in front of a Radar that also serves under it.
+// Radar sends the browser to {basePath}/, the ingress strips it again, and the
+// two bounce until the browser gives up with ERR_TOO_MANY_REDIRECTS.
+//
+// Phrased as a hint rather than an error because reaching / is legitimate — a
+// port-forward straight to the pod lands here, as does an ingress that routes
+// the origin root through as well.
+func (s *Server) hintRootRequestUnderBasePath() {
+	s.rootHintOnce.Do(func() {
+		log.Printf("[base-path] serving under %s; a request arrived for / and was redirected to %s/. "+
+			"If the browser reports too many redirects, the ingress in front of Radar is stripping the prefix: "+
+			"either stop stripping it, or unset --base-path / chart basePath.", s.basePath, s.basePath)
+	})
+}
+
+func querySuffix(r *http.Request) string {
+	if r.URL.RawQuery == "" {
+		return ""
+	}
+	return "?" + r.URL.RawQuery
+}
+
+func (s *Server) setupAppRoutes(r chi.Router) {
 
 	// Middleware (applied to all routes)
 	r.Use(middleware.Logger)
@@ -718,26 +790,73 @@ func (s *Server) setupRoutes() {
 
 	// Static files (frontend) - index.html fallback for client-side routes.
 	if s.staticFS != nil {
-		r.Handle("/*", frontendHandler(http.FS(s.staticFS)))
+		r.Handle("/*", frontendHandler(http.FS(s.staticFS), s.basePath))
 	} else if s.devMode {
 		// In dev mode, serve from web/dist
-		r.Handle("/*", frontendHandler(http.Dir("web/dist")))
+		r.Handle("/*", frontendHandler(http.Dir("web/dist"), s.basePath))
 	}
 }
 
+// NormalizeBasePath canonicalizes the optional URL prefix used when Radar is
+// served behind an ingress path like /radar. Empty and "/" mean root.
+func NormalizeBasePath(raw string) (string, error) {
+	p := strings.TrimSpace(raw)
+	if p == "" || p == "/" {
+		return "", nil
+	}
+	if strings.Contains(p, "://") || strings.HasPrefix(p, "//") {
+		return "", fmt.Errorf("must be a path, not a URL")
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	// Allowlist rather than a blocklist: the value is interpolated into a chi
+	// route pattern and into href/src attributes of the served index.html, so
+	// anything outside unreserved RFC 3986 path characters is rejected up front
+	// instead of relying on each consumer to escape it. Also blocks %-encoding,
+	// which would make the configured prefix and the routed path disagree.
+	for _, segment := range strings.Split(p, "/") {
+		if segment == "" {
+			continue
+		}
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("must not contain . or .. path segments")
+		}
+		for _, c := range segment {
+			isAllowed := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+				c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '~'
+			if !isAllowed {
+				return "", fmt.Errorf("segment %q contains disallowed character %q — use only letters, digits, '-', '_', '.', '~'", segment, c)
+			}
+		}
+	}
+	clean := pathpkg.Clean(p)
+	if clean == "/" || clean == "." {
+		return "", nil
+	}
+	return clean, nil
+}
+
 // frontendHandler serves static files, falling back to index.html for client-side routing
-func frontendHandler(fsys http.FileSystem) http.Handler {
+func frontendHandler(fsys http.FileSystem, basePath string) http.Handler {
 	fileServer := http.FileServer(fsys)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Paths arrive root-relative even under a base path — basePathHandler
+		// strips the prefix at the router edge. basePath is still needed to
+		// rewrite the asset URLs inside index.html.
 		path := r.URL.Path
+
+		if path == "/" || path == "/index.html" {
+			serveFrontendIndex(w, r, fsys, basePath)
+			return
+		}
 
 		// Try to open the file
 		f, err := fsys.Open(path)
 		if err != nil {
 			// File doesn't exist - serve index.html for client-side routing
-			r.URL.Path = "/"
-			fileServer.ServeHTTP(w, r)
+			serveFrontendIndex(w, r, fsys, basePath)
 			return
 		}
 		defer f.Close()
@@ -746,11 +865,100 @@ func frontendHandler(fsys http.FileSystem) http.Handler {
 		stat, err := f.Stat()
 		if err != nil || (stat.IsDir() && path != "/") {
 			// For directories without index.html, serve root index.html
-			r.URL.Path = "/"
+			serveFrontendIndex(w, r, fsys, basePath)
+			return
 		}
 
 		fileServer.ServeHTTP(w, r)
 	})
+}
+
+func serveFrontendIndex(w http.ResponseWriter, r *http.Request, fsys http.FileSystem, basePath string) {
+	f, err := fsys.Open("/index.html")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	body, err := io.ReadAll(f)
+	if err != nil {
+		http.Error(w, "failed to read frontend index", http.StatusInternalServerError)
+		return
+	}
+	body = rewriteFrontendIndex(body, basePath)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	http.ServeContent(w, r, "index.html", stat.ModTime(), bytes.NewReader(body))
+}
+
+// prefixAttrPaths re-roots the href/src URLs of the served index.html under
+// basePath, turning both root-absolute ("/x") and Vite's relative ("./x") forms
+// into "{basePath}/x" — the latter matters at the root too, where basePath is
+// empty and "./x" must still become "/x" so deep client routes resolve assets.
+//
+// Protocol-relative URLs ("//cdn.example.com/x") are deliberately skipped: they
+// address another origin, and prefixing one would silently turn it into a local
+// path that 404s. Scheme-qualified URLs never match, since the character after
+// the quote isn't a slash.
+func prefixAttrPaths(html, basePath string) string {
+	for _, attr := range []string{`href="`, `src="`} {
+		var out strings.Builder
+		rest := html
+		for {
+			i := strings.Index(rest, attr)
+			if i < 0 {
+				out.WriteString(rest)
+				break
+			}
+			out.WriteString(rest[:i+len(attr)])
+			rest = rest[i+len(attr):]
+			switch {
+			case strings.HasPrefix(rest, "//"):
+				// another origin — leave untouched
+			case strings.HasPrefix(rest, "./"):
+				out.WriteString(basePath + "/")
+				rest = rest[len("./"):]
+			case strings.HasPrefix(rest, "/"):
+				out.WriteString(basePath + "/")
+				rest = rest[len("/"):]
+			}
+		}
+		html = out.String()
+	}
+	return html
+}
+
+func rewriteFrontendIndex(body []byte, basePath string) []byte {
+	html := prefixAttrPaths(string(body), basePath)
+	if basePath == "" {
+		return []byte(html)
+	}
+	cfg := struct {
+		BasePath  string `json:"basePath"`
+		ApiBase   string `json:"apiBase"`
+		AssetBase string `json:"assetBase"`
+	}{
+		BasePath:  basePath,
+		ApiBase:   basePath + "/api",
+		AssetBase: basePath,
+	}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return body
+	}
+
+	runtimeScript := `<script>window.__RADAR_RUNTIME_CONFIG__=` + string(cfgJSON) + `;</script>`
+	if strings.Contains(html, `<script type="module"`) {
+		html = strings.Replace(html, `<script type="module"`, runtimeScript+"\n    "+`<script type="module"`, 1)
+	} else {
+		html = strings.Replace(html, `</head>`, "    "+runtimeScript+"\n  </head>", 1)
+	}
+	return []byte(html)
 }
 
 // Start starts the server. If port is 0, an OS-assigned port is used.
@@ -826,6 +1034,12 @@ func (s *Server) ActualPort() int {
 		return s.listener.Addr().(*net.TCPAddr).Port
 	}
 	return s.port
+}
+
+// BasePath returns the normalized URL prefix the server mounted under, or ""
+// when it serves from the root.
+func (s *Server) BasePath() string {
+	return s.basePath
 }
 
 // ActualAddr returns the address the server is listening on (e.g. "localhost:9280").
