@@ -677,6 +677,85 @@ export function useResourceIssues(
   });
 }
 
+import type { Trace as NetworkTrace, InClusterCapability } from '@skyhook-io/k8s-ui'
+
+// useTrace polls the static path-shaped diagnosis for one network entry
+// kind. 5s refetch + 15s staleTime keeps the drawer feeling live without
+// burning request budget; probes are deliberately excluded - they run via
+// fetchTraceWithProbes on operator click.
+export function useTrace(kind: string, namespace: string, name: string, enabled = true) {
+  return useQuery<NetworkTrace>({
+    queryKey: ['trace', kind, namespace, name, 'static'],
+    queryFn: () => fetchJSON(`/trace/${kind}/${namespace}/${name}`),
+    staleTime: 15000,
+    refetchInterval: enabled ? 5000 : false,
+    enabled: enabled && Boolean(kind) && Boolean(namespace) && Boolean(name),
+  })
+}
+
+// fetchTraceWithProbes is one-shot rather than polled: probes generate real
+// network traffic that observability systems can see, so they are NOT polled.
+// They fire on an explicit, scoped trigger - the operator clicking Run, or
+// opening the Reachability tab for a resource (auto-run once per resource, so the
+// tab shows results instead of a blank "click Run" page) - never on every render
+// or background refresh. The in-cluster probe (which spawns a Job) stays
+// click-only.
+export function fetchTraceWithProbes(kind: string, namespace: string, name: string, path?: string): Promise<NetworkTrace> {
+  const q = path && path !== '/' ? `&path=${encodeURIComponent(path)}` : ''
+  return fetchJSON(`/trace/${kind}/${namespace}/${name}?probe=true${q}`)
+}
+
+// fetchInClusterCapability tells the UI whether the active "test from inside the
+// cluster" probe can run for this caller (and names the cluster + namespace).
+export function fetchInClusterCapability(kind: string, namespace: string, name: string): Promise<InClusterCapability> {
+  return fetchJSON(`/trace/${kind}/${namespace}/${name}/probe-in-cluster/capability`)
+}
+
+// InClusterMergedResult is the WHOLE-subject in-cluster test: the server runs every
+// route's live probe, folds them in via the canonical trace.ApplyInClusterResults,
+// and returns the FINALIZED trace - so the frontend displays it directly instead of
+// reimplementing a weaker merge that could falsely confirm a sibling route.
+// InClusterTestOutcome is one route's in-cluster result. A failure (the Job
+// couldn't start / timed out / RBAC) comes back as HTTP 200 with a human status
+// and a copyable fallbackCommand - it MUST be surfaced, not dropped.
+export interface InClusterTestOutcome {
+  route: string
+  target?: string
+  status?: string
+  fallbackCommand?: string
+  // Raw probe results when the run produced any. A status WITH results is
+  // informational context; a status WITHOUT results means the route (or the
+  // whole subject) was not tested and the status must be surfaced.
+  results?: unknown[]
+}
+
+export interface InClusterMergedResult {
+  trace: NetworkTrace
+  inClusterTests?: InClusterTestOutcome[]
+}
+
+// runInClusterMerged triggers the whole-subject in-cluster test and returns the
+// server-finalized trace. The endpoint returns a JSON body on denial too, so
+// parse the body either way and surface the error field.
+export async function runInClusterMerged(kind: string, namespace: string, name: string, path?: string): Promise<InClusterMergedResult> {
+  const response = await apiFetch(`${getApiBase()}/trace/${kind}/${namespace}/${name}/in-cluster`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: path ?? '/' }),
+  })
+  // A gateway/proxy failure (chi's 60s timeout, a Hub ingress 502) returns
+  // HTML - an unguarded .json() surfaced "Unexpected token <" instead of the
+  // status. Mirror fetchJSON's tolerant parse.
+  const body = await response.json().catch(() => undefined)
+  if (!response.ok || body?.error) {
+    throw new Error(body?.error || `In-cluster test failed (${response.status})`)
+  }
+  if (body === undefined) {
+    throw new Error('In-cluster test returned an unreadable response')
+  }
+  return body
+}
+
 // Audit settings
 export interface AuditSettings {
   ignoredNamespaces: string[];

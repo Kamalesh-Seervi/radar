@@ -1243,7 +1243,7 @@ func (c *ResourceCache) ListDynamicWithGroup(ctx context.Context, kind string, n
 
 	discovery := GetResourceDiscovery()
 	if discovery == nil {
-		return nil, fmt.Errorf("resource discovery not initialized")
+		return nil, fmt.Errorf("%w: resource discovery", ErrDynamicNotReady)
 	}
 
 	var gvr schema.GroupVersionResource
@@ -1268,7 +1268,7 @@ func (c *ResourceCache) ListDynamicWithGroup(ctx context.Context, kind string, n
 
 	dynamicCache := GetDynamicResourceCache()
 	if dynamicCache == nil {
-		return nil, fmt.Errorf("dynamic resource cache not initialized")
+		return nil, fmt.Errorf("%w: dynamic cache", ErrDynamicNotReady)
 	}
 
 	if shouldBypassDynamicInformer(gvr) {
@@ -1301,6 +1301,13 @@ func shouldBypassDynamicInformer(gvr schema.GroupVersionResource) bool {
 // layer translates this to 400 Bad Request.
 var ErrUnknownDynamicKind = errors.New("unknown resource kind")
 
+// ErrDynamicNotReady is returned when API discovery or the dynamic cache hasn't
+// been wired (early startup / a context without dynamic support). It is a
+// definitive "dynamic support isn't available" - distinct from a transient List
+// failure (RBAC / cache-not-synced) against an available CRD - so callers can
+// treat it as a clean no-match rather than as actionable uncertainty.
+var ErrDynamicNotReady = errors.New("dynamic resource support not initialized")
+
 // GetDynamic returns a single resource of any type using the dynamic cache
 func (c *ResourceCache) GetDynamic(ctx context.Context, kind string, namespace string, name string) (*unstructured.Unstructured, error) {
 	return c.GetDynamicWithGroup(ctx, kind, namespace, name, "")
@@ -1332,7 +1339,7 @@ func (c *ResourceCache) getDynamicWithGroup(ctx context.Context, kind string, na
 
 	discovery := GetResourceDiscovery()
 	if discovery == nil {
-		return nil, fmt.Errorf("resource discovery not initialized")
+		return nil, fmt.Errorf("%w: resource discovery", ErrDynamicNotReady)
 	}
 
 	var gvr schema.GroupVersionResource
@@ -1357,7 +1364,7 @@ func (c *ResourceCache) getDynamicWithGroup(ctx context.Context, kind string, na
 
 	dynamicCache := GetDynamicResourceCache()
 	if dynamicCache == nil {
-		return nil, fmt.Errorf("dynamic resource cache not initialized")
+		return nil, fmt.Errorf("%w: dynamic cache", ErrDynamicNotReady)
 	}
 
 	// CRD detail views need spec.versions[].schema and spec.conversion, which

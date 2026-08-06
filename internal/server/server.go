@@ -552,6 +552,19 @@ func (s *Server) setupAppRoutes(r chi.Router) {
 			r.Get("/audit/resource/{kind}/{namespace}/{name}", s.handleAuditResource)
 			r.Get("/upgrade-readiness", s.handleUpgradeReadiness)
 
+			// Network path trace - path-shaped diagnosis for Service /
+			// Ingress / HTTPRoute / GRPCRoute / Gateway. See internal/trace.
+			r.Get("/trace/{kind}/{namespace}/{name}", s.handleTrace)
+			// Whether the active "test from inside the cluster" (a short-lived,
+			// restricted, self-destructing probe Job as the caller's RBAC) can
+			// run - gates the UI button and names the cluster + namespace the
+			// probe pod would land in.
+			r.Get("/trace/{kind}/{namespace}/{name}/probe-in-cluster/capability", s.handleProbeInClusterCapability)
+			// Whole-subject in-cluster test: runs every route's live probe and folds
+			// them in server-side (canonical merge), returning the finalized trace so
+			// the frontend never reimplements a divergent merge.
+			r.Post("/trace/{kind}/{namespace}/{name}/in-cluster", s.handleTraceInCluster)
+
 			// Packages — merged "what's installed" view across Helm
 			// releases, workload labels, CRD registrations, and GitOps
 			// declarations. See pkg/packages for merge semantics.

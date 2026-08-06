@@ -61,6 +61,16 @@ func registerTools(server *mcp.Server, includeWrites bool) {
 		DestructiveHint: boolPtr(true),
 		OpenWorldHint:   boolPtr(false),
 	}
+	// diagnose is read-only EXCEPT when inCluster=true, which creates UP TO
+	// maxInClusterProbes transient, self-destructing probe pods (one per intended
+	// route, sequentially) to test the real dataplane. That makes it non-read-only
+	// (a client gating on readOnlyHint must know the inCluster arg can create pods),
+	// but NOT destructive - each pod is additive and deletes itself within ~60s - so
+	// DestructiveHint stays false.
+	diagnoseAnno := &mcp.ToolAnnotations{
+		DestructiveHint: boolPtr(false),
+		OpenWorldHint:   boolPtr(false),
+	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "get_dashboard",
@@ -188,7 +198,8 @@ func registerTools(server *mcp.Server, includeWrites bool) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "diagnose",
 		Description: "Use for CrashLoopBackOff, OOMKilled, image-pull, readiness, scheduling, " +
-			"or GitOps sync/health symptoms after narrowing to one broken workload or reconciler. " +
+			"or GitOps sync/health symptoms after narrowing to one broken workload or reconciler, " +
+			"or for 'traffic is not reaching this service / route / ingress'. " +
 			"For workload symptoms, it replaces a get_resource → get_events(type=Warning) → " +
 			"current/previous-log chain in one round-trip. For a Pod, " +
 			"Deployment, StatefulSet, or DaemonSet, it " +
@@ -206,9 +217,19 @@ func registerTools(server *mcp.Server, includeWrites bool) {
 			"`application_configuration_change: true` is a factual edit classification " +
 			"and narrow ranking hint, not a causal or universal relevance verdict. " +
 			"For Application, Kustomization, or Flux HelmRelease, returns reconciler status " +
-			"and parsed issues without pod-log fan-out. Prefer a targeted resource/log/event " +
-			"tool when you need only one facet; use get_resource for other kinds.",
-		Annotations: readOnly,
+			"and parsed issues without pod-log fan-out. " +
+			"For network entry kinds (Service/Ingress/HTTPRoute/GRPCRoute/Gateway), returns a " +
+			"per-route reachability diagnosis whose fields carry their own explanations - trust " +
+			"`routes[].outcome` + `confidence` and the `headline`/`diagnosis` text over the coarse " +
+			"`verdict` rollup, and treat `indirect` confidence as reached only via the API-server " +
+			"proxy, never the live-traffic path. " +
+			"Prefer a targeted resource/log/event " +
+			"tool when you need only one facet; use get_resource for other kinds. " +
+			"Read-only EXCEPT the optional inCluster=true arg (network kinds), which creates up to 5 " +
+			"transient, self-destructing probe pods to test the real dataplane.",
+		// NOT readOnly: inCluster=true creates pods. A client gating on
+		// readOnlyHint must be told that.
+		Annotations: diagnoseAnno,
 	}, logToolCall("diagnose", handleDiagnose))
 
 	mcp.AddTool(server, &mcp.Tool{

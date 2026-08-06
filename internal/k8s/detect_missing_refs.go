@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -48,9 +49,11 @@ import (
 //
 // Each check uses the "we know it's missing vs we can't tell" rule: when
 // the target's lister isn't available in cache (e.g., deferred informer
-// hasn't been warmed yet), the check is silently skipped. This is the
-// conservative path — better to under-report than to false-positive every
-// ref during cold-cache windows. The trade-off: a freshly-started radar
+// hasn't been warmed yet), OR the informer doesn't cover the target's
+// namespace (namespace-scoped RBAC — see refLookupResult), the check is
+// silently skipped. This is the conservative path — better to under-report
+// than to false-positive every ref during cold-cache windows or on
+// namespace-restricted installs. The trade-off: a freshly-started radar
 // may miss the SA-missing case until something else triggers the
 // ServiceAccount informer.
 //
@@ -110,6 +113,35 @@ func missingRefFingerprint(reason, detail string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(detail))
 	return fmt.Sprintf("%s|%016x", reason, h.Sum64())
+}
+
+// refLookupResult classifies a lister Get result into the honest tri-state
+// "exists / known missing / couldn't verify". A lister miss is only
+// authoritative when the informer for the target's kind actually covers the
+// target namespace (KindCoversNamespace): a namespace-scoped informer answers
+// NotFound for every namespace it doesn't watch — indistinguishable from true
+// absence — so a miss outside its coverage is "couldn't verify", never
+// "missing". Non-NotFound errors are likewise unverifiable. resource is the
+// plural lowercase informer key ("services", "configmaps"); ns is "" for
+// cluster-scoped kinds.
+func refLookupResult(cache *ResourceCache, resource, ns string, err error) (verifiable, exists bool) {
+	if err == nil {
+		return true, true
+	}
+	if apierrors.IsNotFound(err) && cache.KindCoversNamespace(resource, ns) {
+		return true, false
+	}
+	return false, false
+}
+
+// refKnownMissing reports whether a lister Get error is an AUTHORITATIVE
+// "target doesn't exist" per refLookupResult. Callers emit a missing-ref
+// finding only on true; anything unverifiable fails toward silence — a
+// confident "Missing X" built on an unobserved namespace would fire on every
+// namespace-restricted install.
+func refKnownMissing(cache *ResourceCache, resource, ns string, err error) bool {
+	verifiable, exists := refLookupResult(cache, resource, ns, err)
+	return verifiable && !exists
 }
 
 // withFix attaches the plain-English consequence (cause) and the concrete fix
@@ -236,7 +268,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 				if pvcLister == nil {
 					continue
 				}
-				if _, err := pvcLister.PersistentVolumeClaims(p.Namespace).Get(name); err != nil {
+				if _, err := pvcLister.PersistentVolumeClaims(p.Namespace).Get(name); refKnownMissing(cache, "persistentvolumeclaims", p.Namespace, err) {
 					emit("Missing PVC",
 						fmt.Sprintf("volume references PersistentVolumeClaim %q which does not exist", name),
 						fmt.Sprintf("PersistentVolumeClaim %q doesn't exist, so the pod can't be scheduled.", name),
@@ -253,7 +285,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 				if cmLister == nil {
 					continue
 				}
-				if _, err := cmLister.ConfigMaps(p.Namespace).Get(name); err != nil {
+				if _, err := cmLister.ConfigMaps(p.Namespace).Get(name); refKnownMissing(cache, "configmaps", p.Namespace, err) {
 					emit(cmRefDiag("volume", name, p.Namespace))
 				}
 
@@ -267,7 +299,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 				if secLister == nil {
 					continue
 				}
-				if _, err := secLister.Secrets(p.Namespace).Get(name); err != nil {
+				if _, err := secLister.Secrets(p.Namespace).Get(name); refKnownMissing(cache, "secrets", p.Namespace, err) {
 					emit(secretRefDiag("volume", name, p.Namespace))
 				}
 			}
@@ -288,7 +320,10 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 					if cmLister == nil {
 						continue
 					}
-					if _, err := cmLister.ConfigMaps(p.Namespace).Get(name); err != nil && !seen["cm:"+name] {
+					// A lister miss is only a missing ref when the informer actually
+					// watches this namespace - one that does not answers NotFound for
+					// everything in it, which is indistinguishable from true absence.
+					if _, err := cmLister.ConfigMaps(p.Namespace).Get(name); refKnownMissing(cache, "configmaps", p.Namespace, err) && !seen["cm:"+name] {
 						emitMissingEnv(c.Name, "", "envFrom", "ConfigMap", name, "")
 					}
 				}
@@ -301,7 +336,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 					if secLister == nil {
 						continue
 					}
-					if _, err := secLister.Secrets(p.Namespace).Get(name); err != nil && !seen["sec:"+name] {
+					if _, err := secLister.Secrets(p.Namespace).Get(name); refKnownMissing(cache, "secrets", p.Namespace, err) && !seen["sec:"+name] {
 						emitMissingEnv(c.Name, "", "envFrom", "Secret", name, "")
 					}
 				}
@@ -321,7 +356,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 					}
 					cm, err := cmLister.ConfigMaps(p.Namespace).Get(name)
 					if err != nil {
-						if !seen["cm:"+name] {
+						if refKnownMissing(cache, "configmaps", p.Namespace, err) && !seen["cm:"+name] {
 							emitMissingEnv(c.Name, e.Name, "env var", "ConfigMap", name, "")
 						}
 						continue
@@ -341,7 +376,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 					}
 					secret, err := secLister.Secrets(p.Namespace).Get(name)
 					if err != nil {
-						if !seen["sec:"+name] {
+						if refKnownMissing(cache, "secrets", p.Namespace, err) && !seen["sec:"+name] {
 							emitMissingEnv(c.Name, e.Name, "env var", "Secret", name, "")
 						}
 						continue
@@ -359,7 +394,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 		// the kubelet fails to mount the projected SA token volume.
 		if sa := p.Spec.ServiceAccountName; sa != "" && sa != "default" {
 			if saLister != nil {
-				if _, err := saLister.ServiceAccounts(p.Namespace).Get(sa); err != nil {
+				if _, err := saLister.ServiceAccounts(p.Namespace).Get(sa); refKnownMissing(cache, "serviceaccounts", p.Namespace, err) {
 					emit("Missing ServiceAccount",
 						fmt.Sprintf("references ServiceAccount %q which does not exist", sa),
 						fmt.Sprintf("ServiceAccount %q doesn't exist, so the pod can't start (or restart) with its expected identity/token.", sa),
@@ -383,7 +418,7 @@ func detectPodMissingRefs(cache *ResourceCache, namespace string, now time.Time)
 			if secLister == nil {
 				continue
 			}
-			if _, err := secLister.Secrets(p.Namespace).Get(name); err != nil {
+			if _, err := secLister.Secrets(p.Namespace).Get(name); refKnownMissing(cache, "secrets", p.Namespace, err) {
 				emit("Missing imagePullSecret",
 					fmt.Sprintf("imagePullSecrets references Secret %q which does not exist", name),
 					fmt.Sprintf("Pull Secret %q doesn't exist, so private-registry image pulls fail (ImagePullBackOff).", name),
@@ -439,21 +474,21 @@ func workloadExists(cache *ResourceCache, kind, namespace, name string) (verifia
 			return false, false
 		}
 		_, err := l.Deployments(namespace).Get(name)
-		return true, err == nil
+		return refLookupResult(cache, "deployments", namespace, err)
 	case "StatefulSet":
 		l := cache.StatefulSets()
 		if l == nil {
 			return false, false
 		}
 		_, err := l.StatefulSets(namespace).Get(name)
-		return true, err == nil
+		return refLookupResult(cache, "statefulsets", namespace, err)
 	case "DaemonSet":
 		l := cache.DaemonSets()
 		if l == nil {
 			return false, false
 		}
 		_, err := l.DaemonSets(namespace).Get(name)
-		return true, err == nil
+		return refLookupResult(cache, "daemonsets", namespace, err)
 	}
 	// ReplicaSet HPAs and custom scalable CRDs reach here — refuse to flag.
 	return false, false
@@ -498,12 +533,16 @@ func detectIngressMissingBackend(cache *ResourceCache, namespace string, now tim
 			seenSvc[key] = true
 			svc, err := svcLister.Services(ing.Namespace).Get(b.Name)
 			if err != nil {
-				out = append(out, withFix(missingRefProblem("Ingress", "networking.k8s.io", ing.Namespace, ing.Name,
-					"Missing backend Service",
-					fmt.Sprintf("%s references Service %q which does not exist", sourcePath, b.Name),
-					age),
-					fmt.Sprintf("Service %q doesn't exist, so this route serves nothing.", b.Name),
-					fmt.Sprintf("Point the backend at an existing Service in namespace %q, remove the stale backend, or create Service %q if it should still receive traffic.", ing.Namespace, b.Name)))
+				// Unverifiable (uncovered namespace / non-NotFound error): stay
+				// silent — can't confirm the Service NOR check its ports.
+				if refKnownMissing(cache, "services", ing.Namespace, err) {
+					out = append(out, withFix(missingRefProblem("Ingress", "networking.k8s.io", ing.Namespace, ing.Name,
+						"Missing backend Service",
+						fmt.Sprintf("%s references Service %q which does not exist", sourcePath, b.Name),
+						age),
+						fmt.Sprintf("Service %q doesn't exist, so this route serves nothing.", b.Name),
+						fmt.Sprintf("Point the backend at an existing Service in namespace %q, remove the stale backend, or create Service %q if it should still receive traffic.", ing.Namespace, b.Name)))
+				}
 				return
 			}
 			// Service exists — verify the port resolves.
@@ -561,7 +600,7 @@ func detectIngressMissingBackend(cache *ResourceCache, namespace string, now tim
 				continue
 			}
 			seenSec[tls.SecretName] = true
-			if _, err := secLister.Secrets(ing.Namespace).Get(tls.SecretName); err != nil {
+			if _, err := secLister.Secrets(ing.Namespace).Get(tls.SecretName); refKnownMissing(cache, "secrets", ing.Namespace, err) {
 				p := withFix(missingRefProblem("Ingress", "networking.k8s.io", ing.Namespace, ing.Name,
 					"Missing TLS Secret",
 					fmt.Sprintf("tls[].secretName references Secret %q which does not exist", tls.SecretName),
@@ -601,7 +640,7 @@ func detectStatefulSetMissingService(cache *ResourceCache, namespace string, now
 		if sts.Spec.ServiceName == "" {
 			continue
 		}
-		if _, err := svcLister.Services(sts.Namespace).Get(sts.Spec.ServiceName); err != nil {
+		if _, err := svcLister.Services(sts.Namespace).Get(sts.Spec.ServiceName); refKnownMissing(cache, "services", sts.Namespace, err) {
 			age := now.Sub(sts.CreationTimestamp.Time)
 			// The headless Service only matters for multi-replica peer DNS. For
 			// a single-replica StatefulSet (a controller running as a singleton)
@@ -714,7 +753,10 @@ func DetectMissingWebhookRefs(cache *ResourceCache, dynamicCache *DynamicResourc
 				if svcName == "" || svcNS == "" {
 					continue
 				}
-				if _, err := svcLister.Services(svcNS).Get(svcName); err != nil {
+				// clientConfig.service targets an arbitrary namespace, which a
+				// namespace-scoped Services informer frequently doesn't watch —
+				// only a covered-namespace NotFound is a real absence.
+				if _, err := svcLister.Services(svcNS).Get(svcName); refKnownMissing(cache, "services", svcNS, err) {
 					whName, _ := wm["name"].(string)
 					policy := webhookFailurePolicy(wm)
 					key := svcNS + "/" + svcName
@@ -857,7 +899,7 @@ func DetectMissingGatewayRefs(cache *ResourceCache, dynamicCache *DynamicResourc
 			routes = items
 		}
 		for _, route := range routes {
-			out = append(out, detectGatewayRouteMissingBackends(svcLister, getReferenceGrants, kind, route, now)...)
+			out = append(out, detectGatewayRouteMissingBackends(cache, svcLister, getReferenceGrants, kind, route, now)...)
 		}
 	}
 	return out
@@ -887,7 +929,7 @@ func gatewayReferenceGrantGetter(dynamicCache *DynamicResourceCache, discovery *
 	}
 }
 
-func detectGatewayRouteMissingBackends(svcLister corev1listers.ServiceLister, getReferenceGrants referenceGrantGetter, kind string, route *unstructured.Unstructured, now time.Time) []Detection {
+func detectGatewayRouteMissingBackends(cache *ResourceCache, svcLister corev1listers.ServiceLister, getReferenceGrants referenceGrantGetter, kind string, route *unstructured.Unstructured, now time.Time) []Detection {
 	rules, found, err := unstructured.NestedSlice(route.Object, "spec", "rules")
 	if err != nil || !found {
 		return nil
@@ -923,12 +965,18 @@ func detectGatewayRouteMissingBackends(svcLister corev1listers.ServiceLister, ge
 			svc, err := svcLister.Services(svcNS).Get(name)
 			source := fmt.Sprintf("spec.rules[%d].backendRefs[%d]", ri, bi)
 			if err != nil {
-				out = append(out, withFix(missingRefProblem(kind, "gateway.networking.k8s.io", route.GetNamespace(), route.GetName(),
-					"Missing Gateway backend Service",
-					fmt.Sprintf("%s references Service %q in namespace %q which does not exist", source, name, svcNS),
-					age),
-					fmt.Sprintf("Service %q in namespace %q doesn't exist, so this route's backend receives no traffic.", name, svcNS),
-					fmt.Sprintf("Point the backendRef at an existing Service in namespace %q, remove the stale backendRef, or create Service %q if this route should still send traffic there.", svcNS, name)))
+				// svcNS is frequently a CROSS-NAMESPACE backendRef target —
+				// exactly what a namespace-scoped Services informer doesn't
+				// watch. A miss there is "couldn't verify", not "missing";
+				// skip the whole backendRef (ports are unverifiable too).
+				if refKnownMissing(cache, "services", svcNS, err) {
+					out = append(out, withFix(missingRefProblem(kind, "gateway.networking.k8s.io", route.GetNamespace(), route.GetName(),
+						"Missing Gateway backend Service",
+						fmt.Sprintf("%s references Service %q in namespace %q which does not exist", source, name, svcNS),
+						age),
+						fmt.Sprintf("Service %q in namespace %q doesn't exist, so this route's backend receives no traffic.", name, svcNS),
+						fmt.Sprintf("Point the backendRef at an existing Service in namespace %q, remove the stale backendRef, or create Service %q if this route should still send traffic there.", svcNS, name)))
+				}
 				continue
 			}
 			if port == "" {
@@ -1073,7 +1121,7 @@ func detectPVCMissingStorageClass(cache *ResourceCache, namespace string, now ti
 			continue
 		}
 		scName := *pvc.Spec.StorageClassName
-		if _, err := scLister.Get(scName); err != nil {
+		if _, err := scLister.Get(scName); refKnownMissing(cache, "storageclasses", "", err) {
 			age := now.Sub(pvc.CreationTimestamp.Time)
 			det := withFix(missingRefProblem("PersistentVolumeClaim", "", pvc.Namespace, pvc.Name,
 				"Missing StorageClass",
@@ -1121,13 +1169,13 @@ func detectRoleBindingMissingRole(cache *ResourceCache, namespace string, now ti
 				return false, false
 			}
 			_, err := roleLister.Roles(ns).Get(name)
-			return true, err == nil
+			return refLookupResult(cache, "roles", ns, err)
 		case "ClusterRole":
 			if crLister == nil {
 				return false, false
 			}
 			_, err := crLister.Get(name)
-			return true, err == nil
+			return refLookupResult(cache, "clusterroles", "", err)
 		}
 		return false, false
 	}

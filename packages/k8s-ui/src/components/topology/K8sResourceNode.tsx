@@ -282,6 +282,11 @@ function getSubtitle(
   kind: NodeKind,
   nodeData: Record<string, unknown>,
 ): string {
+  // An explicit override wins over the per-kind computed subtitle: the Reachability
+  // diagram precomputes a functional one-liner (port→targetPort, readiness) the
+  // generic per-kind logic can't know. '' is a deliberate "no subtitle", honored as
+  // such. App-topology nodes never set this, so their behavior is unchanged.
+  if (typeof nodeData.subtitleOverride === 'string') return nodeData.subtitleOverride;
   const base = baseSubtitle(kind, nodeData);
   const ps = nodeData.podSummary as PodSummary | undefined;
   if (ps && SUMMARY_POD_KINDS.has(kind)) {

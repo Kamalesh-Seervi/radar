@@ -1459,6 +1459,34 @@ func (rc *ResourceCache) IsKindClusterWide(resource string) bool {
 	return ok && s.Enabled && s.Namespace == "" && len(rc.config.ResourceScopeNamespaces[resource]) == 0
 }
 
+// KindCoversNamespace reports whether the informer for a resource (plural
+// lowercase, e.g. "pods") reliably covers the given namespace - cluster-wide, or
+// namespace-scoped to exactly that namespace. When it returns false, an EMPTY
+// list for that namespace is NOT authoritative: the informer may simply not watch
+// it (namespace-scoped RBAC), so callers must not infer "0 objects" from a miss.
+// A nil ResourceScopes is the legacy/cluster-wide default and covers everything.
+func (rc *ResourceCache) KindCoversNamespace(resource, ns string) bool {
+	if rc == nil {
+		return false
+	}
+	if rc.config.ResourceScopes == nil {
+		return true
+	}
+	s, ok := rc.config.ResourceScopes[resource]
+	if !ok || !s.Enabled {
+		return false
+	}
+	if s.Namespace == "" {
+		return true
+	}
+	for _, watched := range resourceScopeNamespaces(resource, s, rc.config.ResourceScopeNamespaces) {
+		if watched == ns {
+			return true
+		}
+	}
+	return false
+}
+
 // KindNamespaces returns the namespaces covered by a namespaced informer.
 // A nil result means the kind is cluster-wide or disabled.
 func (rc *ResourceCache) KindNamespaces(resource string) []string {

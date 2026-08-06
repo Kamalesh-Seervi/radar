@@ -144,6 +144,7 @@ Use `/visual-test` command for the full workflow (cluster check, Playwright MCP,
 - GitOps detail data: `/api/gitops/tree/{kind}/{ns}/{name}` (resource tree + ownership edges), `/api/gitops/insights/{kind}/{ns}/{name}` (curated diagnosis: summary + issues + drift + events + plan + history + capabilities)
 - Nodes: `/api/nodes/{name}/...` (cordon, uncordon, drain, debug)
 - Audit: `/api/audit`, `/api/audit/resource/{kind}/{ns}/{name}`, `/api/settings/audit` (GET/PUT)
+- Network trace: `/api/trace/{kind}/{ns}/{name}` (path-shaped diagnosis for Service/Ingress/HTTPRoute/GRPCRoute/Gateway; `?probe=true` runs DNS/TCP/TLS/HTTP probes against the declared path - direct TCP in-cluster, K8s API server proxy from a laptop, gated by the user's `services/proxy` + `pods/proxy` RBAC).
 - Capacity (Karpenter): `/api/capacity` (overview), `/api/capacity/pools` (+ `/{name}`, `/{name}/members`), `/api/capacity/demand` (`?state=`, `?pool=`, `?owner=ns/Kind/name`, `?pod=ns/name`), `/api/capacity/activity` — all read-only, all gated on the caller's ability to list NodePools; deliberately cluster-wide (no namespace view-filter forwarding). See [docs/capacity.md](docs/capacity.md)
 - Upgrade impact: `/api/upgrade-readiness?target={major.minor}` (GET; cluster-wide evidence bounded by the current identity's RBAC and the configured cache scope)
 - CAPI: `/api/capi/clusters/{ns}/{name}/kubeconfig` (GET), `/api/capi/clusters/{ns}/{name}/connect` (POST)

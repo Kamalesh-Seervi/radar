@@ -51,6 +51,7 @@ type AppConfig struct {
 	DisableLocalTerminal     bool
 	PodShellDefault          string
 	DebugImage               string
+	ReachabilityImage        string
 	ListPageSize             int64
 	NamespaceScope           bool
 	TimelineStorage          string
@@ -268,6 +269,7 @@ func CreateServer(cfg AppConfig) *server.Server {
 		PrometheusHeaders:        cfg.PrometheusHeaders,
 		PrometheusHeadersFromEnv: cfg.PrometheusHeadersFromEnv,
 		DebugImage:               cfg.DebugImage,
+		ReachabilityImage:        cfg.ReachabilityImage,
 		MCP:                      &cfg.MCPEnabled,
 	}
 
