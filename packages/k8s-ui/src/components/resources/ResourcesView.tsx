@@ -153,6 +153,9 @@ import { ResourceClaimCell, ResourceClaimTemplateCell, DeviceClassCell, Resource
 import { NvidiaClusterPolicyCell, NvidiaDriverCell } from './renderers/nvidia-cells'
 import { ServiceMonitorCell, PrometheusRuleCell, PodMonitorCell } from './renderers/prometheus-cells'
 import { PolicyReportCell, ClusterPolicyReportCell, KyvernoPolicyCell, ClusterPolicyCell } from './renderers/kyverno-cells'
+import { KyvernoModernPolicyCell, KyvernoPolicyExceptionCell, KyvernoCleanupPolicyCell } from './renderers/kyverno-modern-cells'
+import { KYVERNO_MODERN_PLURALS, isModernKyvernoPolicy } from './resource-utils-kyverno-modern'
+import { isAnyKyvernoPolicyException } from './resource-utils-kyverno-exceptions'
 import { ExternalSecretCell, ClusterExternalSecretCell, SecretStoreCell, ClusterSecretStoreCell } from './renderers/eso-cells'
 import { BackupCell, RestoreCell, ScheduleCell, BackupStorageLocationCell } from './renderers/velero-cells'
 import { CNPGClusterCell, CNPGBackupCell, CNPGScheduledBackupCell, CNPGPoolerCell } from './renderers/cnpg-cells'
@@ -702,20 +705,20 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
   policyreports: [
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-36' },
-    { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'status', label: 'Status', width: 'w-32' },
     { key: 'pass', label: 'Pass', width: 'w-16' },
     { key: 'fail', label: 'Fail', width: 'w-16' },
-    { key: 'warn', label: 'Warn', width: 'w-16' },
+    { key: 'warn', label: 'Warn', width: 'w-20' },
     { key: 'error', label: 'Err', width: 'w-16' },
     { key: 'skip', label: 'Skip', width: 'w-16' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   clusterpolicyreports: [
     { key: 'name', label: 'Name' },
-    { key: 'status', label: 'Status', width: 'w-24' },
+    { key: 'status', label: 'Status', width: 'w-32' },
     { key: 'pass', label: 'Pass', width: 'w-16' },
     { key: 'fail', label: 'Fail', width: 'w-16' },
-    { key: 'warn', label: 'Warn', width: 'w-16' },
+    { key: 'warn', label: 'Warn', width: 'w-20' },
     { key: 'error', label: 'Err', width: 'w-16' },
     { key: 'skip', label: 'Skip', width: 'w-16' },
     { key: 'age', label: 'Age', width: 'w-24' },
@@ -733,6 +736,119 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
     { key: 'status', label: 'Status', width: 'w-24' },
     { key: 'action', label: 'Action', width: 'w-24', tooltip: 'Validation failure action (Enforce or Audit)' },
     { key: 'rules', label: 'Rules', width: 'w-16' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  // Kyverno modern CEL family (policies.kyverno.io). "Enforcement" is the
+  // effective posture, not spec.validationActions verbatim — a policy that
+  // declares Deny with admission evaluation disabled blocks nothing.
+  validatingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'status', label: 'Enforcement', width: 'w-44', tooltip: 'Effective enforcement posture, accounting for whether admission evaluation is enabled' },
+    { key: 'appliesTo', label: 'Applies To', width: 'min-w-40', tooltip: 'Resources matched by spec.matchConstraints' },
+    { key: 'rules', label: 'Rules', width: 'w-20', tooltip: 'CEL validation expressions' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  namespacedvalidatingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Enforcement', width: 'w-44', tooltip: 'Effective enforcement posture, accounting for whether admission evaluation is enabled' },
+    { key: 'appliesTo', label: 'Applies To', width: 'min-w-40' },
+    { key: 'rules', label: 'Rules', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  imagevalidatingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'status', label: 'Enforcement', width: 'w-44' },
+    { key: 'images', label: 'Images', width: 'min-w-40', tooltip: 'Image references this policy verifies' },
+    { key: 'attestors', label: 'Attestors', width: 'w-20', tooltip: 'Trusted signing authorities' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  namespacedimagevalidatingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Enforcement', width: 'w-44' },
+    { key: 'images', label: 'Images', width: 'min-w-40' },
+    { key: 'attestors', label: 'Attestors', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  mutatingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'status', label: 'Enforcement', width: 'w-44' },
+    { key: 'appliesTo', label: 'Applies To', width: 'min-w-40' },
+    { key: 'rules', label: 'Mutations', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  namespacedmutatingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Enforcement', width: 'w-44' },
+    { key: 'appliesTo', label: 'Applies To', width: 'min-w-40' },
+    { key: 'rules', label: 'Mutations', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  generatingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'status', label: 'Enforcement', width: 'w-44' },
+    { key: 'appliesTo', label: 'Applies To', width: 'min-w-40' },
+    { key: 'rules', label: 'Generates', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  namespacedgeneratingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Enforcement', width: 'w-44' },
+    { key: 'appliesTo', label: 'Applies To', width: 'min-w-40' },
+    { key: 'rules', label: 'Generates', width: 'w-20' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  // The Deleting kinds are the only modern family whose headline column is the
+  // schedule rather than the enforcement posture, so they carry their own
+  // health signal. It is Last Run, NOT readiness: Kyverno 1.18.2 declares a
+  // READY printer column on these CRDs but never populates
+  // status.conditionStatus.ready, so `kubectl get deletingpolicies` prints it
+  // blank and a Ready column here would read "unknown" on every row forever.
+  // It also has nothing to catch — an uncompilable policy is rejected at
+  // admission and never exists. What does go wrong is a policy that exists and
+  // silently never fires, which lastExecutionTime shows.
+  //
+  // The other eight kinds deliberately have no readiness column either: their
+  // status cell already returns "Not Ready" IN PLACE OF the posture (see
+  // getModernKyvernoPolicyStatus), so a second one would be redundant.
+  deletingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'lastRun', label: 'Last Run', width: 'w-28', tooltip: 'When the schedule last fired. A scheduled policy that has never run is the failure worth catching — Kyverno rejects uncompilable policies at admission, so a broken one never exists to flag.' },
+    { key: 'schedule', label: 'Schedule', width: 'w-32', tooltip: 'Cron schedule on which matched resources are deleted' },
+    { key: 'appliesTo', label: 'Deletes', width: 'min-w-40' },
+    { key: 'rules', label: 'Conditions', width: 'w-28', tooltip: 'CEL conditions narrowing what is deleted; none means every matched resource' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  namespaceddeletingpolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'lastRun', label: 'Last Run', width: 'w-28', tooltip: 'When the schedule last fired. A scheduled policy that has never run is the failure worth catching — Kyverno rejects uncompilable policies at admission, so a broken one never exists to flag.' },
+    { key: 'schedule', label: 'Schedule', width: 'w-32' },
+    { key: 'appliesTo', label: 'Deletes', width: 'min-w-40' },
+    { key: 'rules', label: 'Conditions', width: 'w-28' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  policyexceptions: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Exempts', width: 'w-28', tooltip: 'How many policies this exception bypasses' },
+    { key: 'policies', label: 'Policies', width: 'min-w-40' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  cleanuppolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'schedule', label: 'Schedule', width: 'w-32' },
+    { key: 'appliesTo', label: 'Deletes', width: 'min-w-40' },
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  clustercleanuppolicies: [
+    { key: 'name', label: 'Name' },
+    { key: 'schedule', label: 'Schedule', width: 'w-32' },
+    { key: 'appliesTo', label: 'Deletes', width: 'min-w-40' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   grpcroutes: [
@@ -5455,6 +5571,29 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
 
   // Kind-specific columns (normalize CRD singular names like 'ScaledObject' → 'scaledobjects')
   const kindLower = normalizeKindToPlural(kind, group)
+
+  // Kyverno cells are group-gated ahead of the switch so a non-matching CR
+  // falls through to the switch's default (GenericCell) instead of being
+  // described in Kyverno's vocabulary. These plurals are generic enough that
+  // another vendor could ship them, and `policyexceptions` is served by BOTH
+  // Kyverno API families with different spec shapes. The stakes are higher
+  // here than in the drawer: an absent `validationActions` legitimately means
+  // Deny for a real Kyverno policy, so an ungated foreign CR would render a
+  // red "Deny" badge purely because it lacks a field it never had.
+  if (KYVERNO_MODERN_PLURALS.has(kindLower) && isModernKyvernoPolicy(resource)) {
+    return <KyvernoModernPolicyCell resource={resource} column={column} />
+  }
+  if (kindLower === 'policyexceptions' && isAnyKyvernoPolicyException(resource)) {
+    return <KyvernoPolicyExceptionCell resource={resource} column={column} />
+  }
+  if (
+    (kindLower === 'cleanuppolicies' || kindLower === 'clustercleanuppolicies') &&
+    typeof resource?.apiVersion === 'string' &&
+    resource.apiVersion.startsWith('kyverno.io/')
+  ) {
+    return <KyvernoCleanupPolicyCell resource={resource} column={column} />
+  }
+
   switch (kindLower) {
     case 'pods':
       return <PodCell resource={resource} column={column} />

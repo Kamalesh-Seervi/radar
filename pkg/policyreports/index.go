@@ -95,10 +95,40 @@ func (i *Index) Replace(reports []*unstructured.Unstructured) {
 	for _, r := range sorted {
 		extractFindings(r, next)
 	}
+	dedupeFindings(next)
 
 	i.mu.Lock()
 	i.bySubject = next
 	i.mu.Unlock()
+}
+
+// dedupeFindings collapses byte-identical findings within each subject.
+//
+// A cluster migrating between report APIs (wgpolicyk8s.io → openreports.io)
+// can serve both families at once, and the caller may legitimately watch both
+// when both hold data — stale reports in the old family otherwise disappear
+// from view entirely. The same (policy, rule, result, message, source) on the
+// same subject carries no extra information whichever report it arrived in,
+// and counting it twice would inflate every violation total.
+//
+// Order is preserved: the first occurrence wins, so the newest report's copy
+// is the one kept (Replace feeds reports newest-first).
+func dedupeFindings(bySubject map[string][]Finding) {
+	for key, findings := range bySubject {
+		if len(findings) < 2 {
+			continue
+		}
+		seen := make(map[Finding]bool, len(findings))
+		out := findings[:0]
+		for _, f := range findings {
+			if seen[f] {
+				continue
+			}
+			seen[f] = true
+			out = append(out, f)
+		}
+		bySubject[key] = out
+	}
 }
 
 // FindingsFor returns the findings indexed for the given subject. Returns
@@ -125,6 +155,55 @@ func (i *Index) FindingsFor(group, kind, namespace, name string) []Finding {
 	}
 	out := make([]Finding, len(src))
 	copy(out, src)
+	return out
+}
+
+// FindingsForEngine returns the findings indexed for the given subject that
+// were produced by the given engine. Same contract as FindingsFor,
+// filtered.
+//
+// Filtering happens on the normalized engine rather than the raw Source
+// because one engine emits several source values — asking for
+// EngineKyverno must return legacy `kyverno` results and modern
+// `KyvernoValidatingPolicy` results alike. A caller that matched on the raw
+// string would silently see only part of what Kyverno reported.
+func (i *Index) FindingsForEngine(group, kind, namespace, name string, engine Engine) []Finding {
+	return i.FindingsForAnyEngine(group, kind, namespace, name, engine)
+}
+
+// FindingsForAnyEngine returns the findings indexed for the given subject that
+// were produced by any of the given engines.
+//
+// Use this over FindingsFor wherever the result is labelled with an engine
+// name. The index is shared across producers — Kyverno, Trivy, Falco adapters
+// and VAP evaluation all write into the same report families — so an
+// unfiltered read presented under one engine's name over-counts the moment a
+// second engine is installed.
+//
+// Passing no engines returns nil. An empty filter means "nothing matches"
+// rather than "everything", so a caller that accidentally passes an empty set
+// gets an obviously empty result instead of silently unfiltered data.
+func (i *Index) FindingsForAnyEngine(group, kind, namespace, name string, engines ...Engine) []Finding {
+	if len(engines) == 0 {
+		return nil
+	}
+	all := i.FindingsFor(group, kind, namespace, name)
+	if len(all) == 0 {
+		return nil
+	}
+	want := make(map[Engine]bool, len(engines))
+	for _, e := range engines {
+		want[e] = true
+	}
+	out := make([]Finding, 0, len(all))
+	for _, f := range all {
+		if want[f.Engine()] {
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
 	return out
 }
 
@@ -225,6 +304,7 @@ func (i *Index) Size() int {
 //	    severity: info|low|medium|high|critical
 //	    category: string
 //	    message: string
+//	    source: string                               # producer type, not engine
 //	    resources:
 //	      - apiVersion, kind, namespace, name, uid     # optional, can be []
 //	    ...
@@ -255,6 +335,7 @@ func extractFindings(report *unstructured.Unstructured, dst map[string][]Finding
 			Severity: stringField(entry, "severity"),
 			Category: stringField(entry, "category"),
 			Message:  stringField(entry, "message"),
+			Source:   stringField(entry, "source"),
 		}
 
 		subjects, hasResources := resultResources(entry)

@@ -21,14 +21,25 @@ import (
 // internal/server/ai_handlers.go — keeping the projection narrow here lets
 // pkg/policyreports.Finding evolve without perturbing the wire contract.
 type mcpPolicyReportLookupAdapter struct {
-	idx *policyreports.Index
+	idx    *policyreports.Index
+	status k8s.PolicyReportStatus
+}
+
+// Unavailable implements resourcecontext.PolicyReportAvailability so an agent
+// can tell "no violations" from "Radar could not read the policy reports".
+func (a mcpPolicyReportLookupAdapter) Unavailable() (resourcecontext.OmittedReason, bool) {
+	return a.status.OmittedReason()
 }
 
 func (a mcpPolicyReportLookupAdapter) FindingsFor(group, kind, namespace, name string) []resourcecontext.KyvernoFinding {
 	if a.idx == nil {
 		return nil
 	}
-	findings := a.idx.FindingsFor(group, kind, namespace, name)
+	// Filtered, not FindingsFor: this projection fills `policySummary.kyverno`,
+	// and the index is shared with every other producer writing into the same
+	// report families — Trivy, Falco adapters, VAP evaluation. An unfiltered
+	// read would inflate the Kyverno rollup with enforcement Kyverno never did.
+	findings := a.idx.FindingsForAnyEngine(group, kind, namespace, name, policyreports.EnginesAttributableToKyverno...)
 	if len(findings) == 0 {
 		return nil
 	}
