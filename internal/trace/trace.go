@@ -349,6 +349,33 @@ type Trace struct {
 	// synthesizing). Set in computeCoverage; nil when there is nothing to
 	// diagnose (every route verified over real traffic). See Diagnosis.
 	Diagnosis *Diagnosis `json:"diagnosis,omitempty"`
+	// EntryProblems are faults on the resource's DECLARED ENTRY POINTS - an
+	// Ingress or route that will never receive traffic. They are deliberately
+	// NOT part of Diagnosis: upstreams are parallel, so one dead front door must
+	// not condemn a Service that is genuinely reachable through another. But a
+	// verdict scoped to the tested path can't see them either, which left a real
+	// misconfiguration visible only as a dot inside a graph node. Vantage-
+	// invariant (they are config facts) and deduped against Diagnosis.
+	EntryProblems []EntryProblem `json:"entryProblems,omitempty"`
+}
+
+// EntryProblem is one declared entry point that cannot carry traffic, promoted
+// from an existing upstream Finding - never synthesized.
+type EntryProblem struct {
+	Resource ResourceRef `json:"resource"`
+	// Summary is the HUMAN line ("Not attached: no listener matches its hosts").
+	// Deliberately Message-first, the opposite of Diagnosis: a diagnosis wants
+	// the deeper cause, but a one-line row under the header wants the sentence a
+	// non-expert can read - the raw controller condition goes in Detail, one
+	// hover away.
+	Summary string `json:"summary"`
+	// Detail is the underlying cause (a controller condition, usually), shown on
+	// hover. Empty when it would just repeat Summary.
+	Detail string `json:"detail,omitempty"`
+	Severity string      `json:"severity"`
+	Code     string      `json:"code,omitempty"`
+	Action   string      `json:"action,omitempty"`
+	Command  string      `json:"command,omitempty"`
 }
 
 // UnknownClass enumerates the two distinct flavors of an unknown verdict.

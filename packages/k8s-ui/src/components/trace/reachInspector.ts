@@ -2,7 +2,7 @@ import type { Trace, RouteResult, ResourceRef } from './types'
 import type { Mark, SevTone } from './reachMarks'
 import { routeMark, routeChip, routeTone, routeAsSeenFrom, originRouteEvidence, routeForOrigin, traceInClusterRunnable, markHelp } from './reachMarks'
 import type { Origin, OriginId } from './reachOrigins'
-import { strongestGap, actionableGap, originSkipReason } from './reachOrigins'
+import { strongestGap, actionableGap, originSkipReason, originInformationalReason } from './reachOrigins'
 import { hopEvidenceFor, originProducedEvidence, type GraphNode } from './reachGraphModel'
 
 // 'run-probes' re-runs the reachability probes. It is deliberately NOT
@@ -45,7 +45,7 @@ export interface Sidebar {
     scope: { k: string; v: string }[]
     evidence: { mark: Mark; text: string }[]
     notProve: string[]
-    next: { header: string; body: string; blocked?: string; ctas: InspectorCTA[]; quiet?: boolean }
+    next: { header: string; body: string; blocked?: string; ctas: InspectorCTA[] }
   }
   /** Every hop on the selected path, in order - the whole story for this path
    *  seen from this vantage, rather than a summary plus whichever node was last
@@ -74,7 +74,7 @@ export interface HopDetail {
 /** Configured-but-bypassed resources, grouped under one label naming WHY they
  *  are outside this vantage's journey. Their config sections stay readable;
  *  their journey-state words do not apply. */
-function contextGroup(ctx: Ctx, byId: Map<string, GraphNode>): Sidebar['context'] {
+function contextGroup(ctx: Ctx, byId: Map<string, GraphNode>, sel: Selection): Sidebar['context'] {
   const nodes = (ctx.contextNodeIds ?? []).map((id) => byId.get(id)).filter((n): n is GraphNode => !!n)
   if (nodes.length === 0) return undefined
   const label =
@@ -85,12 +85,16 @@ function contextGroup(ctx: Ctx, byId: Map<string, GraphNode>): Sidebar['context'
         : 'PARALLEL ENTRY — NOT ON THIS ROUTE\u2019S PATH'
   return {
     label,
+    // Context hops are collapsed by default - they are not the journey. But the
+    // SELECTED one opens: the entry-problem row's whole purpose is "show me the
+    // cause", and landing on a still-collapsed section makes the reader spend a
+    // second click on the thing they just asked for.
     hops: nodes.map((n) => ({
       ...resourceSection(n),
       id: n.id,
       state: 'plain' as const,
       chipText: '',
-      expanded: false,
+      expanded: sel === n.id,
     })),
   }
 }
@@ -120,7 +124,7 @@ const NOT_DATAPLANE = 'Nothing about the normal network path. Kubernetes relayed
 const SYNTHETIC_IDENTITY =
   'That your app can reach it. This test ran from a throwaway Pod under the namespace’s default account with no token mounted — not as your application — so anything that checks who is calling may answer differently.'
 
-function originScope(o: Origin, trace: Trace): { k: string; v: string }[] {
+function originScope(o: Origin, trace: Trace, request?: string): { k: string; v: string }[] {
   const runsIn: Record<OriginId, string> = {
     incluster: `a throwaway Pod in ${trace.subject.namespace || 'the cluster'}`,
     'radar-incluster': 'Radar\u2019s own Pod',
@@ -137,6 +141,9 @@ function originScope(o: Origin, trace: Trace): { k: string; v: string }[] {
     // different facts and must not share a label.
     { k: o.id === 'local' ? 'NETWORK POSITION' : 'IDENTITY', v: o.identity },
     { k: 'MECHANISM', v: o.mech },
+    // A status code cannot be read without knowing what was asked for - "404"
+    // means nothing until you know the request was GET /.
+    ...(request ? [{ k: 'REQUEST', v: request }] : []),
   ]
 }
 
@@ -151,6 +158,7 @@ function gapNext(
   namespace?: string,
   multiPath?: boolean,
   inClusterRunnable = true,
+  canRun = true,
 ): Sidebar['path']['next'] {
   // The server can only test a route that carries a concrete in-cluster request.
   // When none does, the run fails with "not supported for this subject" - so the
@@ -161,7 +169,14 @@ function gapNext(
   // graph, which is the thing that would produce the missing evidence - and a
   // third copy of the same control (header, panel, capsule) was one too many.
   // The panel keeps the REASONING, which is what it is good at.
-  const inClusterCTA = (): InspectorCTA[] => []
+  const inClusterCTA = (): InspectorCTA[] => {
+    // No handler wired (a library consumer that omits it) means the click would
+    // do nothing at all - offer nothing rather than a button that lies.
+    if (!canRun) return []
+    return inClusterRunnable
+      ? [{ text: '⚗ Run the in-cluster test', action: 'run-in-cluster', primary: true }]
+      : [{ text: '⚗ Run the in-cluster test', action: 'run-in-cluster', disabledReason: notRunnable }]
+  }
   const actionable = actionableGap(origins)
   const ceiling = strongestGap(origins)
   const ceilingNote = ceiling?.unsupported ? `Even then, ${ceiling.name.toLowerCase()} stays untested — ${ceiling.unavailable}` : undefined
@@ -194,28 +209,23 @@ function gapNext(
     }
   }
   if (actionable && actionable.id === current.id) {
-    // You are looking at the vantage that is itself the gap.
+    // You are looking at the vantage that is itself the gap. The section body
+    // already said nothing ran from here, and the caveats section already
+    // carries the ceiling - so this is the ACTION and nothing else.
     return {
-      header: 'RUN THIS NEXT',
-      body: inClusterRunnable
-        ? `Nothing has been tested from ${actionable.name} yet, and it is the strongest evidence Radar can still collect.${allPaths}`
-        : `${notRunnable} Every declared path here was skipped before a request could be formed.`,
-      blocked: ceilingNote,
+      header: '',
+      body: inClusterRunnable ? '' : `${notRunnable} Every declared path here was skipped before a request could be formed.`,
       ctas: actionable.id === 'incluster' ? inClusterCTA() : [{ text: '⟳ Re-run', action: 'run-probes' }],
     }
   }
   if (!actionable) {
-    // Terminal state: there is nothing to do, and a call-to-action box whose
-    // message is "no action" shouts its own irrelevance. One quiet line of
-    // closure; no Re-run (the header already owns that control - the same
-    // one-copy rule as inClusterCTA), and no ceiling caveat (WHAT THIS
-    // DOESN'T PROVE states it on this same pane).
-    return {
-      header: 'NO STRONGER TEST AVAILABLE',
-      body: `This is the strongest evidence Radar can collect for this path.${allPaths}`,
-      ctas: [],
-      quiet: true,
-    }
+    // Nothing to offer: say nothing. This was a resource-level statement living
+    // in the selection-scoped panel, identical on every vantage - the scope
+    // mixing this redesign exists to remove - and the ceiling it gestured at is
+    // already stated, with specifics, in WHAT THIS DOESN'T PROVE and in the
+    // footer's coverage ledger. An empty section is the honest render of
+    // "there is no next step".
+    return { header: '', body: '', ctas: [] }
   }
   return {
     header: 'RUN THIS NEXT',
@@ -259,6 +269,9 @@ interface Ctx {
   multiPath?: boolean
   /** The HTTP path the run requests, as chosen in "what to test". */
   httpPath?: string
+  /** False when the host wired no in-cluster handler, or permission is denied:
+   *  the run must not be offered at all then. */
+  canRunInCluster?: boolean
 }
 
 /**
@@ -280,7 +293,73 @@ function restatesTitle(summary: string | undefined, title: string): boolean {
   return !!summary && !!title && norm(summary) === norm(title)
 }
 
+/** The request this route would send, in one line - "GET /healthz", or "TCP
+ *  connect" where there is no application request to make. */
+function requestLabel(route: RouteResult | undefined, httpPath?: string): string | undefined {
+  const r = route?.inClusterRequest
+  if (!r) return undefined
+  if (r.protocol === 'tcp') return 'TCP connect'
+  const path = httpPath || r.path || '/'
+  return `GET ${path}`
+}
+
+/**
+ * What an ANSWER means for this page's question.
+ *
+ * "reached" plus an HTTP status is the single most-misread result on the tab:
+ * a reader sees amber and 404 and cannot tell whether that is a problem. It is
+ * not - for the question this page asks. The network path is proven the moment
+ * the app answers at all; the status code is a statement about the app's own
+ * routing, auth or health, which reachability does not judge. Say that, and say
+ * what would turn it into a verified pass.
+ */
+/**
+ * What an answer MEANS, and whether that answer is evidence the path works.
+ *
+ * `pathWorks` is the load-bearing half: an app answering 404 proves the journey
+ * reached it, while a gateway answering 502 proves the opposite. Both are
+ * "answers", so a caller that prefixes every meaning with "the path works"
+ * states the reverse of the truth on exactly the cases that matter most.
+ */
+function statusMeaning(evidence?: string, httpPath?: string, failedLayer?: string): { text: string; pathWorks: boolean } | undefined {
+  // A cert failure never gets an HTTP status - the handshake stops before a
+  // request is sent - so this must be decided before looking for a code.
+  if (failedLayer === 'tls') {
+    return { text: 'the TLS handshake did not verify - a certificate problem, not an application one.', pathWorks: false }
+  }
+  const m = /HTTP\s+(\d{3})/i.exec(evidence ?? '')
+  if (!m) return undefined
+  const code = Number(m[1])
+  const asked = httpPath && httpPath !== '/' ? httpPath : '/'
+  // 502/504 are NOT the app: a gateway answering that it could not reach its
+  // upstream. The producer says so with failedLayer 'upstream'; blaming app
+  // health here contradicted the chip beside it.
+  if (failedLayer === 'upstream' || code === 502 || code === 504) {
+    return {
+      text: `the front door answered, but only to say it could not reach the backend (HTTP ${code}) - the break is between the entry and the app, not inside the app.`,
+      pathWorks: false,
+    }
+  }
+  if (code >= 500) {
+    return { text: `the request reached the app and the app itself returned an error (HTTP ${code}) - application health, which this page does not judge.`, pathWorks: true }
+  }
+  if (code === 401 || code === 403 || code === 407) {
+    return { text: `the app answered by demanding credentials (HTTP ${code}) - it is enforcing auth, which is a different thing from reachability.`, pathWorks: true }
+  }
+  if (code >= 300 && code < 400) {
+    return { text: `the app answered with a redirect (HTTP ${code}), which Radar does not follow - so whatever it points at is untested from here.`, pathWorks: true }
+  }
+  if (code >= 400) {
+    return { text: `the app answered (HTTP ${code}) - that is it saying it serves no route for ${asked}, not a reachability problem. To verify a real route, re-run with a path your app serves.`, pathWorks: true }
+  }
+  return undefined
+}
+
 /** The persistent diagnosis: did traffic get through, from where, and what next. */
+/** The suffix the localization lines carry; stripped when deduping so one
+ *  observation cannot appear twice at two lengths. */
+const LOCALIZED_SUFFIX_RE = / [-\u2014] checked directly, past the entry point$/
+
 function pathSection(ctx: Ctx): Sidebar['path'] {
   const { trace, route, origin, origins } = ctx
   // The route outcome is merged across origins. Without this gate the panel
@@ -330,17 +409,28 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
   }
 
   const evidence: { mark: Mark; text: string }[] = []
-  const seen = new Set<string>()
+  const seen = new Map<string, number>()
+  // Two lines can be the SAME observation worded at different lengths: a route's
+  // rollup evidence and the localization fact from that same dial differ only by
+  // the " - checked directly..." suffix, so exact-string dedupe let both through
+  // and the reader saw "HTTP 404 - reached" twice. Key on the observation and
+  // keep the more specific wording.
   const add = (m: Mark, text: string) => {
-    const key = text.trim().toLowerCase()
-    if (!key || seen.has(key)) return
-    seen.add(key)
-    evidence.push({ mark: m, text })
+    const t = text.trim()
+    const key = t.toLowerCase().replace(LOCALIZED_SUFFIX_RE, '').trim()
+    if (!key) return
+    const at = seen.get(key)
+    if (at !== undefined) {
+      if (t.length > evidence[at].text.length) evidence[at] = { mark: evidence[at].mark, text: t }
+      return
+    }
+    seen.set(key, evidence.length)
+    evidence.push({ mark: m, text: t })
   }
   if ((hasEvidence || fromConfig) && asSeen?.evidence) add(mark, asSeen.evidence)
-  // A result with no evidence STRING is still a result. Falling through to the
-  // "nothing ran" default below printed "no test has been run from here" beside
-  // a headline reporting what that very run found.
+  // A result with no evidence STRING is still a result: show what the mark
+  // means rather than leaving the section empty, which would read as "nothing
+  // ran" for a vantage that did.
   else if (hasEvidence && asSeen) add(mark, markHelp(mark))
   // What this vantage saw at each HOP. The route is built from the backend's
   // probes, so a laptop that dialled the front door and got an answer had all
@@ -378,12 +468,16 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
     // has been run" - the capsule preserves the attempt and this row must not
     // erase it. The error itself is the observation.
     const attemptError = origin.id === 'incluster' && origin.mark === 'blocked' ? origin.unavailable : undefined
+    // A demoted run produced a real observation; "no test has been run from
+    // here" erased it.
+    const informational = origin.mark === 'inconclusive' ? originInformationalReason(trace, origin.id) : undefined
     add(
       mark,
       // The attempt error outranks skip rows: a prior Job's leftover skips
       // would otherwise paint a fresh failed run (image pull, quota) with last
       // run's reason, one pane from a capsule saying "test couldn't run".
-      attemptError ||
+      informational ||
+        attemptError ||
         skipReason ||
         (origin.unsupported
           ? 'Radar cannot test from here, so nothing has been learned this way'
@@ -392,7 +486,7 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
             : // A vantage that CANNOT be used states why (nothing dialable from
               // the laptop, a skipped mechanism) - "no test has been run" reads
               // as a test someone forgot, which is a different claim.
-              origin.unavailable || 'no test has been run from here'),
+              origin.unavailable || ''),
     )
   }
 
@@ -403,12 +497,22 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
   const rawDiagnosis = trace.diagnosis
   const diagnosis = rawDiagnosis && (!rawDiagnosis.route || rawDiagnosis.route === route?.route) ? rawDiagnosis : undefined
   const reachedSomething = !hasEvidence && !fromConfig && hopSeen.some((x) => x.ev.mark !== 'failed')
+  const answer = statusMeaning(asSeen?.evidence, ctx.httpPath, asSeen?.failedLayer)
   const body = basis === 'cluster-state'
     ? 'Nothing is ready to serve this path right now, so it cannot work from any vantage. No request was sent to establish that — it is read off the current state of the cluster, and it changes when the workload does.'
     : fromConfig
     ? 'The configuration itself is broken, so this path cannot work from any vantage. No request was sent to establish that — it is read off what is declared.'
     : reachedSomething
     ? 'This vantage did reach part of the path — see what it saw below. It has no result for this route as a whole, so the end-to-end journey from here is still unproven.'
+    : origin.mark === 'inconclusive' || mark === 'inconclusive'
+    // A demoted run RAN and answered - it is only kept out of the verdict. The
+    // "nothing has been tested" branch below fired first and denied it happened.
+    // Both the origin's mark and the route's own can carry the demotion, and the
+    // sentence is the same either way; the reason comes from the informational
+    // skip that recorded it, never from the route-scoped skip lookup.
+    ? `The probe ran and got an answer, but it is kept as evidence rather than a verdict${
+        originInformationalReason(trace, origin.id) ? `: ${originInformationalReason(trace, origin.id)}` : ''
+      }. A throwaway identity cannot stand in for your application, so what it saw informs but never decides.`
     : !hasEvidence
     ? (origin.unavailable || 'Nothing has been tested from here, so this says nothing about whether traffic gets through.') +
       // When NOTHING was tested anywhere, the health dots are the only colour
@@ -420,11 +524,23 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
     : mark === 'proved'
       ? 'A real request went through and the target answered.'
       : mark === 'proxied'
-        ? 'Kubernetes relayed a request and the target answered — which shows something is serving, not that the normal path works.'
+        ? [
+            'Kubernetes relayed a request and the target answered — which shows something is serving, not that the normal path works.',
+            // The relay caveat alone leaves "404" unreadable: the reader still
+            // cannot tell whether the answer itself was a problem.
+            answer && `As for the answer itself: ${answer.text}`,
+          ]
+            .filter(Boolean)
+            .join(' ')
         : mark === 'untested'
           ? 'Nothing has been tried from here yet. Configuration may look right, but that is intent, not proof.'
           : mark === 'stale'
             ? 'This result predates a change to the cluster, so it is set aside rather than trusted.'
+            : mark === 'excluded'
+              // Benign by design (deliberately scaled to zero, a not-eligible
+              // endpoint). It fell through to the generic "answered" sentence,
+              // which described a request that was never sent.
+              ? `${asSeen?.evidence || 'Nothing is behind this path right now'} — that is deliberate, not a failure: nothing was sent, because there is nothing to reach.`
             : mark === 'running'
               ? 'A test is running. Earlier results stay until new ones replace them.'
               : // A proxy-only failure wears the same amber mark as a real answer,
@@ -432,7 +548,14 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
                 // the reader to debug an application response that never existed.
                 asSeen?.outcome === 'unreachable' && asSeen?.confidence === 'indirect'
                 ? 'The relayed dial failed. The proxy bypasses the real path, so this does not condemn it — but nothing answered, and the real path is still untested.'
-                : 'The target answered, but not with what was asked for.'
+                : // Only an answer that proves the journey completed earns "the
+                  // path works" - a 502 or a failed handshake is an answer that
+                  // says the opposite.
+                  (answer ? (answer.pathWorks ? `The path works: ${answer.text}` : `The path did not work: ${answer.text}`) : undefined) ??
+                // A transport-only reach: nothing was asked of the application.
+                (asSeen?.outcome === 'reached'
+                  ? 'The port accepted a connection, but nothing was asked of the application - the transport works and the application protocol is unverified.'
+                  : 'The target answered, but not with what was asked for.')
 
   return {
     chipTone: asSeen ? routeTone(asSeen, { stale: ctx.stale, running: ctx.running }) : 'unknown',
@@ -440,7 +563,7 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
     title: `${origin.name} → ${route?.target || trace.subject.name}`,
     request: route ? `${route.route}${ctx.httpPath && ctx.httpPath !== '/' ? ` · HTTP path ${ctx.httpPath}` : ''}` : undefined,
     body,
-    scope: [...originScope(origin, trace), ...(route ? [{ k: 'PATH', v: route.route }] : [])],
+    scope: [...originScope(origin, trace, requestLabel(route, ctx.httpPath)), ...(route ? [{ k: 'PATH', v: route.route }] : [])],
     evidence,
     notProve,
     next:
@@ -453,7 +576,7 @@ function pathSection(ctx: Ctx): Sidebar['path'] {
               ...(diagnosis.command ? [{ text: 'Copy the command', action: 'copy-command' as InspectorAction, command: diagnosis.command }] : []),
             ],
           }
-        : gapNext(origins, origin, trace.subject.namespace, ctx.multiPath, traceInClusterRunnable(trace)),
+        : gapNext(origins, origin, trace.subject.namespace, ctx.multiPath, traceInClusterRunnable(trace), ctx.canRunInCluster !== false),
   }
 }
 
@@ -592,7 +715,7 @@ export function buildSidebar(sel: Selection, ctx: Ctx): Sidebar {
         expanded: sel ? n.id === sel : i === defaultOpen,
       }
     }),
-    context: contextGroup(ctx, byId),
+    context: contextGroup(ctx, byId, sel),
   }
 }
 
@@ -611,6 +734,8 @@ export function buildVerdict(
    *  route-scoped badge apart from the resource-wide headline beside it. */
   chipScope?: string
   scopeLabel?: string
+  /** The selected vantage's name - the viewing strip renders it. */
+  originName?: string
   title: string
   problem?: string
   body: string
@@ -647,6 +772,7 @@ export function buildVerdict(
       .filter(Boolean)
       .join(' · ') || undefined,
     scopeLabel: opts.pathLabel || opts.originName ? 'THIS RESOURCE' : undefined,
+    originName: opts.originName,
     // A stale screen previously led with the old headline ("Reachable...") and
     // then said underneath that the result was excluded. That is a contradiction,
     // not an exclusion.

@@ -107,6 +107,50 @@ export function markHelp(m: Mark): string {
   return MARK_LEGEND.find((l) => l.mark === m)?.text ?? m
 }
 
+/**
+ * What a LINE means, when the generic mark help would mislead.
+ *
+ * Structural edges are drawn `config` because nothing was dialled along them -
+ * but "not tested" then invites the reader to ask why we didn't, and the honest
+ * answer differs per edge: ownership is not a traffic hop at all, a selector is
+ * read from the cluster rather than proven by a request, and declared routing
+ * can only be exercised by a request that actually goes through that entry.
+ * Saying "not tested" for all three trains the reader to expect a test that in
+ * two of the cases does not exist.
+ */
+export function edgeHelp(label: string, mark: Mark): string {
+  if (mark === 'config') {
+    switch (label.trim().toLowerCase()) {
+      case 'runs':
+        return 'ownership, not a traffic hop - the workload owns these Pods'
+      case 'selects':
+        return 'read from the cluster - which Pods this Service selects'
+      case 'routes to':
+      case 'sends to':
+        return 'declared routing - only a request through this entry exercises it'
+      case 'also serves':
+        return 'other backends this entry declares, collapsed here'
+    }
+  }
+  // Excluded-by-design, not a gap: this backend serves a different host, so no
+  // request for THIS path would ever go down it. "not sent any traffic" read as
+  // something we skipped.
+  if (mark === 'excluded' && label.trim().toLowerCase() === 'other host') {
+    return 'not part of this path - this backend serves a different host'
+  }
+  return markHelp(mark)
+}
+
+/** Whether a line's own words already say what its mark would say. An origin
+ *  edge is labelled with its evidence ("not tested"), so appending the mark help
+ *  ("not tested from here") repeated it back at the reader. */
+export function edgeHelpIsRedundant(title: string, label: string, mark: Mark): boolean {
+  const t = title.trim().toLowerCase()
+  if (!t) return false
+  const help = edgeHelp(label, mark).toLowerCase()
+  return help.startsWith(t) || t.startsWith(help)
+}
+
 /** Inline style for a mark glyph. */
 export function glyphStyle(m: Mark): React.CSSProperties {
   return { color: markStyle(m).color, fontWeight: 700, fontSize: '12px', lineHeight: 1.1, flex: 'none' }

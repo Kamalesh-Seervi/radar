@@ -2185,3 +2185,116 @@ func TestComputeCoverage_TransportFailureAbsorbsAppLayerRow(t *testing.T) {
 		t.Fatalf("Coverage = %+v, want failed=1 skipped=0 - one broken path counted once", tr.Coverage)
 	}
 }
+
+// A dead front door is a real misconfiguration, but upstreams are parallel: it
+// must be stated WITHOUT condemning a Service that other entries still serve.
+func TestComputeEntryProblems_PromotesUpstreamFaultWithoutTouchingVerdict(t *testing.T) {
+	tr := &Trace{
+		Subject: ResourceRef{Kind: "Service", Namespace: "staging", Name: "shop"},
+		Upstreams: []Hop{
+			{Resource: ResourceRef{Kind: "Ingress", Namespace: "staging", Name: "shop"}},
+			{
+				Resource: ResourceRef{Kind: "HTTPRoute", Namespace: "staging", Name: "shop"},
+				Findings: []Finding{{
+					Code: "gwroute:not-accepted", Severity: SeverityWarning,
+					Message: "Not attached: no listener matches its hosts",
+					Action:  "check the parent Gateway's listener hostnames",
+				}},
+			},
+		},
+		Downstream: []Hop{{Resource: ResourceRef{Kind: "Service", Namespace: "staging", Name: "shop"}}},
+	}
+	got := computeEntryProblems(tr)
+	if len(got) != 1 {
+		t.Fatalf("EntryProblems = %+v, want the HTTPRoute fault promoted", got)
+	}
+	if got[0].Resource.Kind != "HTTPRoute" || !strings.Contains(got[0].Summary, "no listener") {
+		t.Fatalf("promoted the wrong finding: %+v", got[0])
+	}
+	// The row is read by a human at a glance: the friendly Message leads, and
+	// the raw controller condition is one hover away - the opposite order from
+	// Diagnosis, which wants the deeper cause first.
+	tr.Upstreams[1].Findings[0].Cause = "Accepted: NoMatchingListenerHostname - there were no hostname intersections between the HTTPRoute and this parent ref's Listener(s)."
+	promoted := computeEntryProblems(tr)[0]
+	if !strings.Contains(promoted.Summary, "Not attached") {
+		t.Errorf("Summary = %q, want the human Message to lead", promoted.Summary)
+	}
+	if !strings.Contains(promoted.Detail, "NoMatchingListenerHostname") {
+		t.Errorf("Detail = %q, want the raw cause available for the hover", promoted.Detail)
+	}
+	if got[0].Action == "" {
+		t.Error("an entry problem should carry its finding's action")
+	}
+	// Info-level advisories stay where they are.
+	tr.Upstreams[1].Findings[0].Severity = SeverityInfo
+	if n := len(computeEntryProblems(tr)); n != 0 {
+		t.Errorf("info-severity findings must not surface as entry problems, got %d", n)
+	}
+}
+
+// The two surfaces must never state the same fault twice.
+func TestComputeEntryProblems_DedupesAgainstDiagnosis(t *testing.T) {
+	same := "Not attached: no listener matches its hosts"
+	tr := &Trace{
+		Subject:   ResourceRef{Kind: "Service", Namespace: "staging", Name: "shop"},
+		Diagnosis: &Diagnosis{Summary: same},
+		Upstreams: []Hop{{
+			Resource: ResourceRef{Kind: "HTTPRoute", Namespace: "staging", Name: "shop"},
+			Findings: []Finding{{Code: "gwroute:not-accepted", Severity: SeverityWarning, Message: same}},
+		}},
+	}
+	if got := computeEntryProblems(tr); len(got) != 0 {
+		t.Fatalf("EntryProblems = %+v, want none - the Diagnosis already says it", got)
+	}
+}
+
+// An entry can serve THIS Service perfectly while a different backendRef of the
+// same entry is missing. Promoting that sibling's break as "this entry cannot
+// carry traffic" is the misattribution computeVerdict already refuses to make.
+func TestComputeEntryProblems_IgnoresSiblingMissingRef(t *testing.T) {
+	tr := &Trace{
+		Subject: ResourceRef{Kind: "Service", Namespace: "store", Name: "shop"},
+		Upstreams: []Hop{{
+			Resource: ResourceRef{Kind: "Ingress", Namespace: "store", Name: "entry"},
+			Findings: []Finding{
+				{Code: missingRefCodePrefix + "service", Severity: SeverityCritical, Message: "backend Service checkout does not exist"},
+				{Code: "gwroute:not-accepted", Severity: SeverityWarning, Message: "Not attached: no listener matches its hosts"},
+			},
+		}},
+		Downstream: []Hop{{Resource: ResourceRef{Kind: "Service", Namespace: "store", Name: "shop"}}},
+	}
+	got := computeEntryProblems(tr)
+	if len(got) != 1 {
+		t.Fatalf("EntryProblems = %+v, want only the entry's OWN fault", got)
+	}
+	if strings.Contains(got[0].Summary, "checkout") {
+		t.Errorf("a sibling backend's missing ref was promoted as this entry's problem: %q", got[0].Summary)
+	}
+}
+
+// A route Radar dialled and watched fail is the strongest fault it can report.
+// The UI renders anything short of critical as a warning, so an unset severity
+// on this path would make confirmed unreachability look weaker than a predicted
+// one.
+func TestComputeDiagnosis_ConfirmedRouteFailureIsCritical(t *testing.T) {
+	tr := &Trace{
+		Subject: ResourceRef{Kind: "Service", Namespace: "store", Name: "shop"},
+		Routes: []RouteResult{{
+			Route:      "GET /",
+			Target:     "shop:80",
+			Outcome:    OutcomeUnreachable,
+			Confidence: "real",
+			Evidence:   "connection refused",
+		}},
+	}
+	d := computeDiagnosis(tr)
+	if d == nil {
+		t.Fatal("a failed route must produce a diagnosis")
+	}
+	if d.Severity != SeverityCritical {
+		t.Errorf("severity = %q, want %q — a dialled-and-failed route is not a warning", d.Severity, SeverityCritical)
+	}
+	if d.Class == DiagnosisClassCoverage {
+		t.Errorf("class = %q, want a fault — this is a real break, not an untested gap", d.Class)
+	}
+}

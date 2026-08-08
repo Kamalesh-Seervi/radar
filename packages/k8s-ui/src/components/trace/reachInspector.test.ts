@@ -73,7 +73,9 @@ describe('the diagnosis is always present', () => {
     const s = buildSidebar(undefined, ctx(t, 'incluster'))
     expect(s.path.title).toBeTruthy()
     expect(s.path.evidence.length).toBeGreaterThan(0)
-    expect(s.path.next.header).toBeTruthy()
+    // The panel always answers the path question; a next-step block is offered
+    // only when there is genuinely a next step.
+    expect(s.path.body).toBeTruthy()
     expect(s.resource).toBeUndefined()
   })
 
@@ -223,10 +225,14 @@ describe('verdict band', () => {
     expect(s.path.next.header).toMatch(/run this next/i)
   })
 
-  it('says so plainly when nothing stronger can be run', () => {
+  it('offers nothing when nothing stronger can be run', () => {
+    // A resource-level "there is no more to learn" repeated on every vantage was
+    // scope mixing; the ceiling is stated with specifics in the caveats and the
+    // footer's coverage ledger instead.
     const t = mk([pod('a', true, '10.0.0.1')], [p({}), p({ path: 'apiserver' }), p({ vantage: 'local', path: 'data' })])
     const s = buildSidebar(undefined, ctx(t, 'incluster'))
-    expect(s.path.next.header).toMatch(/no stronger test/i)
+    expect(s.path.next.header).toBe('')
+    expect(s.path.next.ctas).toHaveLength(0)
   })
 
   it('falls back to the backend verdict when there is no route to derive a tone from', () => {
@@ -270,9 +276,13 @@ describe('an in-cluster test that could not run says so first', () => {
 
   // The button moved to the vantage capsule in the graph, so the panel must not
   // offer a third copy of it - it keeps the reasoning instead.
-  it('offers no run button of its own', () => {
+  it('offers the run, disabled, with the reason attached', () => {
+    // The action lives WITH its explanation now, so it is present even when it
+    // cannot be taken - but never silently clickable into a guaranteed no-op.
     const s = buildSidebar(undefined, ctx(noRunnableRoute(), 'apiserver'))
-    expect(s.path.next.ctas.some((c) => c.action === 'run-in-cluster')).toBe(false)
+    const run = s.path.next.ctas.find((c) => c.action === 'run-in-cluster')
+    expect(run).toBeTruthy()
+    expect(run!.disabledReason).toMatch(/nothing to run|no path/i)
   })
 
   it('explains it in the body rather than promising stronger evidence', () => {
@@ -634,14 +644,13 @@ describe('a proxy-only failure never claims the target answered', () => {
   })
 })
 
-describe('the terminal "nothing to do" state is quiet', () => {
-  it('no call-to-action styling, no duplicate Re-run, no repeated ceiling caveat', () => {
+describe('nothing to suggest means nothing shown', () => {
+  it('renders no next-step block at all when there is no stronger test', () => {
     const t = mk([pod('a', true, '10.0.0.1')], [p({})])
     const s = buildSidebar(undefined, ctx(t, 'incluster'))
-    expect(s.path.next.quiet).toBe(true)
+    expect(s.path.next.header).toBe('')
+    expect(s.path.next.body).toBe('')
     expect(s.path.next.ctas).toHaveLength(0)
-    expect(s.path.next.body).toMatch(/strongest evidence/i)
-    expect(s.path.next.blocked).toBeUndefined()
   })
 })
 
@@ -676,5 +685,208 @@ describe('a result with no evidence string still reads as a result', () => {
     const texts = buildSidebar(undefined, ctx(t, 'incluster', r)).path.evidence.map((e) => e.text).join('\n')
     expect(texts).not.toContain('no test has been run from here')
     expect(texts.length).toBeGreaterThan(0)
+  })
+})
+
+describe('selecting a context entry opens it', () => {
+  // The entry-problem row exists to answer "show me the cause". Landing on a
+  // still-collapsed section makes the reader spend a second click on the very
+  // thing they asked for - and it must hold for EVERY declared entry kind.
+  const withEntries = (): Trace => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ path: 'apiserver' })])
+    t.upstreams = [
+      { resource: { kind: 'Ingress', name: 'shop', namespace: 'store' }, edge: 'ingress->service', findings: [], config: { addresses: ['34.0.0.1'] } },
+      { resource: { kind: 'HTTPRoute', name: 'shop', namespace: 'store' }, edge: 'httproute->service', findings: [] },
+    ]
+    return t
+  }
+  for (const kind of ['Ingress', 'HTTPRoute']) {
+    it(`expands the selected ${kind}, and leaves its sibling collapsed`, () => {
+      const t = withEntries()
+      const c = ctx(t, 'apiserver')
+      const id = `n:${kind}/store/shop`
+      const s = buildSidebar(id, c)
+      const hops = s.context?.hops ?? []
+      expect(hops.length).toBeGreaterThan(0)
+      const picked = hops.find((h) => h.id === id)
+      expect(picked, `${kind} should be a context hop`).toBeTruthy()
+      expect(picked!.expanded).toBe(true)
+      expect(hops.filter((h) => h.id !== id).every((h) => !h.expanded)).toBe(true)
+    })
+  }
+  it('leaves every context hop collapsed when nothing is selected', () => {
+    const s = buildSidebar(undefined, ctx(withEntries(), 'apiserver'))
+    expect((s.context?.hops ?? []).every((h) => !h.expanded)).toBe(true)
+  })
+})
+
+describe('a coverage statement is not a fault', () => {
+  it('the verdict keeps it on the wire but marks it coverage-class', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ path: 'apiserver' })])
+    t.diagnosis = { class: 'coverage', summary: "reachable via API server - the real-traffic path wasn't confirmed from here" } as never
+    // buildVerdict still surfaces it for consumers that want the sentence...
+    const v = buildVerdict(t, route({ outcome: 'reached', confidence: 'indirect' }), { originId: 'apiserver', originName: 'API-server proxy' })
+    expect(v.problem).toBeTruthy()
+    // ...and the class is what the header uses to keep it OUT of the problem list.
+    expect(t.diagnosis!.class).toBe('coverage')
+  })
+})
+
+describe('one observation is stated once', () => {
+  it('a localization fact does not repeat the route evidence it came from', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ path: 'apiserver', tone: 'reached', detail: 'HTTP 404 · reached' })])
+    const r = route({
+      outcome: 'reached', confidence: 'indirect', evidence: 'HTTP 404 · reached',
+      localization: [{ layer: 'http', ok: true, detail: 'HTTP 404 · reached' }],
+    } as never)
+    t.routes = [r]
+    const texts = buildSidebar(undefined, ctx(t, 'apiserver', r)).path.evidence.map((e) => e.text)
+    const plain = texts.filter((x) => x.toLowerCase().startsWith('http 404 · reached'))
+    expect(plain, `saw: ${JSON.stringify(texts)}`).toHaveLength(1)
+    // and the surviving line is the MORE specific one
+    expect(plain[0]).toContain('checked directly')
+  })
+})
+
+describe('an answer is interpretable', () => {
+  const reached = (evidence: string): RouteResult =>
+    route({ outcome: 'reached', confidence: 'real', evidence, inClusterRequest: { protocol: 'http', scheme: 'http', path: '/' } } as never)
+  const body = (evidence: string) => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ tone: 'reached', detail: evidence })])
+    const r = reached(evidence)
+    t.routes = [r]
+    return buildSidebar(undefined, ctx(t, 'incluster', r)).path
+  }
+
+  it('a 404 says the PATH works and names what would verify a route', () => {
+    const b = body('HTTP 404 · reached').body
+    expect(b).toContain('path works')
+    expect(b).toContain('serves no route')
+    expect(b).toContain('re-run with a path your app serves')
+  })
+  it('auth, redirect and app-error answers are each read correctly', () => {
+    expect(body('HTTP 401 · reached').body).toContain('credentials')
+    expect(body('HTTP 308 · reached, redirect').body).toMatch(/redirect .*Radar does not follow/)
+    expect(body('HTTP 503 · reached, server error').body).toContain('application health')
+  })
+  it('a transport-only reach never claims something was asked', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ layer: 'tcp', ok: true })])
+    const r = route({ outcome: 'reached', confidence: 'real', evidence: '', inClusterRequest: { protocol: 'tcp' } } as never)
+    t.routes = [r]
+    expect(buildSidebar(undefined, ctx(t, 'incluster', r)).path.body).toContain('nothing was asked of the application')
+  })
+  it('shows WHAT was requested, so a status code can be read at all', () => {
+    expect(body('HTTP 404 · reached').scope.some((s) => s.k === 'REQUEST' && s.v === 'GET /')).toBe(true)
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ layer: 'tcp', ok: true })])
+    const r = route({ outcome: 'reached', confidence: 'real', inClusterRequest: { protocol: 'tcp' } } as never)
+    t.routes = [r]
+    expect(buildSidebar(undefined, ctx(t, 'incluster', r)).path.scope.some((s) => s.k === 'REQUEST' && s.v === 'TCP connect')).toBe(true)
+  })
+})
+
+describe('a relayed answer explains the relay AND the answer', () => {
+  it('keeps the relay caveat and still reads the status', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ path: 'apiserver', tone: 'reached', detail: 'HTTP 404 · reached' })])
+    const r = route({ outcome: 'reached', confidence: 'indirect', evidence: 'HTTP 404 · reached', inClusterRequest: { protocol: 'http', path: '/' } } as never)
+    t.routes = [r]
+    const b = buildSidebar(undefined, ctx(t, 'apiserver', r)).path.body
+    expect(b).toContain('relayed')
+    expect(b).toContain('serves no route')
+    // ...but never claims the real path works, because a relay cannot show that
+    expect(b).not.toContain('The path works')
+  })
+})
+
+// An answer is not the same as an answer that got through. A gateway saying it
+// could not reach its upstream, and a handshake that never verified, are both
+// answers - and both mean the opposite of "the path works".
+describe('an answer that reports a break never reads as a success', () => {
+  const bodyFor = (r: Partial<RouteResult>) => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ tone: 'reached' } as never)])
+    const full = route({ outcome: 'server-error', confidence: 'real', inClusterRequest: { protocol: 'http', path: '/' }, ...r } as never)
+    t.routes = [full]
+    return buildSidebar(undefined, ctx(t, 'incluster', full)).path.body
+  }
+
+  for (const code of [502, 504]) {
+    it(`does not claim the path works on HTTP ${code}`, () => {
+      const b = bodyFor({ evidence: `HTTP ${code}`, failedLayer: 'upstream' } as never)
+      expect(b).not.toContain('The path works')
+      expect(b).toContain('could not reach the backend')
+    })
+  }
+
+  it('explains a certificate failure, which carries no status code at all', () => {
+    const b = bodyFor({ evidence: 'x509: certificate has expired', failedLayer: 'tls' } as never)
+    expect(b).not.toContain('The path works')
+    expect(b).toContain('certificate problem')
+    // The generic fallthrough would have said this instead, explaining nothing.
+    expect(b).not.toContain('not with what was asked for')
+  })
+
+  it('still credits the path when the APP itself answered', () => {
+    expect(bodyFor({ evidence: 'HTTP 404' } as never)).toContain('The path works')
+    expect(bodyFor({ evidence: 'HTTP 500' } as never)).toContain('The path works')
+  })
+})
+
+describe('every state explains itself, not the nearest generic sentence', () => {
+  const withRoute = (r: RouteResult, probes = [p({})]) => {
+    const t = mk([pod('a', true, '10.0.0.1')], probes)
+    t.routes = [r]
+    return buildSidebar(undefined, ctx(t, 'incluster', r)).path.body
+  }
+
+  it('a deliberately dormant path is not described as an answer', () => {
+    const b = withRoute(route({ outcome: 'unreachable', benign: true, evidence: 'no running backends (scaled to 0)' } as never))
+    expect(b).toContain('deliberate')
+    expect(b).not.toContain('not with what was asked for')
+  })
+
+  it('a kept-informational run says it ran AND why it does not decide', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [
+      p({ target: 'shop:80', port: 80, skipped: true, skipClass: 'informational', reason: 'the throwaway Pod was denied by mTLS', ok: false, source: 'probe-job' }),
+    ])
+    const r = route({ target: 'shop:80', outcome: 'not-tested', confidence: undefined, byVantage: undefined } as never)
+    t.routes = [r]
+    const b = buildSidebar(undefined, ctx(t, 'incluster', r)).path.body
+    expect(b + JSON.stringify(buildSidebar(undefined, ctx(t, 'incluster', r)).path.evidence)).toContain('denied by mTLS')
+  })
+
+  it('a verified answer is not described as a partial one', () => {
+    const b = withRoute(route({ outcome: 'verified', confidence: 'real', evidence: 'HTTP 200 · verified' } as never))
+    expect(b).toContain('A real request went through')
+  })
+})
+
+
+describe('the action sits with its explanation', () => {
+  it('an untested vantage offers the run, and does not repeat the sentence above it', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ path: 'apiserver' })])
+    const r = route({ outcome: 'not-tested', confidence: undefined, byVantage: undefined, inClusterRequest: { protocol: 'http', path: '/' } } as never)
+    t.routes = [r]
+    const s = buildSidebar(undefined, ctx(t, 'incluster', r)).path
+    expect(s.body).toContain('Nothing has been tested from here')
+    // the action is present...
+    expect(s.next.ctas.some((c) => c.action === 'run-in-cluster')).toBe(true)
+    // ...and the block does not say "nothing has been tested" a second time
+    expect(s.next.body).toBe('')
+  })
+
+  it('WHAT WE SAW disappears rather than echoing "no test has been run"', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [p({ path: 'apiserver' })])
+    const r = route({ outcome: 'not-tested', confidence: undefined, byVantage: undefined } as never)
+    t.routes = [r]
+    const ev = buildSidebar(undefined, ctx(t, 'incluster', r)).path.evidence
+    expect(ev).toHaveLength(0)
+  })
+
+  it('a vantage that CANNOT be used still says why, instead of going silent', () => {
+    const t = mk([pod('a', true, '10.0.0.1')], [])
+    t.verdict = 'unknown'
+    t.routes = [route({ outcome: 'not-tested', confidence: undefined, byVantage: undefined } as never)]
+    t.downstream![0].probes = [p({ target: 'shop:80', port: 80, vantage: 'local', path: 'apiserver', skipped: true, reason: 'proxy said no', ok: false })]
+    const ev = buildSidebar(undefined, ctx(t, 'local', t.routes[0])).path.evidence
+    expect(ev.map((e) => e.text).join(' ')).toMatch(/no entry point|Ingress/i)
   })
 })

@@ -450,6 +450,7 @@ func computeCoverage(t *Trace) {
 	// Single source of truth for the banner sentence - UI and MCP both read this.
 	t.Headline = CoverageHeadline(t)
 	t.Diagnosis = computeDiagnosis(t)
+	t.EntryProblems = computeEntryProblems(t)
 }
 
 // upgradeDefinitiveBackendDown promotes a Service route's unreachability from
@@ -772,6 +773,7 @@ func ApplyInClusterResults(t *Trace, byTarget map[string][]probe.Result) {
 	recountCoverage(t)
 	t.Headline = CoverageHeadline(t)
 	t.Diagnosis = computeDiagnosis(t)
+	t.EntryProblems = computeEntryProblems(t)
 	// Same collapse as the standard path (BuildTraceWithOptions): ship the one
 	// coverage-honest verdict so REST, UI, and MCP never diverge on the in-cluster
 	// flow.
@@ -971,7 +973,21 @@ func hopDenyPort(meta map[string]any) int32 {
 // "problem:Completed" on a crashloop) would mislabel, so it is omitted and the
 // honest Summary prose carries the diagnosis instead. The name says "code" so a
 // consumer never mistakes the enum for the plain-English explanation (Summary).
+// Diagnosis classes. A FAULT is something wrong in the user's system, promoted
+// from a real finding; COVERAGE explains what could or could not be tested. The
+// UI's problem list shows faults only - a coverage sentence there duplicated the
+// headline, which is generated from the same coverage state.
+const (
+	DiagnosisClassFault    = "fault"
+	DiagnosisClassCoverage = "coverage"
+)
+
 type Diagnosis struct {
+	// Class is "fault" (default, promoted from a finding) or "coverage".
+	Class string `json:"class,omitempty"`
+	// Severity of the finding this was promoted from, so a consumer renders the
+	// weight the detector assigned rather than assuming the worst.
+	Severity  string `json:"severity,omitempty"`
 	CauseCode string `json:"causeCode,omitempty"`
 	// Route names WHICH route this diagnosis explains, when it is attributable
 	// to exactly one. Empty means it describes the resource as a whole.
@@ -992,6 +1008,57 @@ type Diagnosis struct {
 // Returns nil when every route was verified over real traffic - nothing to
 // diagnose. Benign (intentional scale-to-0) routes are NOT treated as a problem
 // here; their route already reads amber-benign with its own evidence.
+// computeEntryProblems promotes warning+ findings on the DECLARED ENTRY hops
+// (upstreams) so a front door that cannot carry traffic is stated where the
+// reader looks, instead of living only as a dot inside a graph node. Kept out
+// of the Diagnosis ranking on purpose: entries are parallel, so a broken
+// sibling must never hijack the headline of a path that works. Anything the
+// Diagnosis already names is dropped, so the two surfaces never say it twice.
+func computeEntryProblems(t *Trace) []EntryProblem {
+	if t == nil || len(t.Upstreams) == 0 {
+		return nil
+	}
+	var out []EntryProblem
+	for _, h := range t.Upstreams {
+		// A missing-ref on an entry is about a DIFFERENT backendRef: the entry can
+		// still serve this Service perfectly while another of its backends is
+		// missing. computeVerdict already refuses to let a sibling's break count
+		// here; promoting it as "this entry cannot carry traffic" would be the
+		// same misattribution one surface up.
+		for _, f := range nonMissingRefFindings(h.Findings) {
+			if f.Severity != SeverityCritical && f.Severity != SeverityWarning {
+				continue
+			}
+			if isScaleZeroFinding(f) {
+				continue
+			}
+			summary := firstNonEmpty(f.Message, f.Cause)
+			if summary == "" {
+				continue
+			}
+			detail := ""
+			if f.Cause != "" && f.Cause != summary {
+				detail = f.Cause
+			}
+			// Already stated by the Diagnosis band - printing it twice reads as
+			// two problems.
+			if t.Diagnosis != nil && t.Diagnosis.Summary == summary {
+				continue
+			}
+			out = append(out, EntryProblem{
+				Resource: h.Resource,
+				Summary:  summary,
+				Detail:   detail,
+				Severity: f.Severity,
+				Code:     f.Code,
+				Action:   f.Action,
+				Command:  f.Command,
+			})
+		}
+	}
+	return out
+}
+
 func computeDiagnosis(t *Trace) *Diagnosis {
 	if t == nil {
 		return nil
@@ -1000,6 +1067,10 @@ func computeDiagnosis(t *Trace) *Diagnosis {
 		d := &Diagnosis{
 			Summary: firstNonEmpty(f.Cause, f.Message),
 			Command: f.Command,
+			// The promoted finding's OWN severity. Without it a consumer has to
+			// invent one, and a warning-tier prediction (a would-deny, a soft pod
+			// condition) renders as a red critical it never earned.
+			Severity: f.Severity,
 		}
 		if trustworthyCauseCode(f.Code) {
 			d.CauseCode = f.Code
@@ -1033,7 +1104,10 @@ func computeDiagnosis(t *Trace) *Diagnosis {
 	// resolve (branchKnownBreak synthesizes evidence from absence, no Finding).
 	// Promote the route's own real evidence; do NOT invent a cause code.
 	if r, ok := worstNonBenignFailedRoute(t.Routes); ok {
-		d := &Diagnosis{Route: r.Route, Summary: firstNonEmpty(r.Evidence, "route is unreachable")}
+		// A route that was dialled and failed is the strongest fault this page can
+		// state. Leaving Severity empty demotes it to the UI's warning default, so
+		// confirmed unreachability would render weaker than a predicted one.
+		d := &Diagnosis{Route: r.Route, Severity: SeverityCritical, Summary: firstNonEmpty(r.Evidence, "route is unreachable")}
 		if t.BrokenRoute != nil {
 			d.CulpritResource = t.BrokenRoute
 		}
@@ -1043,10 +1117,16 @@ func computeDiagnosis(t *Trace) *Diagnosis {
 	if t.Coverage == nil {
 		return nil
 	}
-	// Reachable, but only the apiserver proxy reached it - the real-traffic path
-	// was never confirmed. The action is to test from inside the cluster.
+	// Reachable only through the apiserver proxy. Kept on the wire for agents -
+	// one machine-readable "what next" - but tagged COVERAGE, because it is a
+	// statement about what could be tested, not a fault in the user's system.
+	// The UI's problem list renders faults only: the headline already says this
+	// ("Reached via API server - not live traffic"), the viewing strip says it
+	// for the selected vantage, and the next-step block offers the in-cluster
+	// run, so a fourth copy read as a separate problem.
 	if t.Coverage.Tested > 0 && !anyRealPass(t.Routes) && anyIndirectReach(t.Routes) {
 		return &Diagnosis{
+			Class:      DiagnosisClassCoverage,
 			Summary:    "reachable via API server - the real-traffic path wasn't confirmed from here",
 			NextAction: "run the in-cluster reachability test to confirm the real path",
 		}
@@ -1060,6 +1140,7 @@ func computeDiagnosis(t *Trace) *Diagnosis {
 		// Nothing is RUNNING: the dominant fact is the workload, not the vantage.
 		if hopsHaveScaleZero(t.Downstream) {
 			return &Diagnosis{
+				Class:      DiagnosisClassCoverage,
 				Summary:    "no running pods - the backing workload is scaled to 0, so there's nothing to reach",
 				NextAction: "scale the workload up to test it (e.g. kubectl scale --replicas=1), or leave it if it's intentionally idle",
 			}
@@ -1073,16 +1154,20 @@ func computeDiagnosis(t *Trace) *Diagnosis {
 		reasons := distinctSkipReasons(t.NotTested)
 		switch {
 		case len(reasons) == 1:
-			d := &Diagnosis{Summary: "couldn't test from here - " + reasons[0]}
+			// No "couldn't test from here -" prefix: the headline says that much.
+			// The reason is the only part that adds anything.
+			d := &Diagnosis{Class: DiagnosisClassCoverage, Summary: reasons[0]}
 			d.NextAction = firstNonEmpty(firstSkipCommand(t.NotTested), "run the in-cluster reachability test to confirm the real path")
 			return d
 		case len(reasons) > 1:
 			return &Diagnosis{
+				Class:      DiagnosisClassCoverage,
 				Summary:    fmt.Sprintf("couldn't test any of the %d declared paths from here, for %d different reasons - select a path to see its own", len(t.NotTested), len(reasons)),
 				NextAction: "run the in-cluster reachability test to confirm the real path",
 			}
 		}
 		return &Diagnosis{
+			Class:      DiagnosisClassCoverage,
 			Summary:    "couldn't actively test any route from here",
 			NextAction: "run the in-cluster reachability test to confirm the real path",
 		}

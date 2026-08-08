@@ -254,6 +254,25 @@ export interface Trace {
    *  walking the hop chain. Absent when there is nothing to diagnose (every
    *  route verified over real traffic). */
   diagnosis?: Diagnosis
+  /** Faults on the DECLARED ENTRY POINTS (an Ingress or route that will never
+   *  receive traffic). Deliberately separate from `diagnosis`: entries are
+   *  parallel, so a dead front door must not condemn a Service that another
+   *  entry still serves - but a verdict scoped to the tested path cannot see it
+   *  either. Vantage-invariant; deduped against `diagnosis` by the producer. */
+  entryProblems?: EntryProblem[]
+}
+
+/** One declared entry point that cannot carry traffic, mirrors
+ *  internal/trace/trace.go EntryProblem. */
+export interface EntryProblem {
+  resource: ResourceRef
+  /** The human line; `detail` carries the raw controller cause for the hover. */
+  summary: string
+  detail?: string
+  severity: string
+  code?: string
+  action?: string
+  command?: string
 }
 
 /** Hoisted lead diagnosis, mirrors internal/trace/coverage.go Diagnosis. Every
@@ -262,6 +281,12 @@ export interface Trace {
  *  fingerprints (missing-ref / svc:*); a pod-state code is omitted and summary
  *  carries the honest prose instead. */
 export interface Diagnosis {
+  /** "fault" (something wrong, promoted from a finding) or "coverage" (a
+   *  statement about what could be tested). The problem list renders faults
+   *  only - a coverage sentence there restates the headline. */
+  class?: string
+  /** Severity of the finding this was promoted from. */
+  severity?: string
   causeCode?: string
   /** Which route this diagnosis explains, when attributable to exactly one.
    *  Absent means it describes the resource as a whole. The selected-path panel

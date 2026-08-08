@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
 import { PILL_MAX_PX, type GraphModel, type GraphNode, type GraphEdge, type LaneBox } from './reachGraphModel'
-import { markStyle, glyphStyle, markHelp, SEV_COLOR, MARK_LEGEND, MARK_CATEGORY_LABEL, type Mark, type MarkCategory } from './reachMarks'
+import { markStyle, glyphStyle, markHelp, edgeHelp, edgeHelpIsRedundant, SEV_COLOR, MARK_LEGEND, MARK_CATEGORY_LABEL, type Mark, type MarkCategory } from './reachMarks'
 import { Tooltip } from '../ui/Tooltip'
 
 /** Finding severity -> the shared health tones. Findings describe the OBJECT;
@@ -68,11 +68,15 @@ function useFit(canvasW: number, canvasH: number): [React.RefObject<HTMLDivEleme
 export function ReachabilityGraph({
   model,
   selected,
+  hovered,
   onSelect,
   onAction,
 }: {
   model: GraphModel
   selected?: string
+  /** Node the reader is pointing at from OUTSIDE the graph (the entry-problem
+   *  rows under the header). Answers "where is it?" before a click is spent. */
+  hovered?: string
   onSelect: (id: string) => void
   onAction?: (a: NonNullable<GraphNode['action']>) => void
 }) {
@@ -149,7 +153,7 @@ export function ReachabilityGraph({
             <EdgePill key={e.id} edge={e} />
           ))}
         {model.nodes.map((n) => (
-          <Node key={n.id} node={n} selected={selected === n.id} onSelect={onSelect} onAction={onAction} />
+          <Node key={n.id} node={n} selected={selected === n.id} hovered={hovered === n.id} onSelect={onSelect} onAction={onAction} />
         ))}
         </div>
         </div>
@@ -221,7 +225,9 @@ function EdgePill({ edge }: { edge: GraphEdge }) {
       content={
         <>
           <span className="font-semibold">{edge.title}</span>
-          <span className="text-theme-text-tertiary"> — {markHelp(edge.mark)}</span>
+          {!edgeHelpIsRedundant(edge.title, edge.label, edge.mark) && (
+            <span className="text-theme-text-tertiary"> — {edgeHelp(edge.label, edge.mark)}</span>
+          )}
         </>
       }
       wrapperClassName="absolute cursor-help"
@@ -246,11 +252,13 @@ function EdgePill({ edge }: { edge: GraphEdge }) {
 function Node({
   node,
   selected,
+  hovered,
   onSelect,
   onAction,
 }: {
   node: GraphNode
   selected: boolean
+  hovered?: boolean
   onSelect: (id: string) => void
   onAction?: (a: NonNullable<GraphNode['action']>) => void
 }) {
@@ -258,6 +266,9 @@ function Node({
   // An origin capsule carries exactly one status row; its action shares that
   // line instead of adding a full-width row beneath it.
   const inlineAction = !!(isOrigin && node.action && node.anomalies?.length === 1)
+  // A test running FROM this vantage: the edge already animates, but the
+  // capsule it leaves from looked as inert as everything else on the board.
+  const testing = !!node.anomalies?.some((a) => a.mark === 'running')
   const style: CSSProperties = {
     left: node.x,
     top: node.y,
@@ -275,13 +286,14 @@ function Node({
       : isOrigin
         ? `1.5px dashed ${node.lane === 'control' ? 'var(--color-info)' : 'var(--accent)'}`
         : '1px solid var(--border-default)',
-    boxShadow: selected ? '0 0 0 3px var(--accent-muted)' : isOrigin ? 'none' : '0 1px 2px rgba(0,0,0,.05)',
+    boxShadow: selected ? '0 0 0 3px var(--accent-muted)' : hovered ? '0 0 0 3px var(--color-warning)' : isOrigin ? 'none' : '0 1px 2px rgba(0,0,0,.05)',
     opacity: node.dim ? 0.5 : 1,
   }
   return (
     <div
       role="button"
       tabIndex={0}
+      data-testing={testing || undefined}
       // The visible text is kind + name in separate spans a screen reader joins
       // unpredictably; one explicit name says what this is and (for a vantage
       // capsule) what selecting it does.
@@ -294,7 +306,7 @@ function Node({
           onSelect(node.id)
         }
       }}
-      className="absolute cursor-pointer px-2.5 py-1.5 text-left"
+      className={`absolute cursor-pointer px-2.5 py-1.5 text-left${testing ? ' reach-node-testing' : ''}`}
       style={style}
     >
       <div className="flex items-center gap-1.5">
@@ -344,7 +356,9 @@ function Node({
               {/* Rows truncate visually; the full sentence must always be a
                   hover away - a cut "reached, redirect…" hid its destination. */}
               <Tooltip content={a.title || a.text} wrapperClassName="min-w-0 flex-1">
-                <span className="block truncate text-[9.5px] leading-[1.35] text-theme-text-secondary">{a.text}</span>
+                <span className={`block truncate text-[9.5px] leading-[1.35] text-theme-text-secondary${a.mark === 'running' ? ' reach-label-testing' : ''}`}>
+                  {a.text}
+                </span>
               </Tooltip>
               {/* The capsule's single status row and its action share the line -
                   a stacked full-width button grew the capsule past the height
