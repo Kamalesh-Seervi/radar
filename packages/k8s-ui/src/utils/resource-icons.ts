@@ -70,6 +70,11 @@ import {
   HeartPulse,
   BookOpen,
 
+  // Velero
+  Cloud,
+  Camera,
+  Package,
+
   // Fallback
   Puzzle,
 } from 'lucide-react'
@@ -257,6 +262,14 @@ const KIND_ICON_MAP: Record<string, LucideIcon> = {
   configauditreport: ShieldCheck,
   exposedsecretreport: ShieldAlert,
   sbomreport: FileSearch,
+
+  // Velero. Only kinds whose names no other operator claims: this map is keyed
+  // on kind alone with no group awareness, so a shared name would give a foreign
+  // resource a Velero icon. That rules out `backup` (CNPG), `restore`
+  // (rancher/backup-restore-operator) and `schedule` (several operators).
+  backupstoragelocation: Cloud,
+  volumesnapshotlocation: Camera,
+  backuprepository: Package,
 }
 
 /** Get the icon for a Kubernetes resource kind (case-insensitive). */

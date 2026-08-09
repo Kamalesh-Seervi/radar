@@ -12,7 +12,7 @@ import { getArgoApplicationStatus, getArgoApplicationSetStatus, getArgoApplicati
 import { getPolicyReportStatus as _getPolicyReportStatus, getKyvernoPolicyStatus as _getKyvernoPolicyStatus } from './resource-utils-kyverno'
 import { getResourceClaimStatus as _getResourceClaimStatus, getResourceClaimDeviceClasses as _getResourceClaimDeviceClasses, getResourceClaimTemplateDeviceClasses as _getResourceClaimTemplateDeviceClasses, getResourceClaimAllocation as _getResourceClaimAllocation, getResourceClaimReservedFor as _getResourceClaimReservedFor } from './resource-utils-dra'
 import { getNvidiaClusterPolicyStatus as _getNvidiaClusterPolicyStatus, getNvidiaClusterPolicyEnabledComponents as _getNvidiaClusterPolicyEnabledComponents, getNvidiaDriverStatus as _getNvidiaDriverStatus } from './resource-utils-nvidia'
-import { getBackupStatus as _getBackupStatus, getRestoreStatus as _getRestoreStatus, getScheduleStatus as _getScheduleStatus, getBSLStatus as _getBSLStatus } from './resource-utils-velero'
+import { getBackupStatus as _getBackupStatus, getRestoreStatus as _getRestoreStatus, getScheduleStatus as _getScheduleStatus, getBSLStatus as _getBSLStatus, getBackupRepositoryStatus as _getBackupRepositoryStatus } from './resource-utils-velero'
 import { getExternalSecretStatus as _getExternalSecretStatus, getClusterExternalSecretStatus as _getClusterExternalSecretStatus, getSecretStoreStatus as _getSecretStoreStatus, getClusterSecretStoreStatus as _getClusterSecretStoreStatus, getSecretStoreProviderType as _getSecretStoreProviderType } from './resource-utils-eso'
 import { getHPATableState, hpaStatusFromState } from './resource-utils-hpa'
 
@@ -2091,9 +2091,15 @@ export function getCellFilterValue(resource: any, column: string, kind: string):
       if (kindLower === 'nvidiadrivers') return _getNvidiaDriverStatus(resource).text
       if (kindLower === 'resourceclaims') return _getResourceClaimStatus(resource).text
       if (kindLower === 'backups') return _getBackupStatus(resource).text
-      if (kindLower === 'restores') return _getRestoreStatus(resource).text
-      if (kindLower === 'schedules') return _getScheduleStatus(resource).text
+      // Velero's Restore/Schedule keys are group-qualified (see
+      // GROUP_QUALIFIED_COLUMN_KEYS) because those plurals are shared with
+      // rancher/backup-restore-operator and others. The unqualified plural
+      // deliberately does not match: a foreign CRD falls through to the generic
+      // reader below rather than being filtered as though it were Velero.
+      if (kindLower === 'velerorestores') return _getRestoreStatus(resource).text
+      if (kindLower === 'veleroschedules') return _getScheduleStatus(resource).text
       if (kindLower === 'backupstoragelocations') return _getBSLStatus(resource).text
+      if (kindLower === 'backuprepositories') return _getBackupRepositoryStatus(resource).text
       if (kindLower === 'externalsecrets') return _getExternalSecretStatus(resource).text
       if (kindLower === 'clusterexternalsecrets') return _getClusterExternalSecretStatus(resource).text
       if (kindLower === 'secretstores') return _getSecretStoreStatus(resource).text
