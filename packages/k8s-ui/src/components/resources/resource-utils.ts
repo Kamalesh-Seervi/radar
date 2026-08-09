@@ -291,6 +291,14 @@ export function getPodStatus(pod: any): StatusBadge {
       if (unsettled > 0) {
         return { text: `Running (${ready}/${total})`, color: healthColors.degraded, level: 'degraded' }
       }
+      // Batch work in flight is not an all-clear. The Job itself already grades
+      // neutral while running; without the same call here its pods would read
+      // healthy — one piece of work graded two ways. Last, after every failure
+      // check above, so a broken Job pod keeps its real verdict.
+      // Mirrors pkg/health.classifyPodLevel.
+      if (isOwnedByJob(pod)) {
+        return { text: 'Running', color: healthColors.neutral, level: 'neutral' }
+      }
       return { text: 'Running', color: healthColors.healthy, level: 'healthy' }
     }
     case 'Succeeded':
@@ -741,6 +749,30 @@ export function getContainerSquareStates(pod: any): ContainerSquareState[] {
 // WORKLOAD UTILITIES (Deployment, StatefulSet, DaemonSet, ReplicaSet)
 // ============================================================================
 
+/**
+ * Whether the controller has not yet acted on this workload's current spec, so
+ * grading against that spec would report controller lag as an outage. The
+ * scale-up case: spec says 10, the controller is still working from the previous
+ * generation and has created 3.
+ *
+ * Deliberately NOT age-based — "created recently" guesses wrong exactly when a
+ * deploy is broken on arrival. Mirrors pkg/health.converging; keep in step.
+ */
+function isConverging(resource: any): boolean {
+  const generation = resource?.metadata?.generation
+  const observed = resource?.status?.observedGeneration
+  return typeof generation === 'number' && typeof observed === 'number' && observed > 0 && observed < generation
+}
+
+/** Whether the pod was created by a batch Job. The owner's API group is checked
+ *  so a CRD that merely uses Kind "Job" doesn't match. Mirrors
+ *  pkg/health.isOwnedByJob. */
+function isOwnedByJob(pod: any): boolean {
+  const refs = pod?.metadata?.ownerReferences
+  if (!Array.isArray(refs)) return false
+  return refs.some((r: any) => r?.kind === 'Job' && typeof r?.apiVersion === 'string' && r.apiVersion.startsWith('batch/'))
+}
+
 export function getWorkloadStatus(resource: any, kind: string): StatusBadge {
   const status = resource.status || {}
   const spec = resource.spec || {}
@@ -756,6 +788,12 @@ export function getWorkloadStatus(resource: any, kind: string): StatusBadge {
     if (ready === desired && updated === desired) {
       return { text: `${ready}/${desired}`, color: healthColors.healthy, level: 'healthy' }
     }
+    // Convergence grace, same as the replica kinds below. pkg/health.Workload
+    // passes this signal for DaemonSets too, so omitting it here would render a
+    // mid-reconcile DaemonSet unhealthy while the backend calls it neutral.
+    if (isConverging(resource)) {
+      return { text: `${ready}/${desired}`, color: healthColors.neutral, level: 'neutral' }
+    }
     if (ready > 0) {
       return { text: `${ready}/${desired}`, color: healthColors.degraded, level: 'degraded' }
     }
@@ -770,6 +808,16 @@ export function getWorkloadStatus(resource: any, kind: string): StatusBadge {
 
   if (desired === 0) {
     return { text: 'Scaled to 0', color: healthColors.neutral, level: 'neutral' }
+  }
+
+  // Convergence grace — mirrors pkg/health.replicaVerdict. A workload whose
+  // spec just changed (or that was created moments ago) has not had a chance to
+  // reach its target, so grading against that target reports controller lag as
+  // an outage. Neutral, never healthy: declining to call it broken is not the
+  // same as calling it fine. Guarded on "not already fully ready" so a
+  // converged workload still takes the healthy path below, matching Go's order.
+  if (isConverging(resource) && !(ready === desired && available === desired)) {
+    return { text: `${ready}/${desired}`, color: healthColors.neutral, level: 'neutral' }
   }
 
   // Check if updating
