@@ -160,6 +160,7 @@ import { ExternalSecretCell, ClusterExternalSecretCell, SecretStoreCell, Cluster
 import { BackupCell, RestoreCell, ScheduleCell, BackupStorageLocationCell, VolumeSnapshotLocationCell, BackupRepositoryCell } from './renderers/velero-cells'
 import { isVeleroResource } from './resource-utils-velero'
 import { CNPGClusterCell, CNPGBackupCell, CNPGScheduledBackupCell, CNPGPoolerCell } from './renderers/cnpg-cells'
+import { isApiGroup, CNPG_GROUP } from './resource-utils-cnpg'
 import { ManagedResourceCell, CompositeResourceCell, CrossplaneProviderCell, CrossplaneProviderConfigCell, CompositionCell, XRDCell } from './renderers/crossplane-cells'
 import { isManagedResource, isComposite } from './resource-utils-crossplane'
 import { VirtualServiceCell, DestinationRuleCell, IstioGatewayCell, ServiceEntryCell, PeerAuthenticationCell, AuthorizationPolicyCell } from './renderers/istio-cells'
@@ -1284,11 +1285,34 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
   cnpgclusters: [
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-36' },
-    { key: 'status', label: 'Status', width: 'w-28' },
+    // w-28 leaves the "Status" label 0.23px short once the sort AND filter
+    // affordances are both present, which renders "STAT…" — a sub-pixel miss
+    // costs two characters because the ellipsis needs its own room. The filter
+    // icon appears as soon as a column holds more than one distinct value, so
+    // this is latent on any status column, not specific to the current data.
+    // w-44 fits "WAL Archiving Failing" (120.2px against a 127px label budget).
+    // CNPG's own phases are mapped to short display states — see
+    // getCNPGClusterDisplayState; a 315px sentence fits no column at all.
+    { key: 'status', label: 'Status', width: 'w-44' },
     { key: 'instances', label: 'Instances', width: 'w-28', tooltip: 'Ready/Total' },
     { key: 'primary', label: 'Primary', width: 'w-36' },
     { key: 'image', label: 'Image', width: 'w-28' },
-    { key: 'storage', label: 'Storage', width: 'w-28' },
+    // No Storage column: it rendered spec.storage.size, the configured REQUEST.
+    // The useful number is actual usage (kubectl cnpg status shows "Size: 158M")
+    // and that isn't in the CR. A plausible-but-wrong-meaning number is worse
+    // than an absent one — the reader can't tell which meaning they're getting.
+    { key: 'age', label: 'Age', width: 'w-24' },
+  ],
+  cnpgbackups: [
+    { key: 'name', label: 'Name' },
+    { key: 'namespace', label: 'Namespace', width: 'w-36' },
+    { key: 'status', label: 'Status', width: 'w-44' },
+    { key: 'cluster', label: 'Cluster', width: 'w-36' },
+    // `barmanObjectStore` is the longest method and the field that decides how
+    // the rest of the row reads; at w-36 it was permanently ellipsised.
+    { key: 'method', label: 'Method', width: 'w-40' },
+    { key: 'started', label: 'Started', width: 'w-24' },
+    { key: 'duration', label: 'Duration', width: 'w-24' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   scheduledbackups: [
@@ -1304,11 +1328,19 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
   poolers: [
     { key: 'name', label: 'Name' },
     { key: 'namespace', label: 'Namespace', width: 'w-36' },
-    { key: 'status', label: 'Status', width: 'w-24' },
+    // "Not Scheduled" (83.5px) is kept rather than shortened to "Unscheduled":
+    // ScheduledBackup also renders a literal "Scheduled" badge in this same
+    // column, so a standalone adjective would read as "has no cron" — a claim
+    // about a field Poolers don't have. w-36 buys the words.
+    { key: 'status', label: 'Status', width: 'w-36' },
     { key: 'cluster', label: 'Cluster', width: 'w-36' },
-    { key: 'type', label: 'Type', width: 'w-16' },
+    // Sized for the HEADER, not the value: `rw`/`ro` need 27px, but "Type" plus
+    // the sort affordance needs more than w-16 leaves, and the label rendered
+    // as "T…".
+    { key: 'type', label: 'Type', width: 'w-24' },
     { key: 'poolMode', label: 'Pool Mode', width: 'w-32' },
-    { key: 'instances', label: 'Instances', width: 'w-28', tooltip: 'Ready/Total' },
+    // status.instances counts pods trying to be scheduled, not ready ones.
+    { key: 'instances', label: 'Instances', width: 'w-28', tooltip: 'Scheduled/Total' },
     { key: 'age', label: 'Age', width: 'w-24' },
   ],
   // ============================================================================
@@ -1836,6 +1868,9 @@ const KNOWN_COLUMNS: Record<string, Column[]> = {
 // Map (plural, group) → KNOWN_COLUMNS key for kinds that collide with core K8s
 const GROUP_QUALIFIED_COLUMN_KEYS: Record<string, Record<string, string>> = {
   clusters: { 'postgresql.cnpg.io': 'cnpgclusters', 'cluster.x-k8s.io': 'capiclusters' },
+  // Velero owns the unqualified `backups` column set; CNPG Backups carry a
+  // completely different shape (cluster + method, no storage location/expiry).
+  backups: { 'postgresql.cnpg.io': 'cnpgbackups' },
   clusterpolicies: { 'nvidia.com': 'nvidiaclusterpolicies' },
   services: { 'serving.knative.dev': 'knativeservices' },
   configurations: { 'serving.knative.dev': 'knativeconfigurations' },
@@ -5811,12 +5846,19 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
     case 'clustersecretstores':
       return <ClusterSecretStoreCell resource={resource} column={column} />
     // Velero
+    case 'cnpgbackups':
+      return <CNPGBackupCell resource={resource} column={column} />
     case 'backups':
-      // Disambiguate CNPG vs Velero backups by apiVersion
-      if (resource.apiVersion?.includes('cnpg.io')) {
+      // Reached only when the group is unknown to normalizeKindToPlural. Both
+      // engines are matched positively so a third `backups` CRD renders generic
+      // rather than inheriting whichever branch happened to be the fallback.
+      if (isApiGroup(resource.apiVersion, CNPG_GROUP)) {
         return <CNPGBackupCell resource={resource} column={column} />
       }
-      return <BackupCell resource={resource} column={column} />
+      if (isApiGroup(resource.apiVersion, 'velero.io')) {
+        return <BackupCell resource={resource} column={column} />
+      }
+      return <GenericCell resource={resource} column={column} />
     case 'velerorestores':
       return <RestoreCell resource={resource} column={column} />
     case 'veleroschedules':
@@ -5832,12 +5874,25 @@ function CellContent({ resource, kind, column, group, majorityNodeMinorVersion, 
       return <BackupRepositoryCell resource={resource} column={column} />
     // CloudNativePG
     case 'cnpgclusters':
-    case 'clusters':
       return <CNPGClusterCell resource={resource} column={column} />
+    case 'clusters':
+      // Positive guard: `clusters` is one of the most collided CRD plurals
+      // (CNPG, CAPI, KubeBlocks, Redis/Valkey operators). Anything else gets
+      // the generic cell instead of a fabricated Postgres status.
+      if (isApiGroup(resource.apiVersion, CNPG_GROUP)) {
+        return <CNPGClusterCell resource={resource} column={column} />
+      }
+      return <GenericCell resource={resource} column={column} />
     case 'scheduledbackups':
-      return <CNPGScheduledBackupCell resource={resource} column={column} />
+      if (isApiGroup(resource.apiVersion, CNPG_GROUP)) {
+        return <CNPGScheduledBackupCell resource={resource} column={column} />
+      }
+      return <GenericCell resource={resource} column={column} />
     case 'poolers':
-      return <CNPGPoolerCell resource={resource} column={column} />
+      if (isApiGroup(resource.apiVersion, CNPG_GROUP)) {
+        return <CNPGPoolerCell resource={resource} column={column} />
+      }
+      return <GenericCell resource={resource} column={column} />
     // Istio Service Mesh
     case 'virtualservices':
       return <VirtualServiceCell resource={resource} column={column} />
