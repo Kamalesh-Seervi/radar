@@ -32,6 +32,14 @@ export interface Target {
   kind: string;
   namespace: string;
   name: string;
+  /** The issue this investigation is for, when it came from an issue. Hosts
+   *  that group sessions by issue key on it; the rest carry it and ignore it. */
+  issueId?: string;
+  /** Start a new session instead of continuing one the backend would otherwise
+   *  return for this target. Rides here rather than as a separate argument so
+   *  the consent-deferred path replays one object — a parallel "was it fresh?"
+   *  state is a thing that can fall out of sync with the target it describes. */
+  fresh?: boolean;
 }
 export type DiagnoseView = "home" | "investigation";
 
@@ -66,6 +74,10 @@ interface DiagnoseCtx {
   historyDegraded: boolean; // persistence broke — history won't survive a restart
   needsConsent: boolean; // a start is pending the one-time consent
   startError: string | null;
+  // Kept apart from startError: the consent card renders this as "why your
+  // approval was refused", and a run-start failure landing in the same slot
+  // would be read as exactly that — the two paths don't share a lifecycle.
+  consentError: string | null;
   openInvestigation: (t: Target) => void;
   openRun: (id: string) => void;
   openHome: () => void;
@@ -200,6 +212,7 @@ export function DiagnoseProvider({ children }: { children: ReactNode }) {
   const [historyDegraded, setHistoryDegraded] = useState(false);
   const [pendingTarget, setPendingTarget] = useState<Target | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [consentError, setConsentError] = useState<string | null>(null);
   const [width, setWidth] = useState<number>(() => {
     try {
       const v = Number(localStorage.getItem(WIDTH_KEY));
@@ -341,7 +354,7 @@ export function DiagnoseProvider({ children }: { children: ReactNode }) {
   // panel closed — and only re-render when the set actually changes, not every poll.
   const runningSig = runs
     .filter((r) => r.status === "running")
-    .map((r) => `${r.kind}\x00${r.namespace}\x00${r.name}`)
+    .map((r) => runTargetKey(r.kind, r.namespace, r.name))
     .sort()
     .join("|");
   const runningKeys = useMemo(
@@ -398,6 +411,7 @@ export function DiagnoseProvider({ children }: { children: ReactNode }) {
   const openInvestigation = useCallback(
     (t: Target) => {
       setStartError(null);
+      setConsentError(null);
       setOpen(true);
       if (!hosted && !consentSurface) {
         setPendingTarget(null);
@@ -449,21 +463,29 @@ export function DiagnoseProvider({ children }: { children: ReactNode }) {
     }
     if (id) openRun(id);
   }, [available, openRun]);
+  // Leaving the detail pane drops the failure that belonged to it. startError
+  // renders as the entire pane (maximized home still shows `detail`), where a
+  // message about a resource you just navigated away from has nothing to attach
+  // to and no way to be dismissed.
   const openHome = useCallback(() => {
     setView("home");
+    setStartError(null);
     setOpen(true);
   }, []);
-  const goHome = useCallback(() => setView("home"), []);
+  const goHome = useCallback(() => {
+    setView("home");
+    setStartError(null);
+  }, []);
   const close = useCallback(() => setOpen(false), []);
   const consentBusyRef = useRef(false);
   const approveConsent = useCallback(() => {
     if (consentBusyRef.current) return;
     if (!consentSurface) {
-      setStartError("Radar can’t record consent for this agent.");
+      setConsentError("Radar can’t record consent for this agent.");
       return;
     }
     consentBusyRef.current = true;
-    setStartError(null);
+    setConsentError(null);
     const t = pendingTarget;
     // The server ENFORCES consent at start, so the acknowledgment must land
     // before the run request — awaiting also makes it durable for the CLI.
@@ -475,8 +497,16 @@ export function DiagnoseProvider({ children }: { children: ReactNode }) {
         setPendingTarget(null);
         if (t) startRunRef.current(t);
       })
-      .catch(() => {
-        setStartError("Couldn't record your consent — try again.");
+      .catch((e) => {
+        // The server's message, when it has one. A host that records consent
+        // above the individual refuses whoever isn't allowed to grant it, and
+        // only its message can say who is — "try again" sends them at something
+        // that can never succeed.
+        setConsentError(
+          e instanceof DiagnoseError && e.message
+            ? e.message
+            : "Couldn't record your consent — try again.",
+        );
       })
       .finally(() => {
         consentBusyRef.current = false;
@@ -484,6 +514,7 @@ export function DiagnoseProvider({ children }: { children: ReactNode }) {
   }, [consentSurface, pendingTarget]);
   const cancelConsent = useCallback(() => {
     setPendingTarget(null);
+    setConsentError(null);
     setOpen(false);
   }, []);
   const dismissError = useCallback(() => setStartError(null), []);
@@ -517,6 +548,7 @@ export function DiagnoseProvider({ children }: { children: ReactNode }) {
     // cleared on approve/cancel — so its presence is exactly "consent needed now".
     needsConsent: !!pendingTarget,
     startError,
+    consentError,
     openInvestigation,
     openRun,
     openHome,

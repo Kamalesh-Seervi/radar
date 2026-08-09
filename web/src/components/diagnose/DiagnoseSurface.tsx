@@ -15,6 +15,7 @@ import {
   TerminalSquare,
   Copy,
   Check,
+  Plus,
 } from "lucide-react";
 import { Tooltip } from "../ui/Tooltip";
 import {
@@ -22,6 +23,7 @@ import {
   useDiagnoseLayout,
   agentLabelFor,
   openDiagnoseSettings,
+  type DiagnoseView,
 } from "./DiagnoseContext";
 import { useDiagnoseCustomization } from "../../context/DiagnoseCustomization";
 import { InvestigationView } from "./InvestigationView";
@@ -141,6 +143,33 @@ function InvestigationMenu({ run }: { run: RunSummary }) {
 // header, right of the nav rail) — App renders it there and passes topInset (the
 // header height; 0 in chromeless embeds). It shares that frame with the resource/
 // Helm drawers, so it no longer floats viewport-fixed or DOM-measures the chrome.
+// Whether the header offers a new investigation on the focused run's resource.
+// Every clause is a failure this button actually had:
+//
+//   view          goHome() leaves activeRunId set, so the header keeps rendering
+//                 the last focused run. Without this the button dispatches an
+//                 agent — real tokens — from a screen showing an unrelated list.
+//   run           nothing to take a resource from.
+//   running       a start is handed back the live run, so the click does nothing
+//                 and the button reads as broken.
+//   stale         the body already offers "Re-run on current cluster" WITH the
+//                 warning that the context changed; a bare + carries none of it,
+//                 and the resource may not exist in the context it'd run against.
+//   needsConsent  the consent card owns the surface until it's answered.
+export function canStartNewInvestigation(
+  view: DiagnoseView,
+  run: RunSummary | null,
+  needsConsent: boolean,
+): boolean {
+  return (
+    view === "investigation" &&
+    !!run &&
+    run.status !== "running" &&
+    run.status !== "stale" &&
+    !needsConsent
+  );
+}
+
 export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
   const d = useDiagnose();
   // Injected settings action: undefined = Radar's own Settings dialog;
@@ -223,6 +252,7 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
           profile={d.profile}
           copy={consentCopy}
           onOpenSettings={openSettings ?? undefined}
+          error={d.consentError}
           onApprove={d.approveConsent}
           onCancel={d.cancelConsent}
         />
@@ -341,6 +371,26 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
+          {activeRun &&
+            canStartNewInvestigation(d.view, activeRun, d.needsConsent) && (
+            <Tooltip content="New investigation on this resource" position="bottom">
+              <button
+                onClick={() =>
+                  d.openInvestigation({
+                    kind: activeRun.kind,
+                    namespace: activeRun.namespace,
+                    name: activeRun.name,
+                    issueId: activeRun.issueId,
+                    fresh: true,
+                  })
+                }
+                className="rounded-md p-1 text-theme-text-tertiary hover:bg-theme-hover hover:text-theme-text-primary"
+                aria-label="New investigation on this resource"
+              >
+                <Plus className="h-4 w-4" />
+              </button>
+            </Tooltip>
+          )}
           {activeRun && <InvestigationMenu run={activeRun} />}
           <Tooltip content={maximized ? "Restore" : "Expand"} position="bottom">
             <button
