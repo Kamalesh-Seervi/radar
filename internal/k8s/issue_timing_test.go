@@ -62,9 +62,9 @@ func TestIssueTimingFromConditionLTT(t *testing.T) {
 			wantBasis:       "condition",
 		},
 		{
-			// ratio rule: product-catalog case — crashes 1min after 7min-old deploy
-			// healthyFor=1min (14% of 7min) < 25% AND < 5min → started_at_resource_creation
-			name:            "started_at_resource_creation: ratio rule — crash within 1min of 7min-old deploy",
+			// healthyFor=1min — inside the deploy window, so the healthy period is
+			// reconciliation lag rather than a clean bill of health.
+			name:            "started_at_resource_creation: crash within 1min of deploy",
 			failingSince:    now.Add(-6 * time.Minute),
 			resourceCreated: now.Add(-7 * time.Minute),
 			basis:           "owner_condition",
@@ -81,9 +81,8 @@ func TestIssueTimingFromConditionLTT(t *testing.T) {
 			wantBasis:       "condition",
 		},
 		{
-			// ratio rule doesn't fire: healthyFor=7min (35% of 20min), above 25% ratio
-			// AND above 5min cap → falls to gray zone (between 5min and 10min healthy)
-			name:            "gray zone: 7min healthy out of 20min — ratio 35% above threshold",
+			// healthyFor=7min — past the deploy window, short of confirmed-healthy.
+			name:            "gray zone: 7min healthy is neither deploy-time nor confirmed",
 			failingSince:    now.Add(-13 * time.Minute),
 			resourceCreated: now.Add(-20 * time.Minute),
 			basis:           "condition",
@@ -91,9 +90,9 @@ func TestIssueTimingFromConditionLTT(t *testing.T) {
 			wantBasis:       "",
 		},
 		{
-			// ratio rule cap: healthyFor=4min, resourceAge=15min (27%) but healthyFor
-			// < 5min check only — wait, 4/15=26.7%>25% so no ratio rule → gray zone
-			name:            "gray zone: ratio rule doesn't apply when ratio >= 25%",
+			// healthyFor=4min. The verdict must not depend on the resource's age,
+			// which is what the removed ratio term made it do.
+			name:            "gray zone: 4min healthy, whatever the resource's age",
 			failingSince:    now.Add(-11 * time.Minute),
 			resourceCreated: now.Add(-15 * time.Minute),
 			basis:           "condition",
@@ -101,8 +100,8 @@ func TestIssueTimingFromConditionLTT(t *testing.T) {
 			wantBasis:       "",
 		},
 		{
-			// ratio rule doesn't fire when healthyFor >= 5min even with low ratio
-			name:            "gray zone: ratio rule capped at 5min healthyFor",
+			// healthyFor=5min on an hour-old resource: past the deploy window.
+			name:            "gray zone: 5min healthy on an old resource",
 			failingSince:    now.Add(-55 * time.Minute),
 			resourceCreated: now.Add(-1 * time.Hour),
 			basis:           "condition",
@@ -218,5 +217,53 @@ func TestTerminatingProblemIssueTiming(t *testing.T) {
 	if !ok || createdThenDeleted.IssueTiming != "started_at_resource_creation" {
 		t.Errorf("deleted 15s after creation = (%q, %q), want started_at_resource_creation; ok=%v",
 			createdThenDeleted.IssueTiming, createdThenDeleted.IssueTimingBasis, ok)
+	}
+}
+
+// The classification must depend only on how long the resource was healthy, not
+// on how long ago that was. Comparing the healthy window against the resource's
+// current age decays as the resource ages, so one unchanged pair of timestamps
+// answered "no verdict" early in a resource's life and "started at resource
+// creation" later, with nothing about the evidence having changed.
+func TestIssueTimingIsStableAsTheResourceAges(t *testing.T) {
+	const healthyFor = 4 * time.Minute
+
+	// A cluster that came up, served for four minutes, then broke — asked at
+	// five minutes old, at an hour old, and at a week old.
+	for _, age := range []time.Duration{5 * time.Minute, time.Hour, 24 * time.Hour, 7 * 24 * time.Hour} {
+		now := time.Now()
+		created := now.Add(-age)
+		got := IssueTimingFromConditionLTT(created.Add(healthyFor), created, "condition")
+		if got.IssueTiming == "started_at_resource_creation" {
+			t.Errorf("age %v: claimed the issue started at creation, but the resource was healthy for %v first", age, healthyFor)
+		}
+	}
+}
+
+// The same property for a window short enough to classify: it must classify at
+// every age, not only once the resource is old enough.
+func TestIssueTimingClassifiesTheDeployWindowImmediately(t *testing.T) {
+	const healthyFor = 90 * time.Second
+
+	for _, age := range []time.Duration{2 * time.Minute, 10 * time.Minute, 48 * time.Hour} {
+		now := time.Now()
+		created := now.Add(-age)
+		got := IssueTimingFromConditionLTT(created.Add(healthyFor), created, "condition")
+		if got.IssueTiming != "started_at_resource_creation" {
+			t.Errorf("age %v: IssueTiming = %q, want started_at_resource_creation", age, got.IssueTiming)
+		}
+	}
+}
+
+// The rule-3 boundary is inclusive, matching what its comment claims. A
+// comment that misdescribes its own code is how the wrong behaviour survives
+// review, which is the same shape of defect this function was fixed for.
+func TestIssueTimingConfirmedHealthyBoundaryIsInclusive(t *testing.T) {
+	now := time.Now()
+	created := now.Add(-3 * time.Hour)
+	// Exactly 10 minutes of healthy operation before the failure.
+	got := IssueTimingFromConditionLTT(created.Add(10*time.Minute), created, "condition")
+	if got.IssueTiming != "started_after_resource_was_healthy" {
+		t.Errorf("IssueTiming = %q, want started_after_resource_was_healthy at exactly 10m healthy", got.IssueTiming)
 	}
 }
