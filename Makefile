@@ -174,6 +174,21 @@ gitops-demo-status:
 gitops-demo-drift:
 	./scripts/gitops-demo.sh drift
 
+# Bootstrap a kind cluster pre-loaded with Kyverno 1.18.2 and curated policy
+# fixtures (both API families, the four enforcement-posture cases, dual-API
+# PolicyExceptions, and ~40 real PolicyReports across several sources).
+# Useful for visual-testing policy UI changes against realistic state.
+# See scripts/kyverno-demo/README.md for the coverage matrix — and read the
+# 1.20-simulation warning before running `kyverno-demo.sh modern-only`.
+kyverno-demo:
+	./scripts/kyverno-demo.sh up
+
+kyverno-demo-down:
+	./scripts/kyverno-demo.sh down
+
+kyverno-demo-status:
+	./scripts/kyverno-demo.sh status
+
 # Bootstrap a kind cluster pre-loaded with curated Crossplane fixtures
 # (core + provider-kubernetes + function-patch-and-transform + XRD/Composition/XRs).
 # Useful for visual-testing Crossplane UI changes against realistic state.
@@ -199,6 +214,41 @@ LOADTEST_PORT ?= 9281
 PODS ?= 50000
 loadtest: frontend embed
 	go run ./cmd/testserver -port $(LOADTEST_PORT) -pods $(PODS)
+
+# Bootstrap a kind cluster pre-loaded with curated Velero fixtures (all 13
+# Backup phases, the supersession series, a paused+invalid Schedule, an
+# unavailable BSL, a restic repository, and the rancher plural collision).
+# The Velero controller is deliberately scaled to 0 — the failure phases
+# cannot be produced without real object storage, so status is written
+# directly. See scripts/velero-demo/README.md for the coverage matrix.
+velero-demo:
+	./scripts/velero-demo.sh up
+
+velero-demo-down:
+	./scripts/velero-demo.sh down
+
+velero-demo-status:
+	./scripts/velero-demo.sh status
+
+# Bootstrap a kind cluster pre-loaded with curated CloudNativePG fixtures
+# (four clusters all 2/2 Ready with four different badges, a real WAL-archiving
+# failure, Pooler/ScheduledBackup/Backups, plus Velero + KubeBlocks CRs for the
+# shared `backups`/`clusters` plurals).
+# See scripts/cnpg-demo/README.md for the coverage matrix and, more importantly,
+# why the WAL failure is induced rather than patched.
+cnpg-demo:
+	./scripts/cnpg-demo.sh up
+
+cnpg-demo-down:
+	./scripts/cnpg-demo.sh down
+
+cnpg-demo-status:
+	./scripts/cnpg-demo.sh status
+
+# Live CNPG operator for real failovers and backup runs. Frozen-only terminal
+# phases and Backup rows are omitted because the controller owns them.
+cnpg-demo-live:
+	./scripts/cnpg-demo.sh live
 
 # Run linter
 lint:
@@ -313,6 +363,13 @@ help:
 	@echo "  make watch-backend   - Go with air hot reload (port 9280)"
 	@echo "  make run             - Run built binary"
 	@echo "  make test            - Run tests"
+	@echo ""
+	@echo "Demo clusters:"
+	@echo "  make gitops-demo      - GitOps fixtures (Argo CD + Flux)"
+	@echo "  make crossplane-demo  - Crossplane fixtures"
+	@echo "  make kyverno-demo     - Live Kyverno policy + report fixtures"
+	@echo "  make cnpg-demo        - Frozen CNPG rendering fixtures"
+	@echo "  make cnpg-demo-live   - CNPG fixtures with the operator running"
 	@echo ""
 	@echo "Desktop:"
 	@echo "  make desktop                - Build desktop app (frontend + Wails binary)"
