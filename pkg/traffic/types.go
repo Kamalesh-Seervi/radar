@@ -53,6 +53,13 @@ type FlowOptions struct {
 	Since     time.Duration // Look back period (default: 5 minutes)
 	Follow    bool          // Stream new flows
 	Limit     int           // Max flows to return (0 = no limit)
+	// ResultWillBeFiltered tells the source that the caller is going to narrow the
+	// flows it returns — the server does this for a user whose RBAC allows several
+	// namespaces, since Namespace above can only carry one. A source must not then
+	// make claims about traffic it can see but the caller will remove, because that
+	// traffic is not the user's to be told about. Claims about how the source
+	// itself is configured are unaffected.
+	ResultWillBeFiltered bool
 }
 
 // FlowsResponse contains the flows and metadata.
@@ -61,7 +68,24 @@ type FlowsResponse struct {
 	Timestamp time.Time `json:"timestamp"` // When this data was collected
 	Flows     []Flow    `json:"flows"`
 	Warning   string    `json:"warning,omitempty"` // Non-fatal warning (e.g., query errors)
+	// WarningKind separates a warning worth retrying from one that is simply the
+	// truth about this data. Empty means transient, so a source that does not set
+	// it keeps the retrying behaviour it had. A client must not retry
+	// WarningPartial: the answer will not change, and the warning explains
+	// something the user needs to read rather than wait out.
+	WarningKind string `json:"warningKind,omitempty"`
 }
+
+// Warning kinds for FlowsResponse.WarningKind.
+const (
+	// WarningTransient marks a condition that may resolve on its own — a query
+	// that failed, a port-forward still coming up.
+	WarningTransient = "transient"
+	// WarningPartial marks flows that are correct but incomplete, for a reason
+	// retrying cannot fix (a source not exporting an attribute, traffic that
+	// cannot be oriented). Always shown alongside whatever flows did arrive.
+	WarningPartial = "partial"
+)
 
 // AggregatedFlow represents flows aggregated by service pair.
 type AggregatedFlow struct {
@@ -112,6 +136,12 @@ type DetectionResult struct {
 	Version   string `json:"version,omitempty"`
 	Native    bool   `json:"native"` // True if built into the cluster (e.g., Cilium/Hubble in GKE)
 	Message   string `json:"message,omitempty"`
+	// Present means the source was found in the cluster but cannot be used as it
+	// stands — misconfigured, or not being scraped. Only meaningful when Available
+	// is false, and it is what separates a problem the user can fix from a source
+	// they simply have not installed. Absence needs no explanation; a broken
+	// install does.
+	Present bool `json:"present,omitempty"`
 }
 
 // ClusterInfo contains cluster platform and CNI information.

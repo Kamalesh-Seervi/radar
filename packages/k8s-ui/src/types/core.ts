@@ -1307,6 +1307,11 @@ export interface TrafficFlowsResponse {
   flows: TrafficFlow[]
   aggregated: AggregatedFlow[]
   warning?: string  // Non-fatal warning (e.g., query errors)
+  /** 'transient' (or absent) means the condition may clear on its own and a
+   *  retry is worthwhile. 'partial' means the flows are correct but incomplete
+   *  for a reason retrying cannot change, so show the warning next to them and
+   *  do not refetch. */
+  warningKind?: 'transient' | 'partial'
 }
 
 // Wizard state for traffic setup

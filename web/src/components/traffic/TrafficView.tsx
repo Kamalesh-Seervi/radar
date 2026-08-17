@@ -10,7 +10,7 @@ import { Loader2, Filter, Plug, ChevronDown, List, Activity, AlertTriangle } fro
 import { clsx } from 'clsx'
 import { useQueryClient } from '@tanstack/react-query'
 import { useDock } from '../dock'
-import { EmptyState, PaneLoader, FreshnessControl } from '@skyhook-io/k8s-ui'
+import { AlertBanner, EmptyState, PaneLoader, FreshnessControl } from '@skyhook-io/k8s-ui'
 import { useConnection } from '../../context/ConnectionContext'
 import { Tooltip } from '../ui/Tooltip'
 
@@ -432,13 +432,23 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
     enabled: wizardState === 'ready' && !isConnecting && !connectionError,
   })
 
+  // A 'partial' warning is the source telling us this is as complete as it gets —
+  // an attribute it does not export, traffic it cannot orient. Retrying returns
+  // the same answer, so retrying forever is all cost and no progress.
+  const warningIsPermanent = flowsData?.warningKind === 'partial'
+
   // Auto-retry when flows return with warning but no data (e.g., port-forward not ready yet)
   useEffect(() => {
-    if (flowsData?.warning && (!flowsData.aggregated || flowsData.aggregated.length === 0) && !flowsFetching) {
+    if (
+      flowsData?.warning &&
+      !warningIsPermanent &&
+      (!flowsData.aggregated || flowsData.aggregated.length === 0) &&
+      !flowsFetching
+    ) {
       const timer = setTimeout(() => refetchFlowsRaw(), 2000)
       return () => clearTimeout(timer)
     }
-  }, [flowsData, flowsFetching, refetchFlowsRaw])
+  }, [flowsData, warningIsPermanent, flowsFetching, refetchFlowsRaw])
 
   // Filter flows based on user preferences
   // Note: namespace filtering is done server-side via the global namespace selector
@@ -1154,15 +1164,34 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
               className="absolute inset-0"
             />
           ) : finalFlows.length > 0 ? (
-            <TrafficGraph
-              flows={finalFlows}
-              hotPathThreshold={hotPathThreshold}
-              showNamespaceGroups={showNamespaceGroups}
-              serviceCategories={serviceCategories}
-              addonMode={addonMode}
-              trafficSource={sourcesData?.active || ''}
-              onSelectionChange={setGraphSelection}
-            />
+            <>
+              {flowsData?.warning && warningIsPermanent && (
+                // Sits below the two chip rows (both top-3) rather than beside
+                // them: centred at that height it would cover the flow count and
+                // the refresh control at common widths. role/aria-live because it
+                // appears after the graph has already rendered.
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="absolute top-14 left-1/2 z-10 w-[min(40rem,calc(100%-1.5rem))] -translate-x-1/2"
+                >
+                  <AlertBanner
+                    variant="warning"
+                    title="This map is incomplete"
+                    message={flowsData.warning}
+                  />
+                </div>
+              )}
+              <TrafficGraph
+                flows={finalFlows}
+                hotPathThreshold={hotPathThreshold}
+                showNamespaceGroups={showNamespaceGroups}
+                serviceCategories={serviceCategories}
+                addonMode={addonMode}
+                trafficSource={sourcesData?.active || ''}
+                onSelectionChange={setGraphSelection}
+              />
+            </>
           ) : connectionError ? (
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="text-center space-y-3">
@@ -1208,7 +1237,11 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
                   tone="neutral"
                   variant="card"
                   icon={AlertTriangle}
-                  headline="Unable to fetch traffic data"
+                  headline={
+                    warningIsPermanent
+                      ? 'No traffic Radar can place on the map'
+                      : 'Unable to fetch traffic data'
+                  }
                   body={flowsData.warning}
                   className="max-w-md"
                 />

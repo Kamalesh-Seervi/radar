@@ -186,6 +186,21 @@ func (m *Manager) DetectSources(ctx context.Context) (*SourcesResponse, error) {
 			if m.activeSource == nil {
 				m.activeSource = source
 			}
+		} else if result.Present && result.Message != "" {
+			// Present but unusable — installed with the wrong feature enabled, or
+			// running but not scraped. That is a status with an explanation, which is
+			// what SourceStatus is for and what the error branch above already does;
+			// a bare name in NotDetected would flatten it into "not installed".
+			// Gated on Present so a source nobody installed stays out: the
+			// recommendation covers absence, and a row per uninstalled source would
+			// bury the one with a fixable problem.
+			response.Detected = append(response.Detected, SourceStatus{
+				Name:    name,
+				Status:  "not_found",
+				Version: result.Version,
+				Native:  result.Native,
+				Message: result.Message,
+			})
 		} else {
 			response.NotDetected = append(response.NotDetected, name)
 		}
