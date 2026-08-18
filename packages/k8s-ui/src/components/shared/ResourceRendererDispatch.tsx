@@ -80,6 +80,12 @@ import {
   getRevisionStatus,
 } from '../resources/resource-utils-knative'
 import { getHTTPProxyStatus } from '../resources/resource-utils-contour'
+import {
+  isCalicoApiVersion,
+  isCalicoPolicyKind,
+  isCalicoStagedKubernetesNetworkPolicyKind,
+  isCoreNetworkPolicyKind,
+} from '../resources/resource-utils-calico'
 import { getClusterStatus as getCAPIClusterStatus, getMachineStatus, getMachineDeploymentStatus, getMachineSetStatus, getMachinePoolStatus, getKCPStatus, getClusterClassStatus, getMachineHealthCheckStatus } from '../resources/resource-utils-capi'
 import { getAWSMCPStatus, getAWSMMPStatus, getAWSMachineStatus, getAWSManagedClusterStatus } from '../resources/resource-utils-aws-capi'
 import { getGCPMCPStatus, getGCPMMPStatus, getGCPMachineStatus, getGCPManagedClusterStatus } from '../resources/resource-utils-gcp-capi'
@@ -250,6 +256,10 @@ import {
   ResourceSliceRenderer,
   NvidiaClusterPolicyRenderer,
   NvidiaDriverRenderer,
+  CalicoHostEndpointRenderer,
+  CalicoIPPoolRenderer,
+  CalicoNetworkPolicyRenderer,
+  CalicoTierRenderer,
 } from '../resources/renderers'
 import type { ComposedRefStatus } from '../resources/renderers/CompositeRenderer'
 import {
@@ -399,6 +409,10 @@ const KNOWN_KINDS = new Set([
   'orders', 'challenges',
   'gateways', 'gatewayclasses', 'httproutes', 'grpcroutes', 'tcproutes', 'tlsroutes', 'sealedsecrets', 'workflowtemplates', 'clusterworkflowtemplates',
   'networkpolicies', 'networkpolicy',
+  'globalnetworkpolicies', 'globalnetworkpolicy',
+  'stagednetworkpolicies', 'stagednetworkpolicy',
+  'stagedglobalnetworkpolicies', 'stagedglobalnetworkpolicy',
+  'stagedkubernetesnetworkpolicies', 'stagedkubernetesnetworkpolicy',
   'ciliumnetworkpolicies', 'ciliumnetworkpolicy', 'ciliumclusterwidenetworkpolicies', 'ciliumclusterwidenetworkpolicy',
   'clusternetworkpolicies', 'clusternetworkpolicy',
   'poddisruptionbudgets', 'serviceaccounts', 'namespaces',
@@ -422,6 +436,7 @@ const KNOWN_KINDS = new Set([
   'policyexceptions', 'cleanuppolicies', 'clustercleanuppolicies',
   'resourceclaims', 'resourceclaimtemplates', 'deviceclasses', 'resourceslices',
   'nvidiadrivers',
+  'hostendpoints', 'ippools', 'tiers',
   'vulnerabilityreports', 'configauditreports', 'exposedsecretreports',
   'rbacassessmentreports', 'clusterrbacassessmentreports',
   'clustercompliancereports', 'sbomreports', 'clustersbomreports',
@@ -637,6 +652,18 @@ export function ResourceRendererDispatch({
     || (kind === 'policies' && isApiGroup(data?.apiVersion, 'kyverno.io'))
   const groupGatedFallthrough = isGroupGatedKind && !groupGatedMatched
 
+  const calicoApiVersionMatched = isCalicoApiVersion(data?.apiVersion)
+  const isCalicoPolicy = isCalicoPolicyKind(kind) && calicoApiVersionMatched
+  const isCalicoStagedKubernetesPolicy =
+    isCalicoPolicy && isCalicoStagedKubernetesNetworkPolicyKind(kind)
+  const isCoreNetworkPolicy = isCoreNetworkPolicyKind(kind, data?.apiVersion, resource.group)
+  const isCalicoHostEndpoint = kind === 'hostendpoints' && calicoApiVersionMatched
+  const isCalicoIPPool = kind === 'ippools' && calicoApiVersionMatched
+  const isCalicoTier = kind === 'tiers' && calicoApiVersionMatched
+  const calicoCollisionFallthrough = (
+    isCalicoPolicyKind(kind) || kind === 'hostendpoints' || kind === 'ippools' || kind === 'tiers'
+  ) && !isCoreNetworkPolicy && !((isCalicoPolicy || isCalicoHostEndpoint || isCalicoIPPool || isCalicoTier))
+
   const isKnownKind = KNOWN_KINDS.has(kind) || isCrossplaneMR || isCrossplaneClaim || isCrossplaneXR
 
   const PodComp = rendererOverrides?.PodRenderer ?? PodRenderer
@@ -723,7 +750,9 @@ export function ResourceRendererDispatch({
         {kind === 'tlsroutes' && <SimpleRouteRenderer data={data} kind="TLSRoute" onNavigate={onNavigate} />}
         {kind === 'sealedsecrets' && <SealedSecretRenderer data={data} onNavigate={onNavigate} />}
         {(kind === 'workflowtemplates' || kind === 'clusterworkflowtemplates') && <WorkflowTemplateRenderer data={data} />}
-        {(kind === 'networkpolicies' || kind === 'networkpolicy') && <NetworkPolicyRenderer data={data} />}
+        {isCoreNetworkPolicy && <NetworkPolicyRenderer data={data} />}
+        {isCalicoStagedKubernetesPolicy && <NetworkPolicyRenderer data={data} staged />}
+        {isCalicoPolicy && !isCalicoStagedKubernetesPolicy && <CalicoNetworkPolicyRenderer data={data} onNavigate={onNavigate} />}
         {(kind === 'ciliumnetworkpolicies' || kind === 'ciliumnetworkpolicy' || kind === 'ciliumclusterwidenetworkpolicies' || kind === 'ciliumclusterwidenetworkpolicy') && <CiliumNetworkPolicyRenderer data={data} />}
         {(kind === 'clusternetworkpolicies' || kind === 'clusternetworkpolicy') && <ClusterNetworkPolicyRenderer data={data} />}
         {kind === 'poddisruptionbudgets' && <PodDisruptionBudgetRenderer data={data} />}
@@ -773,6 +802,9 @@ export function ResourceRendererDispatch({
         {policyExceptionMatched && <KyvernoPolicyExceptionRenderer data={data} />}
         {kyvernoLegacyExtraMatched && <KyvernoCleanupPolicyRenderer data={data} />}
         {kind === 'nvidiadrivers' && <NvidiaDriverRenderer data={data} />}
+        {isCalicoHostEndpoint && <CalicoHostEndpointRenderer data={data} onNavigate={onNavigate} />}
+        {isCalicoIPPool && <CalicoIPPoolRenderer data={data} />}
+        {isCalicoTier && <CalicoTierRenderer data={data} />}
         {/* DRA (resource.k8s.io) */}
         {kind === 'resourceclaims' && <ResourceClaimRenderer data={data} onNavigate={onNavigate} />}
         {kind === 'resourceclaimtemplates' && <ResourceClaimTemplateRenderer data={data} />}
@@ -892,7 +924,7 @@ export function ResourceRendererDispatch({
             for known-plural collisions where no apiVersion-gated renderer
             matched (e.g. a Knative Configuration sharing the `configurations`
             plural with Crossplane Configuration). */}
-        {(!isKnownKind || crossplaneCollisionFallthrough || kyvernoCollisionFallthrough || veleroCollisionFallthrough || groupGatedFallthrough) && <GenericRenderer data={data} />}
+        {(!isKnownKind || crossplaneCollisionFallthrough || kyvernoCollisionFallthrough || veleroCollisionFallthrough || groupGatedFallthrough || calicoCollisionFallthrough) && <GenericRenderer data={data} />}
 
         {/* Common sections - can be disabled when parent handles them separately */}
         {showCommonSections && (
