@@ -1204,6 +1204,13 @@ export interface TrafficFlow {
   bytesSent: number
   bytesRecv: number
   connections: number
+  /** The conversation's initiator could not be established, so source and
+   *  destination are ordered arbitrarily rather than describing a caller. */
+  directionUnknown?: boolean
+  /** 5xx responses per second. How a rate-based source reports failures: it
+   *  measures a rate rather than observing individual responses, so it has a
+   *  status code for no single flow. */
+  errorRate?: number
   verdict: string // forwarded, dropped, error
   lastSeen: string // ISO date string
 }
@@ -1236,6 +1243,9 @@ export interface AggregatedFlow {
   bytesRecv: number
   connections: number
   lastSeen: string
+  /** The conversation's initiator could not be established, so the endpoints are
+   *  ordered arbitrarily and the edge is drawn without an arrowhead. */
+  directionUnknown?: boolean
   l7Protocol?: string // HTTP, gRPC, DNS
   requestCount?: number
   errorCount?: number
