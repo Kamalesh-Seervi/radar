@@ -64,7 +64,7 @@ import {
 } from '../resources/resource-utils-kyverno-exceptions'
 import { getResourceClaimStatus, getResourceClaimTemplateStatus, getDeviceClassStatus, getResourceSliceStatus } from '../resources/resource-utils-dra'
 import { getNvidiaClusterPolicyStatus, getNvidiaDriverStatus } from '../resources/resource-utils-nvidia'
-import { getBackupStatus, getRestoreStatus, getScheduleStatus, getBSLStatus, isVeleroResource } from '../resources/resource-utils-velero'
+import { getBackupStatus, getRestoreStatus, getScheduleStatus, getBSLStatus, getBackupRepositoryStatus, isVeleroResource } from '../resources/resource-utils-velero'
 import {
   getVirtualServiceStatus,
   getDestinationRuleStatus,
@@ -171,6 +171,7 @@ import {
   VeleroRestoreRenderer,
   VeleroScheduleRenderer,
   VeleroBSLRenderer,
+  VeleroBackupRepositoryRenderer,
   VeleroVSLRenderer,
   CNPGClusterRenderer,
   CNPGBackupRenderer,
@@ -324,6 +325,17 @@ export interface RendererOverrides {
     data: any
     onNavigate?: (ref: ResourceRef) => void
   }>
+  /** Host-injected: adds the Backups-stored-here lookup to a storage location. */
+  VeleroBSLRenderer?: React.ComponentType<{
+    data: any
+    onNavigate?: (ref: ResourceRef) => void
+  }>
+  /** Host-injected: adds the storage location's health to a backup, and the
+   *  on-demand fetch for the messages behind its error/warning counts. */
+  VeleroBackupRenderer?: React.ComponentType<{ data: any; onNavigate?: (ref: ResourceRef) => void }>
+  /** Host-injected: adds the on-demand fetch for the messages behind a
+   *  restore's error and warning counts. */
+  VeleroRestoreRenderer?: React.ComponentType<{ data: any; onNavigate?: (ref: ResourceRef) => void }>
   // Kyverno policy coverage: the host fetches /api/policy/policies/... and
   // renders the section, which the policy renderers accept as a slot. One
   // override serves all six policy renderers — they differ in what the policy
@@ -416,6 +428,7 @@ const KNOWN_KINDS = new Set([
   'infraassessmentreports', 'clusterinfraassessmentreports',
   'verticalpodautoscalers',
   'backups', 'restores', 'schedules', 'backupstoragelocations', 'volumesnapshotlocations',
+  'backuprepositories',
   'externalsecrets', 'clusterexternalsecrets', 'secretstores', 'clustersecretstores',
   'clusters', 'scheduledbackups', 'poolers', 'objectstores',
   'globalcontextentries', 'updaterequests', 'ephemeralreports', 'clusterephemeralreports',
@@ -591,6 +604,7 @@ export function ResourceRendererDispatch({
   const isVeleroCollisionGatedKind =
     kind === 'restores' || kind === 'schedules'
     || kind === 'backupstoragelocations' || kind === 'volumesnapshotlocations'
+    || kind === 'backuprepositories'
   const veleroCollisionFallthrough = isVeleroCollisionGatedKind && !isVeleroResource(data)
 
   // Same rule as the Crossplane block above, for the plurals shared by two
@@ -637,6 +651,9 @@ export function ResourceRendererDispatch({
   const CNPGPublicationComp = rendererOverrides?.CNPGPublicationRenderer ?? CNPGPublicationRenderer
   const CNPGSubscriptionComp = rendererOverrides?.CNPGSubscriptionRenderer ?? CNPGSubscriptionRenderer
   const CNPGObjectStoreComp = rendererOverrides?.CNPGObjectStoreRenderer ?? CNPGObjectStoreRenderer
+  const VeleroBSLComp = rendererOverrides?.VeleroBSLRenderer ?? VeleroBSLRenderer
+  const VeleroBackupComp = rendererOverrides?.VeleroBackupRenderer ?? VeleroBackupRenderer
+  const VeleroRestoreComp = rendererOverrides?.VeleroRestoreRenderer ?? VeleroRestoreRenderer
   const KyvernoCoverageComp = rendererOverrides?.KyvernoPolicyCoverage
   const kyvernoCoverage = KyvernoCoverageComp ? (
     <KyvernoCoverageComp data={data} onNavigate={onNavigate} />
@@ -767,10 +784,11 @@ export function ResourceRendererDispatch({
         {kind === 'subscriptions' && isApiGroup(data.apiVersion, CNPG_GROUP) && <CNPGSubscriptionComp data={data} onNavigate={onNavigate} />}
         {(kind === 'imagecatalogs' || kind === 'clusterimagecatalogs') && isApiGroup(data.apiVersion, CNPG_GROUP) && <CNPGImageCatalogComp data={data} onNavigate={onNavigate} />}
         {kind === 'backups' && isApiGroup(data.apiVersion, CNPG_GROUP) && <CNPGBackupRenderer data={data} onNavigate={onNavigate} />}
-        {kind === 'backups' && isApiGroup(data.apiVersion, 'velero.io') && <VeleroBackupRenderer data={data} />}
-        {kind === 'restores' && isVeleroResource(data) && <VeleroRestoreRenderer data={data} />}
-        {kind === 'schedules' && isVeleroResource(data) && <VeleroScheduleRenderer data={data} />}
-        {kind === 'backupstoragelocations' && isVeleroResource(data) && <VeleroBSLRenderer data={data} />}
+        {kind === 'backups' && isApiGroup(data.apiVersion, 'velero.io') && <VeleroBackupComp data={data} onNavigate={onNavigate} />}
+        {kind === 'restores' && isVeleroResource(data) && <VeleroRestoreComp data={data} onNavigate={onNavigate} />}
+        {kind === 'schedules' && isVeleroResource(data) && <VeleroScheduleRenderer data={data} onNavigate={onNavigate} />}
+        {kind === 'backupstoragelocations' && isVeleroResource(data) && <VeleroBSLComp data={data} onNavigate={onNavigate} />}
+        {kind === 'backuprepositories' && isVeleroResource(data) && <VeleroBackupRepositoryRenderer data={data} onNavigate={onNavigate} />}
         {kind === 'volumesnapshotlocations' && isVeleroResource(data) && <VeleroVSLRenderer data={data} />}
         {kind === 'externalsecrets' && <ExternalSecretRenderer data={data} onNavigate={onNavigate} />}
         {kind === 'clusterexternalsecrets' && <ClusterExternalSecretRenderer data={data} onNavigate={onNavigate} />}
@@ -1038,6 +1056,12 @@ export function getResourceStatus(kind: string, data: any): { text: string; colo
   if (k === 'restores' && isVeleroResource(data)) return getRestoreStatus(data)
   if (k === 'schedules' && isVeleroResource(data)) return getScheduleStatus(data)
   if (k === 'backupstoragelocations' && isVeleroResource(data)) return getBSLStatus(data)
+  // Repositories have table columns and raise their own issue, but had no branch
+  // here — so the drawer header fell through to the raw phase and showed
+  // "NotReady" beside a table cell reading "Not ready". Same object, two
+  // spellings. Deliberately NOT added to KNOWN_KINDS: there is no detail
+  // renderer for this kind, and listing it there suppresses GenericRenderer.
+  if (k === 'backuprepositories' && isVeleroResource(data)) return getBackupRepositoryStatus(data)
   if (k === 'externalsecrets') return getExternalSecretStatus(data)
   if (k === 'clusterexternalsecrets') return getClusterExternalSecretStatus(data)
   if (k === 'secretstores') return getSecretStoreStatus(data)

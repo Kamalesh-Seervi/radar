@@ -153,11 +153,24 @@ describe('DRA renderers dispatch', () => {
 // so any third operator's CRD inherited whichever branch was the fallback.
 // ============================================================================
 
+// The spec field is a probe: GenericRenderer renders spec into a Specification
+// section, so its value appearing in the output is proof the fall-through
+// reached a renderer. A blank drawer is not an empty string — the surrounding
+// wrapper still emits ~50 characters of markup — so asserting non-emptiness
+// passes even when the drawer shows the user nothing.
+const COLLISION_PROBE = 'collision-probe-value'
+
 function renderCollidingKind(kind: string, apiVersion: string): string {
   return renderToString(
     <ResourceRendererDispatch
       resource={{ kind, namespace: 'default', name: 'thing' }}
-      data={{ apiVersion, kind: 'Cluster', metadata: { name: 'thing', namespace: 'default' }, spec: {}, status: {} }}
+      data={{
+        apiVersion,
+        kind: 'Cluster',
+        metadata: { name: 'thing', namespace: 'default' },
+        spec: { collisionProbe: COLLISION_PROBE },
+        status: {},
+      }}
       onCopy={() => {}}
       copied={null}
       showCommonSections={false}
@@ -237,8 +250,20 @@ describe('ResourceRendererDispatch — colliding plurals fall through', () => {
     ['imagecatalogs', 'other.io/v1'],
     ['clusterimagecatalogs', 'other.io/v1'],
     ['policies', 'operators.coreos.com/v1'],
+    // Velero's BackupRepository joined KNOWN_KINDS when it got a renderer, so
+    // it needs the same fall-through as its siblings.
+    ['backuprepositories', 'other.io/v1'],
   ])('renders something for a foreign %s CRD', (kind, apiVersion) => {
-    expect(renderCollidingKind(kind, apiVersion).trim()).not.toBe('')
+    expect(renderCollidingKind(kind, apiVersion)).toContain(COLLISION_PROBE)
+  })
+
+  // A Velero BackupRepository must reach its own renderer, not the generic one.
+  // It raises BackupRepositoryNotReady, and the reason Velero recorded is only
+  // on the dedicated page.
+  it('renders the Velero repository page for a velero.io backuprepositories', () => {
+    const html = renderCollidingKind('backuprepositories', 'velero.io/v1')
+    expect(html).toContain('Volume Namespace')
+    expect(html).not.toContain(COLLISION_PROBE)
   })
 
   // Both owners of `subscriptions` still get their own renderer.
@@ -319,5 +344,31 @@ describe('shared plurals — the status path collides too', () => {
       status: { phase: 'Installed' },
     })
     expect(foreign?.text).toBe('Installed')
+  })
+})
+
+// A BackupRepository has custom table columns and raises its own issue, but no
+// detail renderer — so it renders generically. Its status still has to resolve
+// through the Velero mapping, or the drawer header prints the raw phase next to
+// a table cell showing the human label for the same object.
+describe('Velero BackupRepository status', () => {
+  const repo = (phase: string) => ({
+    apiVersion: 'velero.io/v1',
+    kind: 'BackupRepository',
+    metadata: { name: 'r', namespace: 'velero' },
+    spec: { repositoryType: 'kopia' },
+    status: { phase },
+  })
+
+  it('resolves through the Velero mapping, not the raw phase', () => {
+    expect(getResourceStatus('backuprepositories', repo('NotReady'))?.text).toBe('Not ready')
+    expect(getResourceStatus('backuprepositories', repo('Ready'))?.text).toBe('Ready')
+  })
+
+  // The plural is not Velero's alone; another group's repository must not pick
+  // up Velero's mapping.
+  it('leaves a foreign backuprepositories kind alone', () => {
+    const foreign = { ...repo('NotReady'), apiVersion: 'example.com/v1' }
+    expect(getResourceStatus('backuprepositories', foreign)?.text).not.toBe('Not ready')
   })
 })
