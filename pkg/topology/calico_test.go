@@ -1,6 +1,7 @@
 package topology
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -115,7 +116,7 @@ func calicoTestDynamicFor(group string) *calicoTestDynamic {
 		case "StagedNetworkPolicy":
 			d.resources[gvr] = []*unstructured.Unstructured{calicoTestObject(group, definition.version, definition.kind, "demo", "frontend-staged", map[string]any{
 				"selector":     "app == 'frontend'",
-				"stagedAction": "Deny",
+				"stagedAction": "Set",
 			})}
 		case "StagedGlobalNetworkPolicy":
 			d.resources[gvr] = []*unstructured.Unstructured{calicoTestObject(group, definition.version, definition.kind, "", "all-staged", map[string]any{
@@ -286,11 +287,7 @@ func TestCalicoPolicySelectorsFailClosed(t *testing.T) {
 }
 
 func TestCalicoEndpointSelectorsUseAutomaticLabels(t *testing.T) {
-	definition, ok := calicoPolicyDefinitionForKind("NetworkPolicy")
-	if !ok {
-		t.Fatal("missing NetworkPolicy definition")
-	}
-	workload := calicoWorkload{namespace: "demo", labels: map[string]string{"app": "frontend"}}
+	workload := newCalicoWorkload("deployment/demo/frontend", "demo", map[string]string{"app": "frontend"}, "default")
 
 	for _, test := range []struct {
 		name      string
@@ -304,7 +301,7 @@ func TestCalicoEndpointSelectorsUseAutomaticLabels(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			policy := calicoTestObject("projectcalico.org", "v3", "NetworkPolicy", "demo", test.name, map[string]any{"selector": test.selector})
-			matched, valid := calicoPolicyMatchesWorkload(policy, definition, workload, nil, nil)
+			matched, valid := CompileCalicoPolicyMatcher(policy).Matches(workload.endpointLabels, nil, workload.serviceAccount, nil)
 			if !valid || matched != test.wantMatch {
 				t.Fatalf("selector %q matched=%v valid=%v, want matched=%v valid=true", test.selector, matched, valid, test.wantMatch)
 			}
@@ -313,15 +310,11 @@ func TestCalicoEndpointSelectorsUseAutomaticLabels(t *testing.T) {
 }
 
 func TestStagedKubernetesCalicoPolicyUsesRawPodLabels(t *testing.T) {
-	definition, ok := calicoPolicyDefinitionForKind("StagedKubernetesNetworkPolicy")
-	if !ok {
-		t.Fatal("missing StagedKubernetesNetworkPolicy definition")
-	}
 	policy := calicoTestObject("projectcalico.org", "v3", "StagedKubernetesNetworkPolicy", "demo", "preview", map[string]any{
 		"podSelector": map[string]any{"matchLabels": map[string]any{"projectcalico.org/namespace": "demo"}},
 	})
-	workload := calicoWorkload{namespace: "demo", labels: map[string]string{"app": "preview"}}
-	matched, valid := calicoPolicyMatchesWorkload(policy, definition, workload, nil, nil)
+	workload := newCalicoWorkload("deployment/demo/preview", "demo", map[string]string{"app": "preview"}, "default")
+	matched, valid := CompileCalicoPolicyMatcher(policy).Matches(workload.labels, nil, workload.serviceAccount, nil)
 	if !valid {
 		t.Fatal("raw Kubernetes pod selector was invalid")
 	}
@@ -370,14 +363,14 @@ func TestStagedKubernetesCalicoPolicyIdentity(t *testing.T) {
 	} {
 		t.Run(test.group, func(t *testing.T) {
 			node := Node{
-				ID:   "calicostagedkubernetesnetworkpolicy/demo/preview/" + test.group,
+				ID:   "calicostagedkubernetesnetworkpolicy/demo/preview",
 				Kind: KindCalicoStagedKubernetesNetworkPolicy,
 				Name: "preview",
 				Data: map[string]any{"namespace": "demo", "apiVersion": test.group + "/" + test.version},
 			}
-			tuple, ok := CalicoPolicyRBACTuple(&node)
-			if !ok || tuple != (SARTuple{Group: test.group, Resource: "stagedkubernetesnetworkpolicies", Namespace: "demo"}) {
-				t.Fatalf("RBAC tuple = %+v, %v", tuple, ok)
+			tuples, ok := CalicoPolicyRBACTuples(&node)
+			if !ok || len(tuples) != 1 || tuples[0] != (SARTuple{Group: test.group, Resource: "stagedkubernetesnetworkpolicies", Namespace: "demo"}) {
+				t.Fatalf("RBAC tuples = %+v, %v", tuples, ok)
 			}
 			if got := buildNodeID("stagedkubernetesnetworkpolicies", "demo", "preview", nil); got != "calicostagedkubernetesnetworkpolicy/demo/preview" {
 				t.Fatalf("buildNodeID = %q", got)
@@ -387,22 +380,31 @@ func TestStagedKubernetesCalicoPolicyIdentity(t *testing.T) {
 }
 
 func TestCalicoPolicyFilterUsesExactGroupAndPreservesNativePolicy(t *testing.T) {
-	projectID := "calicoglobalnetworkpolicy//shared/projectcalico.org"
-	legacyID := "calicoglobalnetworkpolicy//shared/crd.projectcalico.org"
-	stagedID := "calicostagedglobalnetworkpolicy//preview/projectcalico.org"
+	sharedID := "calicoglobalnetworkpolicy//shared"
+	legacyOnlyID := "calicoglobalnetworkpolicy//legacy-only"
+	stagedID := "calicostagedglobalnetworkpolicy//preview"
 	nativeID := "networkpolicy/demo/native"
 	workloadID := "deployment/demo/web"
 	topo := &Topology{
 		Nodes: []Node{
-			{ID: projectID, Kind: KindCalicoGlobalNetworkPolicy, Name: "shared", Data: map[string]any{"apiVersion": "projectcalico.org/v3"}},
-			{ID: legacyID, Kind: KindCalicoGlobalNetworkPolicy, Name: "shared", Data: map[string]any{"apiVersion": "crd.projectcalico.org/v1"}},
-			{ID: stagedID, Kind: KindCalicoStagedGlobalNetworkPolicy, Name: "preview", Data: map[string]any{"apiVersion": "projectcalico.org/v3"}},
+			{ID: sharedID, Kind: KindCalicoGlobalNetworkPolicy, Name: "shared", Data: map[string]any{
+				"apiVersion":  "projectcalico.org/v3",
+				"apiVersions": []string{"projectcalico.org/v3", "crd.projectcalico.org/v1"},
+			}},
+			{ID: legacyOnlyID, Kind: KindCalicoGlobalNetworkPolicy, Name: "legacy-only", Data: map[string]any{
+				"apiVersion":  "crd.projectcalico.org/v1",
+				"apiVersions": []string{"crd.projectcalico.org/v1"},
+			}},
+			{ID: stagedID, Kind: KindCalicoStagedGlobalNetworkPolicy, Name: "preview", Data: map[string]any{
+				"apiVersion":  "projectcalico.org/v3",
+				"apiVersions": []string{"projectcalico.org/v3"},
+			}},
 			{ID: nativeID, Kind: KindNetworkPolicy, Name: "native", Data: map[string]any{"namespace": "demo", "apiVersion": "networking.k8s.io/v1"}},
 			{ID: workloadID, Kind: KindDeployment, Name: "web", Data: map[string]any{"namespace": "demo"}},
 		},
 		Edges: []Edge{
-			{Source: projectID, Target: workloadID, Type: EdgeProtects},
-			{Source: legacyID, Target: workloadID, Type: EdgeProtects},
+			{Source: sharedID, Target: workloadID, Type: EdgeProtects},
+			{Source: legacyOnlyID, Target: workloadID, Type: EdgeProtects},
 			{Source: stagedID, Target: workloadID, Type: EdgeProtects, Partial: true},
 			{Source: nativeID, Target: workloadID, Type: EdgeProtects},
 		},
@@ -414,11 +416,11 @@ func TestCalicoPolicyFilterUsesExactGroupAndPreservesNativePolicy(t *testing.T) 
 	})
 
 	if len(topo.Nodes) != 4 {
-		t.Fatalf("nodes after exact Calico filter = %+v, want project Calico policies plus native policy and workload", topo.Nodes)
+		t.Fatalf("nodes after exact Calico filter = %+v, want the dual-group policy plus staged, native and workload", topo.Nodes)
 	}
 	for _, node := range topo.Nodes {
-		if node.ID == legacyID {
-			t.Fatal("crd.projectcalico.org policy survived a projectcalico.org-only filter")
+		if node.ID == legacyOnlyID {
+			t.Fatal("a crd.projectcalico.org-only policy survived a projectcalico.org-only filter")
 		}
 	}
 	if len(topo.Edges) != 3 {
@@ -431,6 +433,39 @@ func TestCalicoPolicyFilterUsesExactGroupAndPreservesNativePolicy(t *testing.T) 
 		if edge.Source == nativeID && edge.Partial {
 			t.Fatal("native NetworkPolicy edge became partial")
 		}
+	}
+}
+
+func TestCalicoPolicyVisibleThroughEitherServingGroup(t *testing.T) {
+	sharedID := "calicoglobalnetworkpolicy//shared"
+	for _, allowedGroup := range []string{"projectcalico.org", "crd.projectcalico.org"} {
+		t.Run(allowedGroup, func(t *testing.T) {
+			topo := &Topology{Nodes: []Node{{
+				ID: sharedID, Kind: KindCalicoGlobalNetworkPolicy, Name: "shared",
+				Data: map[string]any{
+					"apiVersion":  "projectcalico.org/v3",
+					"apiVersions": []string{"projectcalico.org/v3", "crd.projectcalico.org/v1"},
+				},
+			}}}
+			topo.StripCalicoPoliciesExcept(map[SARTuple]bool{
+				{Group: allowedGroup, Resource: "globalnetworkpolicies"}: true,
+			})
+			if len(topo.Nodes) != 1 {
+				t.Fatalf("policy readable through %s was stripped", allowedGroup)
+			}
+		})
+	}
+
+	topo := &Topology{Nodes: []Node{{
+		ID: sharedID, Kind: KindCalicoGlobalNetworkPolicy, Name: "shared",
+		Data: map[string]any{
+			"apiVersion":  "projectcalico.org/v3",
+			"apiVersions": []string{"projectcalico.org/v3", "crd.projectcalico.org/v1"},
+		},
+	}}}
+	topo.StripCalicoPoliciesExcept(map[SARTuple]bool{})
+	if len(topo.Nodes) != 0 {
+		t.Fatal("policy survived with neither group authorized")
 	}
 }
 
@@ -459,37 +494,426 @@ func TestCalicoPseudoKindsResolveInNeighborhood(t *testing.T) {
 	}
 }
 
-func TestBuildNeighborhood_CalicoGroupCollisionRoot(t *testing.T) {
-	projectID := "caliconetworkpolicy/demo/shared/projectcalico.org"
-	legacyID := "caliconetworkpolicy/demo/shared/crd.projectcalico.org"
-	projectTarget := "deployment/demo/project"
-	legacyTarget := "deployment/demo/legacy"
+func TestBuildNeighborhood_CalicoPolicyResolvesFromEitherGroup(t *testing.T) {
+	policyID := "caliconetworkpolicy/demo/shared"
+	targetID := "deployment/demo/web"
 	topo := &Topology{
 		Nodes: []Node{
-			{ID: projectID, Kind: KindCalicoNetworkPolicy, Name: "shared", Data: map[string]any{"namespace": "demo", "apiVersion": "projectcalico.org/v3"}},
-			{ID: legacyID, Kind: KindCalicoNetworkPolicy, Name: "shared", Data: map[string]any{"namespace": "demo", "apiVersion": "crd.projectcalico.org/v1"}},
-			{ID: projectTarget, Kind: KindDeployment, Name: "project", Data: map[string]any{"namespace": "demo"}},
-			{ID: legacyTarget, Kind: KindDeployment, Name: "legacy", Data: map[string]any{"namespace": "demo"}},
+			{ID: policyID, Kind: KindCalicoNetworkPolicy, Name: "shared", Data: map[string]any{
+				"namespace":   "demo",
+				"apiVersion":  "projectcalico.org/v3",
+				"apiVersions": []string{"projectcalico.org/v3", "crd.projectcalico.org/v1"},
+			}},
+			{ID: targetID, Kind: KindDeployment, Name: "web", Data: map[string]any{"namespace": "demo"}},
 		},
-		Edges: []Edge{
-			{Source: projectID, Target: projectTarget, Type: EdgeProtects},
-			{Source: legacyID, Target: legacyTarget, Type: EdgeProtects},
-		},
+		Edges: []Edge{{Source: policyID, Target: targetID, Type: EdgeProtects}},
 	}
 
-	for _, test := range []struct {
-		group, wantRoot, wantTarget string
-	}{
-		{"projectcalico.org", projectID, projectTarget},
-		{"crd.projectcalico.org", legacyID, legacyTarget},
-	} {
-		t.Run(test.group, func(t *testing.T) {
+	for _, group := range []string{"projectcalico.org", "crd.projectcalico.org"} {
+		t.Run(group, func(t *testing.T) {
 			sub := BuildNeighborhoodWithIndex(topo, ResourceRef{
-				Kind: "NetworkPolicy", Namespace: "demo", Name: "shared", Group: test.group,
+				Kind: "NetworkPolicy", Namespace: "demo", Name: "shared", Group: group,
 			}, NeighborhoodOptions{Profile: ProfileAll, Hops: 1}, nil, nil)
-			if len(sub.Nodes) != 2 || sub.Nodes[0].ID != test.wantRoot || sub.Nodes[1].ID != test.wantTarget {
-				t.Fatalf("group-qualified neighborhood = %+v, want root %s and target %s", sub.Nodes, test.wantRoot, test.wantTarget)
+			if len(sub.Nodes) != 2 || sub.Nodes[0].ID != policyID || sub.Nodes[1].ID != targetID {
+				t.Fatalf("neighborhood via %s = %+v, want root %s and target %s", group, sub.Nodes, policyID, targetID)
 			}
 		})
+	}
+}
+
+// calicoTestDynamicForBoth serves the same policies under both Calico API
+// groups, which is what a cluster running the Calico apiserver does.
+func calicoTestDynamicForBoth() *calicoTestDynamic {
+	combined := calicoTestDynamicFor(calicoProjectGroup)
+	legacy := calicoTestDynamicFor(calicoCRDGroup)
+	for key, gvr := range legacy.gvrs {
+		combined.gvrs[key] = gvr
+		combined.resources[gvr] = legacy.resources[gvr]
+	}
+	return combined
+}
+
+func TestCalicoPolicyServedByBothGroupsBuildsOneNode(t *testing.T) {
+	provider := &calicoTestProvider{mockProvider: &mockProvider{deployments: []*appsv1.Deployment{
+		{ObjectMeta: metav1.ObjectMeta{Name: "frontend", Namespace: "demo"}, Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "frontend"}}},
+		}},
+	}}}
+
+	topo, err := NewBuilder(provider).WithDynamic(calicoTestDynamicForBoth()).Build(DefaultBuildOptions())
+	if err != nil {
+		t.Fatalf("Build() error: %v", err)
+	}
+
+	seen := map[string]int{}
+	for _, node := range topo.Nodes {
+		if IsCalicoPolicyKind(node.Kind) {
+			seen[string(node.Kind)+"/"+nodeNamespaceFromData(&node)+"/"+node.Name]++
+		}
+	}
+	for identity, count := range seen {
+		if count != 1 {
+			t.Errorf("%s rendered %d times, want a single node for a policy both groups serve", identity, count)
+		}
+	}
+
+	policyID := "caliconetworkpolicy/demo/frontend-policy"
+	var policy *Node
+	for i := range topo.Nodes {
+		if topo.Nodes[i].ID == policyID {
+			policy = &topo.Nodes[i]
+		}
+	}
+	if policy == nil {
+		t.Fatalf("no node with the unqualified ID %q; nodes = %+v", policyID, topo.Nodes)
+	}
+	tuples, ok := CalicoPolicyRBACTuples(policy)
+	if !ok || len(tuples) != 2 {
+		t.Fatalf("RBAC tuples = %+v (%v), want one per serving group", tuples, ok)
+	}
+
+	edges := 0
+	for _, edge := range topo.Edges {
+		if edge.Source == policyID && edge.Target == "deployment/demo/frontend" && edge.Type == EdgeProtects {
+			edges++
+		}
+	}
+	if edges != 1 {
+		t.Fatalf("protects edges from %s = %d, want 1", policyID, edges)
+	}
+}
+
+func TestCalicoStagedDeletionPreviewsNoProtection(t *testing.T) {
+	// The Calico API rejects a selector on a staged deletion, so its spec carries
+	// only the action — an absent selector that must not read as "selects all".
+	deletion := calicoTestObject(calicoProjectGroup, "v3", "StagedNetworkPolicy", "demo", "retire-frontend", map[string]any{
+		"stagedAction": "Delete",
+	})
+	ignored := calicoTestObject(calicoProjectGroup, "v3", "StagedNetworkPolicy", "demo", "parked", map[string]any{
+		"stagedAction": "Ignore",
+		"selector":     "all()",
+	})
+	if CalicoStagedActionPreviewsProtection(deletion) {
+		t.Error("a staged deletion was treated as previewed protection")
+	}
+	if CalicoStagedActionPreviewsProtection(ignored) {
+		t.Error("an ignored staged policy was treated as previewed protection")
+	}
+	set := calicoTestObject(calicoProjectGroup, "v3", "StagedNetworkPolicy", "demo", "tighten", map[string]any{
+		"stagedAction": "Set",
+		"selector":     "app == 'frontend'",
+	})
+	if !CalicoStagedActionPreviewsProtection(set) {
+		t.Error("a staged Set was not treated as previewed protection")
+	}
+
+	provider := &calicoTestProvider{mockProvider: &mockProvider{deployments: []*appsv1.Deployment{
+		{ObjectMeta: metav1.ObjectMeta{Name: "frontend", Namespace: "demo"}, Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "frontend"}}},
+		}},
+	}}}
+	dynamic := calicoTestDynamicFor(calicoProjectGroup)
+	dynamic.resources[dynamic.gvrs[calicoProjectGroup+"\x00StagedNetworkPolicy"]] = []*unstructured.Unstructured{deletion}
+
+	topo, err := NewBuilder(provider).WithDynamic(dynamic).Build(DefaultBuildOptions())
+	if err != nil {
+		t.Fatalf("Build() error: %v", err)
+	}
+
+	deletionID := "calicostagednetworkpolicy/demo/retire-frontend"
+	var node *Node
+	for i := range topo.Nodes {
+		if topo.Nodes[i].ID == deletionID {
+			node = &topo.Nodes[i]
+		}
+	}
+	if node == nil {
+		t.Fatalf("the staged deletion is not rendered at all; nodes = %+v", topo.Nodes)
+	}
+	if node.Data["matchesAllPods"] == true {
+		t.Error("a staged deletion claimed to select every workload")
+	}
+	if node.Data["policyCoverageWorkloads"] != nil {
+		t.Errorf("a staged deletion claimed coverage: %v", node.Data["policyCoverageWorkloads"])
+	}
+	for _, edge := range topo.Edges {
+		if edge.Source == deletionID {
+			t.Errorf("a staged deletion drew a protects edge to %s", edge.Target)
+		}
+	}
+
+	// A staged policy that DOES select something must still preview its edge, so
+	// the assertions above are about the action and not about staged policies in
+	// general.
+	previewing := calicoTestDynamicFor(calicoProjectGroup)
+	previewing.resources[previewing.gvrs[calicoProjectGroup+"\x00StagedNetworkPolicy"]] = []*unstructured.Unstructured{
+		calicoTestObject(calicoProjectGroup, "v3", "StagedNetworkPolicy", "demo", "tighten", map[string]any{
+			"stagedAction": "Set",
+			"selector":     "app == 'frontend'",
+		}),
+	}
+	previewTopo, err := NewBuilder(provider).WithDynamic(previewing).Build(DefaultBuildOptions())
+	if err != nil {
+		t.Fatalf("Build() error: %v", err)
+	}
+	preview := 0
+	for _, edge := range previewTopo.Edges {
+		if edge.Source == "calicostagednetworkpolicy/demo/tighten" && edge.Partial {
+			preview++
+		}
+	}
+	if preview != 1 {
+		t.Fatalf("staged Set preview edges = %d, want 1 — the deletion assertions must not pass by staged policies never drawing edges", preview)
+	}
+}
+
+// antreaTestDynamic serves a NetworkPolicy CRD under a non-Calico group, which
+// is what a cluster running a different CNI looks like.
+type antreaTestDynamic struct {
+	*calicoTestDynamic
+	antrea    schema.GroupVersionResource
+	resources []*unstructured.Unstructured
+}
+
+func (d *antreaTestDynamic) GetWatchedResources() []schema.GroupVersionResource {
+	return append(d.calicoTestDynamic.GetWatchedResources(), d.antrea)
+}
+
+func (d *antreaTestDynamic) ListNamespaces(gvr schema.GroupVersionResource, ns []string) ([]*unstructured.Unstructured, error) {
+	if gvr == d.antrea {
+		return d.resources, nil
+	}
+	return d.calicoTestDynamic.ListNamespaces(gvr, ns)
+}
+
+func (d *antreaTestDynamic) List(gvr schema.GroupVersionResource, ns string) ([]*unstructured.Unstructured, error) {
+	if gvr == d.antrea {
+		return d.resources, nil
+	}
+	return d.calicoTestDynamic.List(gvr, ns)
+}
+
+func (d *antreaTestDynamic) GetKindForGVR(gvr schema.GroupVersionResource) string {
+	if gvr == d.antrea {
+		return "NetworkPolicy"
+	}
+	return d.calicoTestDynamic.GetKindForGVR(gvr)
+}
+
+// Calico's policy kinds are skipped from the generic CRD path by API GROUP. A
+// name-based skip also swallows another CNI's identically-named CRD, which
+// silently disappears from the graph — the reason the skip is group-scoped.
+func TestForeignNetworkPolicyCRDStillRendersAsGenericNode(t *testing.T) {
+	antreaGVR := schema.GroupVersionResource{Group: "crd.antrea.io", Version: "v1alpha1", Resource: "networkpolicies"}
+	policy := calicoTestObject("crd.antrea.io", "v1alpha1", "NetworkPolicy", "demo", "antrea-policy", map[string]any{
+		"priority": int64(5),
+	})
+	policy.SetOwnerReferences([]metav1.OwnerReference{{Kind: "Deployment", Name: "frontend"}})
+
+	dynamic := &antreaTestDynamic{
+		calicoTestDynamic: calicoTestDynamicFor(calicoProjectGroup),
+		antrea:            antreaGVR,
+		resources:         []*unstructured.Unstructured{policy},
+	}
+	provider := &calicoTestProvider{mockProvider: &mockProvider{deployments: []*appsv1.Deployment{
+		{ObjectMeta: metav1.ObjectMeta{Name: "frontend", Namespace: "demo"}, Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "frontend"}}},
+		}},
+	}}}
+
+	topo, err := NewBuilder(provider).WithDynamic(dynamic).Build(DefaultBuildOptions())
+	if err != nil {
+		t.Fatalf("Build() error: %v", err)
+	}
+
+	var found *Node
+	for i := range topo.Nodes {
+		if topo.Nodes[i].Name == "antrea-policy" {
+			found = &topo.Nodes[i]
+		}
+	}
+	if found == nil {
+		var ids []string
+		for _, n := range topo.Nodes {
+			ids = append(ids, n.ID)
+		}
+		t.Fatalf("another CNI's NetworkPolicy CRD was dropped from the topology; nodes = %v", ids)
+	}
+	if group := nodeAPIGroupFromData(found); group != "crd.antrea.io" {
+		t.Errorf("foreign policy node API group = %q, want crd.antrea.io", group)
+	}
+	// The Calico policies from the same build must still be folded and present,
+	// so the group-scoped skip is doing its own job too.
+	calico := 0
+	for _, n := range topo.Nodes {
+		if IsCalicoPolicyKind(n.Kind) {
+			calico++
+		}
+	}
+	if calico == 0 {
+		t.Error("Calico policy nodes disappeared while making room for the foreign CRD")
+	}
+}
+
+func TestCalicoPolicyRBACTuplesSurviveAJSONRoundTrip(t *testing.T) {
+	// Node data is marshalled and decoded on the SSE and hub paths, which turns
+	// []string into []any. Failing to read that shape would fail closed and hide
+	// every dual-group policy on exactly those paths.
+	node := Node{
+		ID: "calicoglobalnetworkpolicy//shared", Kind: KindCalicoGlobalNetworkPolicy, Name: "shared",
+		Data: map[string]any{
+			"apiVersion":  "projectcalico.org/v3",
+			"apiVersions": []string{"projectcalico.org/v3", "crd.projectcalico.org/v1"},
+		},
+	}
+	encoded, err := json.Marshal(node)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var decoded Node
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if _, ok := decoded.Data["apiVersions"].([]any); !ok {
+		t.Fatalf("decoded apiGroups is %T, expected the []any shape this test exists for", decoded.Data["apiVersions"])
+	}
+	tuples, ok := CalicoPolicyRBACTuples(&decoded)
+	if !ok || len(tuples) != 2 {
+		t.Fatalf("tuples after a round trip = %+v (%v), want one per serving group", tuples, ok)
+	}
+}
+
+func TestCalicoMatcherRejectsUnusableOptionalSelectors(t *testing.T) {
+	workload := newCalicoWorkload("deployment/demo/frontend", "demo", map[string]string{"app": "frontend"}, "api-sa")
+	namespaceLabels := map[string]string{"env": "prod"}
+	serviceAccountLabels := map[string]string{"team": "payments"}
+
+	for _, test := range []struct {
+		name string
+		spec map[string]any
+		want bool
+	}{
+		{name: "usable namespace selector", spec: map[string]any{"selector": "app == 'frontend'", "namespaceSelector": "env == 'prod'"}, want: true},
+		{name: "unparseable namespace selector", spec: map[string]any{"selector": "app == 'frontend'", "namespaceSelector": "env ==="}},
+		{name: "usable service account selector", spec: map[string]any{"selector": "app == 'frontend'", "serviceAccountSelector": "team == 'payments'"}, want: true},
+		{name: "service account selector that does not match", spec: map[string]any{"selector": "app == 'frontend'", "serviceAccountSelector": "team == 'other'"}},
+		{name: "unparseable service account selector", spec: map[string]any{"selector": "app == 'frontend'", "serviceAccountSelector": "team ==="}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := calicoTestObject(calicoProjectGroup, "v3", "NetworkPolicy", "demo", test.name, test.spec)
+			matched, valid := CompileCalicoPolicyMatcher(policy).Matches(
+				workload.endpointLabels, namespaceLabels, workload.serviceAccount, serviceAccountLabels,
+			)
+			if !valid {
+				t.Fatalf("endpoint selector reported invalid; only the endpoint selector may do that")
+			}
+			if matched != test.want {
+				t.Fatalf("matched = %v, want %v", matched, test.want)
+			}
+		})
+	}
+}
+
+func TestCalicoNarrowedAllSelectorDoesNotClaimEveryWorkload(t *testing.T) {
+	// all() endpoints narrowed by a service-account selector covers whichever
+	// workloads use a matching ServiceAccount, not the whole namespace. The
+	// match-all shortcut skips the per-workload check, so claiming it here marks
+	// workloads protected that nothing protects.
+	for _, test := range []struct {
+		name string
+		spec map[string]any
+		want bool
+	}{
+		{name: "bare all()", spec: map[string]any{"selector": "all()"}, want: true},
+		{name: "no selector at all", spec: map[string]any{}, want: true},
+		{name: "all() with a service account selector", spec: map[string]any{"selector": "all()", "serviceAccountSelector": "team == 'payments'"}},
+		{name: "all() with a namespace selector", spec: map[string]any{"selector": "all()", "namespaceSelector": "env == 'prod'"}},
+		{name: "all() with all() selectors", spec: map[string]any{"selector": "all()", "namespaceSelector": "all()"}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := calicoTestObject(calicoProjectGroup, "v3", "NetworkPolicy", "demo", test.name, test.spec)
+			definition, _ := calicoPolicyDefinitionForNodeKind(KindCalicoNetworkPolicy)
+			if got := calicoPolicyMatchesAllWorkloads(policy, definition); got != test.want {
+				t.Fatalf("matchesAllWorkloads = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCalicoPolicyReadvertisedUnderAnAuthorizedGroup(t *testing.T) {
+	// The node advertises one apiVersion and the UI builds its detail fetch from
+	// it. A caller who can read the policy only through the other serving group
+	// must not be pointed at the group it cannot address.
+	build := func() *Topology {
+		return &Topology{Nodes: []Node{{
+			ID: "calicoglobalnetworkpolicy//shared", Kind: KindCalicoGlobalNetworkPolicy, Name: "shared",
+			Data: map[string]any{
+				"apiVersion":  "projectcalico.org/v3",
+				"apiVersions": []string{"projectcalico.org/v3", "crd.projectcalico.org/v1"},
+			},
+		}}}
+	}
+
+	legacyOnly := build()
+	legacyOnly.StripCalicoPoliciesExcept(map[SARTuple]bool{
+		{Group: "crd.projectcalico.org", Resource: "globalnetworkpolicies"}: true,
+	})
+	if len(legacyOnly.Nodes) != 1 {
+		t.Fatal("policy readable through the legacy group was stripped")
+	}
+	if got := legacyOnly.Nodes[0].Data["apiVersion"]; got != "crd.projectcalico.org/v1" {
+		t.Fatalf("apiVersion = %v, want the group this caller can address", got)
+	}
+
+	preferred := build()
+	preferred.StripCalicoPoliciesExcept(map[SARTuple]bool{
+		{Group: "projectcalico.org", Resource: "globalnetworkpolicies"}: true,
+	})
+	if got := preferred.Nodes[0].Data["apiVersion"]; got != "projectcalico.org/v3" {
+		t.Fatalf("apiVersion = %v, want the preferred group left alone", got)
+	}
+
+	// The rewrite must not reach the shared build every other viewer reads.
+	shared := build()
+	original := shared.Nodes[0].Data
+	shared.StripCalicoPoliciesExcept(map[SARTuple]bool{
+		{Group: "crd.projectcalico.org", Resource: "globalnetworkpolicies"}: true,
+	})
+	if original["apiVersion"] != "projectcalico.org/v3" {
+		t.Fatalf("the original data map was mutated: %v", original["apiVersion"])
+	}
+}
+
+func TestReadvertiseCalicoPolicyNodesLeavesOtherKindsAlone(t *testing.T) {
+	// The neighborhood paths filter node by node rather than through
+	// StripCalicoPoliciesExcept, so they re-advertise separately. Only Calico
+	// policy nodes may be touched, and only their apiVersion.
+	nodes := []Node{
+		{ID: "calicoglobalnetworkpolicy//shared", Kind: KindCalicoGlobalNetworkPolicy, Name: "shared", Data: map[string]any{
+			"apiVersion":  "projectcalico.org/v3",
+			"apiVersions": []string{"projectcalico.org/v3", "crd.projectcalico.org/v1"},
+			"namespace":   "",
+		}},
+		{ID: "networkpolicy/demo/native", Kind: KindNetworkPolicy, Name: "native", Data: map[string]any{
+			"apiVersion": "networking.k8s.io/v1", "namespace": "demo",
+		}},
+	}
+
+	ReadvertiseCalicoPolicyNodes(nodes, func(tuple SARTuple) bool {
+		return tuple.Group == "crd.projectcalico.org"
+	})
+
+	if got := nodes[0].Data["apiVersion"]; got != "crd.projectcalico.org/v1" {
+		t.Fatalf("Calico node apiVersion = %v, want the group the caller holds", got)
+	}
+	if got := nodes[1].Data["apiVersion"]; got != "networking.k8s.io/v1" {
+		t.Fatalf("a native NetworkPolicy was rewritten to %v", got)
+	}
+
+	// A nil authorizer must change nothing rather than pick a group at random.
+	before := nodes[0].Data["apiVersion"]
+	ReadvertiseCalicoPolicyNodes(nodes, nil)
+	if nodes[0].Data["apiVersion"] != before {
+		t.Fatal("a missing authorizer rewrote the advertised group")
 	}
 }
