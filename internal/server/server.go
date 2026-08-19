@@ -714,6 +714,11 @@ func (s *Server) setupAppRoutes(r chi.Router) {
 			r.Post("/flux/{kind}/{namespace}/{name}/suspend", s.handleFluxSuspend)
 			r.Post("/flux/{kind}/{namespace}/{name}/resume", s.handleFluxResume)
 
+			// Argo Rollouts progressive-delivery control plane. Rollback and
+			// revision history are served by the /workloads routes above.
+			r.Get("/rollouts/{namespace}/{name}/capabilities", s.handleRolloutCapabilities)
+			r.Post("/rollouts/{namespace}/{name}/{action}", s.handleRolloutOperation)
+
 			// ArgoCD routes
 			r.Get("/argo/destinations", s.handleArgoDestinations)
 			r.Post("/argo/applications/{namespace}/{name}/sync", s.handleArgoSync)
@@ -4047,7 +4052,8 @@ func (s *Server) handleRestartWorkload(w http.ResponseWriter, r *http.Request) {
 		"daemonsets":   true,
 		"rollouts":     true,
 	}
-	if !validKinds[strings.ToLower(kind)] {
+	normalizedKind := k8score.NormalizeWorkloadKind(strings.ToLower(kind))
+	if !validKinds[normalizedKind] {
 		s.writeError(w, http.StatusBadRequest, "only Deployments, StatefulSets, DaemonSets, and Rollouts can be restarted")
 		return
 	}
@@ -4060,6 +4066,12 @@ func (s *Server) handleRestartWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	err := k8s.RestartWorkloadWithClient(r.Context(), kind, namespace, name, client)
 	if err != nil {
+		// Restart reaches a terminating Rollout through get(), so it carries the
+		// same sentinels rollback does.
+		if normalizedKind == "rollouts" {
+			s.writeRolloutError(w, err, "restart", namespace, name)
+			return
+		}
 		if apierrors.IsNotFound(err) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -4131,7 +4143,14 @@ func (s *Server) handleScaleWorkload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleWorkloadRevisions returns the revision history for a Deployment, StatefulSet, or DaemonSet
+var rollbackableWorkloadKinds = map[string]bool{
+	"deployments":  true,
+	"statefulsets": true,
+	"daemonsets":   true,
+	"rollouts":     true,
+}
+
+// handleWorkloadRevisions returns the revision history for a Deployment, StatefulSet, DaemonSet, or Rollout
 func (s *Server) handleWorkloadRevisions(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
@@ -4142,13 +4161,8 @@ func (s *Server) handleWorkloadRevisions(w http.ResponseWriter, r *http.Request)
 	name := chi.URLParam(r, "name")
 
 	// Validate that this is a rollbackable workload type
-	validKinds := map[string]bool{
-		"deployments":  true,
-		"statefulsets": true,
-		"daemonsets":   true,
-	}
-	if !validKinds[strings.ToLower(kind)] {
-		s.writeError(w, http.StatusBadRequest, "revision history only available for Deployments, StatefulSets, and DaemonSets")
+	if !rollbackableWorkloadKinds[k8score.NormalizeWorkloadKind(strings.ToLower(kind))] {
+		s.writeError(w, http.StatusBadRequest, "revision history only available for Deployments, StatefulSets, DaemonSets, and Rollouts")
 		return
 	}
 
@@ -4202,13 +4216,9 @@ func (s *Server) handleRollbackWorkload(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Validate that this is a rollbackable workload type
-	validKinds := map[string]bool{
-		"deployments":  true,
-		"statefulsets": true,
-		"daemonsets":   true,
-	}
-	if !validKinds[strings.ToLower(kind)] {
-		s.writeError(w, http.StatusBadRequest, "rollback only available for Deployments, StatefulSets, and DaemonSets")
+	normalizedKind := k8score.NormalizeWorkloadKind(strings.ToLower(kind))
+	if !rollbackableWorkloadKinds[normalizedKind] {
+		s.writeError(w, http.StatusBadRequest, "rollback only available for Deployments, StatefulSets, DaemonSets, and Rollouts")
 		return
 	}
 
@@ -4220,6 +4230,12 @@ func (s *Server) handleRollbackWorkload(w http.ResponseWriter, r *http.Request) 
 	}
 	err := k8s.RollbackWorkloadWithClient(r.Context(), kind, namespace, name, req.Revision, client)
 	if err != nil {
+		// Rollouts carry sentinel errors (unchanged template, unsupported
+		// workloadRef, terminating) that the substring checks below can't map.
+		if normalizedKind == "rollouts" {
+			s.writeRolloutError(w, err, "rollback", namespace, name)
+			return
+		}
 		if apierrors.IsNotFound(err) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
