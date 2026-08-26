@@ -3130,6 +3130,7 @@ export interface ArgoStatus {
   configured: boolean;
   connected: boolean;
   address?: string;
+  reason?: string;
 }
 
 export function useArgoStatus(enabled = true) {
@@ -6431,10 +6432,13 @@ export interface DiagnosticsSnapshot {
     errorType?: string;
   };
   kubeconfig?: {
-    mode: "" | "in-cluster" | "single" | "multi-env" | "multi-dir";
+    mode: "" | "in-cluster" | "single" | "multi-env" | "multi-dir" | "multi-source";
     fileCount: number;
+    directoryFileCount: number;
     contextCount: number;
     enrichedFromShell: boolean;
+    kubeconfigEnvIgnored: boolean;
+    kubeconfigEnvIgnoredReason: string;
     currentContextUsesExec: boolean;
     execPluginsPresent?: string[];
     execPluginsMissing?: string[];

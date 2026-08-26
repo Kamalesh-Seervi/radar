@@ -101,8 +101,8 @@ func main() {
 	fileCfg := config.Load()
 
 	// Parse flags (defaults come from config file, falling back to hardcoded values)
-	kubeconfig := flag.String("kubeconfig", fileCfg.Kubeconfig, "Path to kubeconfig file (default: ~/.kube/config)")
-	kubeconfigDir := flag.String("kubeconfig-dir", fileCfg.KubeconfigDirsFlag(), "Comma-separated directories containing kubeconfig files (mutually exclusive with --kubeconfig)")
+	kubeconfig := flag.String("kubeconfig", fileCfg.Kubeconfig, "Path to primary kubeconfig file (default: ~/.kube/config)")
+	kubeconfigDir := flag.String("kubeconfig-dir", fileCfg.KubeconfigDirsFlag(), "Comma-separated directories containing additional kubeconfig files")
 	namespace := flag.String("namespace", fileCfg.Namespace, "Initial namespace filter (empty = all namespaces)")
 	namespaces := flag.String("namespaces", fileCfg.NamespacesFlag(), "Initial namespace filters as a comma-separated list (e.g. ns1,ns2,ns3). Use this when you can list resources in specific namespaces but cannot list namespaces cluster-wide.")
 	port := flag.Int("port", fileCfg.PortOr(9280), "Server port")
@@ -248,9 +248,6 @@ func main() {
 	default:
 		log.Fatalf("Invalid --auth-mode %q: must be none, proxy, or oidc", *authMode)
 	}
-	if *kubeconfig != "" && *kubeconfigDir != "" {
-		log.Fatalf("--kubeconfig and --kubeconfig-dir are mutually exclusive")
-	}
 	normalizedListenAddress, err := server.NormalizeListenAddress(*listenAddress)
 	if err != nil {
 		log.Fatalf("Invalid --listen-address %q: %v", *listenAddress, err)
@@ -276,6 +273,8 @@ func main() {
 		log.Fatalf("Invalid --opencost-currency %q: %v", *openCostCurrency, err)
 	}
 	noMCPFlagSet := false
+	kubeconfigFlagSet := false
+	kubeconfigDirsFlagSet := false
 	namespaceFlagSet := false
 	namespacesFlagSet := false
 	openCostCurrencyFlagSet := false
@@ -283,6 +282,10 @@ func main() {
 		switch f.Name {
 		case "no-mcp":
 			noMCPFlagSet = true
+		case "kubeconfig":
+			kubeconfigFlagSet = true
+		case "kubeconfig-dir":
+			kubeconfigDirsFlagSet = true
 		case "namespace":
 			namespaceFlagSet = true
 		case "namespaces":
@@ -315,6 +318,9 @@ func main() {
 	if len(resolvedNamespaces) > *maxScopeCandidates {
 		log.Fatalf("--namespaces lists %d namespaces but the RBAC probe fanout cap is %d; raise --max-scope-candidates (or RADAR_MAX_SCOPE_CANDIDATES) to cover all of them", len(resolvedNamespaces), *maxScopeCandidates)
 	}
+	resolvedKubeconfig, resolvedKubeconfigDirs := app.ResolveKubeconfigSelection(
+		*kubeconfig, *kubeconfigDir, kubeconfigFlagSet, kubeconfigDirsFlagSet,
+	)
 	mcpEnabled := !*noMCP
 	if *mcpCatalogOnly || *mcpCatalogStdio {
 		mcpEnabled = true
@@ -330,8 +336,8 @@ func main() {
 	}
 
 	cfg := app.AppConfig{
-		Kubeconfig:               *kubeconfig,
-		KubeconfigDirs:           app.ParseKubeconfigDirs(*kubeconfigDir),
+		Kubeconfig:               resolvedKubeconfig,
+		KubeconfigDirs:           resolvedKubeconfigDirs,
 		Namespace:                resolvedNamespace,
 		Namespaces:               resolvedNamespaces,
 		Port:                     *port,

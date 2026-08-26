@@ -169,8 +169,8 @@ The table below covers common startup flags. See the [full CLI reference](https:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kubeconfig` | `~/.kube/config` | Path to kubeconfig file |
-| `--kubeconfig-dir` | | Comma-separated directories containing kubeconfig files |
+| `--kubeconfig` | `~/.kube/config` | Path to primary kubeconfig file |
+| `--kubeconfig-dir` | | Comma-separated directories containing additional kubeconfig files |
 | `--namespace` | (all) | Initial namespace filter (supports multi-select in the UI; also used as RBAC fallback for namespace-scoped users) |
 | `--namespaces` | (all) | Initial namespace filters as a comma-separated list, e.g. `--namespaces ns1,ns2,ns3`. Use this when your identity can list resources in specific namespaces but cannot list namespaces cluster-wide. |
 | `--namespace-scope` | `false` | Pin namespaced informer caches to a **single** namespace for large clusters (scoping to multiple namespaces is not supported yet). Requires `--namespace`, a kubeconfig context namespace, or a saved local single-namespace pick. Local mode can rebuild the cache when switching namespaces; auth/cloud mode locks the shared cache to the startup namespace. |

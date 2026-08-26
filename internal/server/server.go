@@ -51,9 +51,9 @@ import (
 	prometheuspkg "github.com/skyhook-io/radar/internal/prometheus"
 	"github.com/skyhook-io/radar/internal/settings"
 	"github.com/skyhook-io/radar/internal/timeline"
-	"github.com/skyhook-io/radar/internal/upgrade"
 	"github.com/skyhook-io/radar/internal/traffic"
 	"github.com/skyhook-io/radar/internal/updater"
+	"github.com/skyhook-io/radar/internal/upgrade"
 	"github.com/skyhook-io/radar/internal/version"
 	"github.com/skyhook-io/radar/pkg/argoapi"
 	"github.com/skyhook-io/radar/pkg/conditions"
@@ -4370,11 +4370,13 @@ func (s *Server) handleConnectionRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reconnect to the same context (reuses PerformContextSwitch which handles full
-	// reinit, including stopping active sessions at teardown)
-	if err := k8s.PerformContextSwitch(ctx); err != nil {
+	if err := k8s.RetryCurrentConnection(); err != nil {
 		if errors.Is(err, k8s.ErrContextSwitchPreflight) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, k8s.ErrReconnectSuperseded) {
+			s.writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 		errorType := k8s.ClassifyError(err)
@@ -4392,7 +4394,7 @@ func (s *Server) handleConnectionRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PerformContextSwitch published the connected status under the
+	// RetryCurrentConnection published the connected status under the
 	// context-operation lock; a second publish here would race a queued
 	// operation's teardown.
 	s.writeJSON(w, k8s.GetConnectionStatus())
@@ -4467,7 +4469,7 @@ func (s *Server) handleCAPIClusterConnect(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	client := s.getClientForRequest(r)
+	client, managementBinding := s.getClientSafetySnapshotForRequest(r)
 	if client == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "cluster client not available — check cluster connection")
 		return
@@ -4521,7 +4523,8 @@ func (s *Server) handleCAPIClusterConnect(w http.ResponseWriter, r *http.Request
 	// Merge into the user's kubeconfig. The returned qualifiedName reflects
 	// any disambiguation the registry had to do (e.g. if another file already
 	// owned this context name). Always switch using the qualified name.
-	qualifiedName, mergedPath, err := k8s.MergeAndSwitchContext(kubeconfigData, contextName)
+	safetyBinding := k8s.CAPIClusterSafetyBinding(managementBinding, ns, name)
+	qualifiedName, mergedPath, created, err := k8s.MergeAndSwitchContext(kubeconfigData, contextName, safetyBinding)
 	if err != nil {
 		log.Printf("[capi] Failed to merge kubeconfig for cluster %s/%s: %v", ns, name, err)
 		s.writeError(w, http.StatusInternalServerError, "failed to connect: "+err.Error())
@@ -4529,13 +4532,21 @@ func (s *Server) handleCAPIClusterConnect(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := k8s.PerformContextSwitch(qualifiedName); err != nil {
+		discarded := k8s.DiscardFailedMergedContext(mergedPath, created)
+		if discarded {
+			log.Printf("[capi] Discarded inactive kubeconfig after failed switch to %q", qualifiedName)
+		}
 		if errors.Is(err, k8s.ErrContextSwitchPreflight) {
 			s.writeError(w, http.StatusBadRequest, "failed to switch context: "+err.Error())
 			return
 		}
+		statusContext := qualifiedName
+		if discarded {
+			statusContext = k8s.GetContextName()
+		}
 		k8s.SetConnectionStatus(k8s.ConnectionStatus{
 			State:     k8s.StateDisconnected,
-			Context:   qualifiedName,
+			Context:   statusContext,
 			Error:     err.Error(),
 			ErrorType: k8s.ClassifyError(err),
 		})
@@ -4746,6 +4757,22 @@ func (s *Server) getClientForRequest(r *http.Request) kubernetes.Interface {
 		return c
 	}
 	return nil
+}
+
+func (s *Server) getClientSafetySnapshotForRequest(r *http.Request) (kubernetes.Interface, string) {
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		client, binding, err := k8s.ImpersonatedClientSafetySnapshot(user.Username, user.Groups)
+		if err != nil {
+			log.Printf("[auth] Impersonation failed for %s: %v", k8s.SanitizeForLog(user.Username), err)
+			return nil, binding
+		}
+		return client, binding
+	}
+	client, binding := k8s.GetClientSafetySnapshot()
+	if client == nil {
+		return nil, binding
+	}
+	return client, binding
 }
 
 // getUserNamespaces returns namespace filtering for the current user.
@@ -5193,9 +5220,16 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 			argoToken        string
 			argoInsecure     bool
 			argoTokenContext string
+			argoTokenBinding string
 		}{
-			c.PrometheusHeaders, c.PrometheusHeadersFromEnv, c.PrometheusURL,
-			c.ArgoCDURL, c.ArgoCDToken, c.ArgoCDInsecureTLS, c.ArgoCDTokenContext,
+			promHeaders:      c.PrometheusHeaders,
+			promHeadersEnv:   c.PrometheusHeadersFromEnv,
+			promURL:          c.PrometheusURL,
+			argoURL:          c.ArgoCDURL,
+			argoToken:        c.ArgoCDToken,
+			argoInsecure:     c.ArgoCDInsecureTLS,
+			argoTokenContext: c.ArgoCDTokenContext,
+			argoTokenBinding: c.ArgoCDTokenBinding,
 		}
 		*c = updated
 		c.PrometheusHeaders = preserved.promHeaders
@@ -5205,6 +5239,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		c.ArgoCDToken = preserved.argoToken
 		c.ArgoCDInsecureTLS = preserved.argoInsecure
 		c.ArgoCDTokenContext = preserved.argoTokenContext
+		c.ArgoCDTokenBinding = preserved.argoTokenBinding
 	})
 	if err != nil {
 		log.Printf("[config] Failed to save config: %v", err)
