@@ -452,6 +452,12 @@ mcp:
   # Set to false to disable the MCP server (useful when deployed behind authentication)
   enabled: true
 
+# OpenCost/Kubecost display configuration
+cost:
+  # Optional ISO 4217 override for OpenCost/Kubecost values. Empty detects the
+  # running cost tool's configured currency when available, then uses USD.
+  currency: ""
+
 # Traffic source configuration
 traffic:
   # Manual Prometheus/VictoriaMetrics URL (bypasses auto-discovery)

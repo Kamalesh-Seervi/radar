@@ -82,6 +82,8 @@ type Server struct {
 	mcpReadOnlyHandler http.Handler
 	diagConfig         *DiagConfig
 	effectiveConfig    *config.Config // running config for GET /api/config
+	openCostCurrency   *opencost.CurrencyResolver
+	currencyManaged    bool
 	authConfig         auth.Config
 	permCache          *auth.PermissionCache
 	oidcHandler        *auth.OIDCHandler
@@ -166,6 +168,8 @@ type Config struct {
 	MCPReadOnlyHandler http.Handler   // read-only MCP handler (read tools only)
 	DiagConfig         *DiagConfig    // Sanitized config for diagnostics endpoint
 	EffectiveConfig    *config.Config // Running startup config for GET /api/config
+	OpenCostCurrency   string         // ISO 4217 code labeling values returned by OpenCost endpoints
+	OpenCostManaged    bool           // true when an explicit CLI/Helm flag owns the running value
 	AuthConfig         auth.Config    // Authentication configuration
 	AIHistoryDB        string         // AI run-history SQLite path ("" = memory-only runs)
 	CloudConnect       CloudConnectConfig
@@ -198,6 +202,8 @@ func New(cfg Config) *Server {
 		mcpReadOnlyHandler:    cfg.MCPReadOnlyHandler,
 		diagConfig:            cfg.DiagConfig,
 		effectiveConfig:       cfg.EffectiveConfig,
+		openCostCurrency:      opencost.NewCurrencyResolver(cfg.OpenCostCurrency),
+		currencyManaged:       cfg.OpenCostManaged,
 		authConfig:            cfg.AuthConfig,
 		cloudConnectCfg:       cfg.CloudConnect,
 		topoMemo:              topology.NewMemoizer(5 * time.Second),
@@ -706,7 +712,7 @@ func (s *Server) setupAppRoutes(r chi.Router) {
 			r.Post("/opencost/application/trend", s.handleOpenCostApplicationTrend)
 			r.Get("/opencost/workload/{kind}/{namespace}/{name}", s.handleOpenCostWorkload)
 			r.Get("/opencost/workload/{kind}/{namespace}/{name}/trend", s.handleOpenCostWorkloadTrend)
-			opencost.RegisterRoutes(r)
+			opencost.RegisterRoutes(r, s.resolvedOpenCostCurrency)
 
 			// FluxCD routes
 			r.Post("/flux/{kind}/{namespace}/{name}/reconcile", s.handleFluxReconcile)
@@ -5098,6 +5104,9 @@ type configResponse struct {
 	File      config.Config `json:"file"`
 	Effective config.Config `json:"effective"`
 	IsDesktop bool          `json:"isDesktop"`
+	// OpenCostManaged tells Settings that an explicit startup flag owns the
+	// running value even when the persisted file changes.
+	OpenCostManaged bool `json:"openCostCurrencyManaged,omitempty"`
 	// PrometheusHeaderKeys lists the configured Prometheus header names so the UI
 	// can show what's set without ever receiving the (secret) values.
 	PrometheusHeaderKeys []string `json:"prometheusHeaderKeys,omitempty"`
@@ -5121,6 +5130,11 @@ type configResponse struct {
 // diagnostics endpoint already masks them as a presence bool.
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	file := config.Load()
+	normalizedCurrency, err := config.NormalizeOpenCostCurrency(file.OpenCostCurrency)
+	if err != nil {
+		normalizedCurrency = ""
+	}
+	file.OpenCostCurrency = normalizedCurrency
 	headerKeys := make([]string, 0, len(file.PrometheusHeaders))
 	for k := range file.PrometheusHeaders {
 		headerKeys = append(headerKeys, k)
@@ -5152,6 +5166,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	resp := configResponse{
 		File:                 file,
 		IsDesktop:            version.IsDesktop(),
+		OpenCostManaged:      s.currencyManaged,
 		PrometheusHeaderKeys: headerKeys,
 		ArgoCDTokenSet:       tokenSet,
 		ArgoCDEnvManaged:     envManaged,
@@ -5171,7 +5186,8 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, resp)
 }
 
-// handlePutConfig replaces the entire config file. Changes take effect on next restart.
+// handlePutConfig replaces the entire config file. Most changes take effect on next restart;
+// the OpenCost currency override is also applied unless an explicit startup flag owns it.
 // Unlike handlePutSettings (which merges fields), this is a full replacement.
 // PrometheusHeaders and the Argo CD token are preserved from the on-disk file: the GET
 // response redacts them, so a UI round-trip would otherwise silently wipe the user's
@@ -5185,6 +5201,12 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	normalizedCurrency, err := config.NormalizeOpenCostCurrency(updated.OpenCostCurrency)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid OpenCost currency: "+err.Error())
+		return
+	}
+	updated.OpenCostCurrency = normalizedCurrency
 	result, err := config.Update(func(c *config.Config) {
 		// Integration connection fields are owned exclusively by the live
 		// /api/integrations/* endpoints, not this startup-config PUT. Preserve
@@ -5216,6 +5238,9 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[config] Failed to save config: %v", err)
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if s.openCostCurrency != nil && !s.currencyManaged {
+		s.openCostCurrency.SetOverride(result.OpenCostCurrency)
 	}
 	result.PrometheusHeaders = nil
 	result.ArgoCDToken = ""
@@ -5292,6 +5317,9 @@ func (s *Server) handleApplyPrometheusURL(w http.ResponseWriter, r *http.Request
 		traffic.SetMetricsHeaders(headers)
 	}
 	prometheuspkg.Reset()
+	if s.openCostCurrency != nil {
+		s.openCostCurrency.Invalidate()
+	}
 
 	resp := struct {
 		Connected bool   `json:"connected"`

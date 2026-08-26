@@ -195,6 +195,7 @@ The table below covers common startup flags. See the [full CLI reference](https:
 | `--prometheus-url` | (auto-discover) | Manual Prometheus/VictoriaMetrics URL (skips auto-discovery) |
 | `--prometheus-header` | | HTTP header sent with every Prometheus request, format `Key=Value` (repeatable). Required for auth-protected backends. |
 | `--prometheus-header-from-env` | | HTTP header sent with every Prometheus request, sourced from an environment variable, format `Key=ENV_VAR` (repeatable). |
+| `--opencost-currency` | (auto-detect, then USD) | Override the ISO 4217 currency label for OpenCost values. Radar labels values but does not convert them. |
 | `--auth-mode` | `none` | Authentication mode: `none`, `proxy`, or `oidc` ([details](docs/authentication.md)) |
 | `--no-mcp` | `false` | Disable MCP server for AI tool integration |
 | `--mcp-catalog-stdio` | `false` | Start only the MCP catalog over stdio for registry introspection |
@@ -395,7 +396,9 @@ See [docs/capacity.md](docs/capacity.md) for the full reference.
 
 ### Cost Insights
 
-Track Kubernetes spending with OpenCost integration — no additional configuration needed.
+Track Kubernetes spending with OpenCost integration. Radar reads the configured currency from a
+running OpenCost or Kubecost workload when available and otherwise uses USD. Override the label in
+Settings → Cost, config, CLI, or Helm. Radar does not convert values between currencies.
 
 - Cluster hourly and projected monthly cost, top namespaces by spend
 - Cost trend charts with 6h/24h/7d range selector
