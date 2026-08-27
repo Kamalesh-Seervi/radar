@@ -26,6 +26,9 @@ import { DialogPortal } from '../ui/DialogPortal'
 import type { SelectedResource, WorkloadRevision } from '../../types'
 import { displayKindName } from '../ui/drawer-components'
 import { getDefaultContainerName } from '../resources/resource-utils'
+import { SetImageDialog, type ManagedImageSource } from './SetImageDialog'
+import type { WorkloadImageInventory, WorkloadImageUpdate } from '../../types/core'
+import { isArgoRolloutResource } from '../../utils/workload-rollout'
 
 // ============================================================================
 // ACTIONS BAR - Interactive buttons that change based on resource kind
@@ -75,6 +78,11 @@ interface ResourceActionsBarProps {
   // Workload restart
   onRestart?: (params: { kind: string; namespace: string; name: string }, callbacks?: { onSuccess?: () => void; onError?: (err: unknown) => void }) => void
   isRestarting?: boolean
+
+  onLoadImages?: (params: { kind: string; namespace: string; name: string }) => Promise<WorkloadImageInventory>
+  onSetImages?: (params: { kind: string; namespace: string; name: string; updates: WorkloadImageUpdate[] }) => Promise<unknown>
+  isSettingImages?: boolean
+  managedImageSources?: ManagedImageSource[]
 
   // Rollback
   revisions?: WorkloadRevision[]
@@ -136,6 +144,7 @@ export function ResourceActionsBar({
   renderPortForward,
   onDelete, isDeleting, cascadeDependents, cascadeLoading, cascadeRootResolved,
   onRestart, isRestarting,
+  onLoadImages, onSetImages, isSettingImages, managedImageSources,
   revisions: revisionsList, revisionsLoading, revisionsError, onRollback, isRollingBack,
   onRolloutPromoteFull,
   onTriggerCronJob, isTriggeringCronJob,
@@ -156,6 +165,8 @@ export function ResourceActionsBar({
   onDrainNode, isDrainingNode,
 }: ResourceActionsBarProps) {
   const kind = resource.kind.toLowerCase()
+  const supportsWorkloadActions = ['deployments', 'statefulsets', 'daemonsets'].includes(kind) ||
+    (kind === 'rollouts' && isArgoRolloutResource(data))
   const canOpenWorkloadLogs = Boolean(
     canViewLogs &&
     !hideLogs &&
@@ -173,6 +184,7 @@ export function ResourceActionsBar({
 
   // Rollback dialog state
   const [showRevisions, setShowRevisions] = useState(false)
+  const [showSetImage, setShowSetImage] = useState(false)
   const isRollbackKind = ['deployments', 'statefulsets', 'daemonsets', 'rollouts'].includes(kind)
   const hasMultipleRevisions = (revisionsList?.length ?? 0) > 1
 
@@ -235,7 +247,7 @@ export function ResourceActionsBar({
   }
 
   return (
-    <div className="flex items-center gap-2 px-4 py-2 flex-wrap">
+    <div className="flex items-center gap-1.5 px-4 py-2 flex-wrap">
       {/* Kind-specific actions (left) */}
       {kind === 'pods' && (
         <>
@@ -298,7 +310,7 @@ export function ResourceActionsBar({
           {canExec && onOpenNodeTerminal && (
             <button
               onClick={() => onOpenNodeTerminal({ nodeName: resource.name })}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium btn-brand rounded-lg"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium btn-brand-muted rounded-lg"
             >
               <Terminal className="w-3.5 h-3.5" />
               Debug Shell
@@ -357,21 +369,36 @@ export function ResourceActionsBar({
       )}
 
       {/* Workload actions - restart, rollback, and logs */}
-      {['deployments', 'statefulsets', 'daemonsets', 'rollouts'].includes(kind) && (
+      {supportsWorkloadActions && (
         <>
-          {onRestart && (
+          {onLoadImages && onSetImages && !data?.metadata?.deletionTimestamp && (
             <button
-              onClick={() => onRestart({
-                kind: resource.kind,
-                namespace: resource.namespace,
-                name: resource.name,
-              })}
-              disabled={isRestarting}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium btn-brand-muted rounded-lg"
+              onClick={() => setShowSetImage(true)}
+              className="flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium btn-brand-muted rounded-lg"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRestarting ? 'animate-spin' : ''}`} />
-              {isRestarting ? 'Restarting...' : 'Restart'}
+              <Box className="w-3.5 h-3.5" />
+              Set image
             </button>
+          )}
+          {onRestart && (
+            <>
+              <button
+                onClick={() => onRestart({
+                  kind: resource.kind,
+                  namespace: resource.namespace,
+                  name: resource.name,
+                })}
+                disabled={isRestarting}
+                aria-busy={isRestarting}
+                className="flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium btn-brand-muted rounded-lg"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isRestarting ? 'animate-spin' : ''}`} />
+                Restart
+              </button>
+              <span className="sr-only" aria-live="polite">
+                {isRestarting ? 'Restarting workload' : ''}
+              </span>
+            </>
           )}
           {isRollbackKind && onRollback && (
             <Tooltip content={hasMultipleRevisions ? 'View revision history and rollback' : 'Only one revision exists'} delay={150}>
@@ -379,7 +406,7 @@ export function ResourceActionsBar({
                 onClick={() => setShowRevisions(true)}
                 disabled={!hasMultipleRevisions}
                 className={clsx(
-                  "flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors",
+                  "flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded-lg transition-colors",
                   hasMultipleRevisions
                     ? "text-white bg-amber-600 hover:bg-amber-700"
                     : "text-theme-text-disabled bg-theme-elevated"
@@ -480,7 +507,7 @@ export function ResourceActionsBar({
             workloadKind: kind,
             workloadName: resource.name,
           })}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium btn-brand-muted rounded-lg"
+          className="flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium btn-brand-muted rounded-lg"
         >
           <FileText className="w-3.5 h-3.5" />
           Logs
@@ -527,7 +554,7 @@ export function ResourceActionsBar({
           <button
             onClick={onToggleYaml}
             className={clsx(
-              'flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors',
+              'flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded-lg transition-colors',
               showYaml
                 ? 'btn-brand'
                 : 'text-theme-text-secondary hover:text-theme-text-primary border border-theme-border-light hover:bg-theme-elevated'
@@ -615,6 +642,20 @@ export function ResourceActionsBar({
         cascadeLoading={cascadeLoading}
         cascadeRootResolved={cascadeRootResolved}
       />
+
+      {onLoadImages && onSetImages && (
+        <SetImageDialog
+          open={showSetImage}
+          workloadLabel={`${displayKindName(resource.kind, data?.kind)} ${resource.namespace}/${resource.name}`}
+          workloadName={resource.name}
+          workloadResource={resource.kind}
+          managedSources={managedImageSources}
+          pending={isSettingImages}
+          onClose={() => setShowSetImage(false)}
+          onLoad={() => onLoadImages({ kind: resource.kind, namespace: resource.namespace, name: resource.name })}
+          onConfirm={(updates) => onSetImages({ kind: resource.kind, namespace: resource.namespace, name: resource.name, updates })}
+        />
+      )}
 
       {/* Node cordon confirmation */}
       <ConfirmDialog

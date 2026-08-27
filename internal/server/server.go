@@ -140,6 +140,9 @@ type Server struct {
 
 	capacityIssueMemo *capacityIssueMemo
 
+	workloadRevisionMu    sync.Mutex
+	workloadRevisionCache map[string]workloadRevisionTargetCacheEntry
+
 	yamlSchemaMu          sync.Mutex
 	yamlSchemaCache       map[string][]byte
 	yamlSchemaPathCache   map[string]yamlSchemaPathCacheEntry
@@ -667,6 +670,8 @@ func (s *Server) setupAppRoutes(r chi.Router) {
 			// Workload restart, scale, rollback
 			r.Post("/workloads/{kind}/{namespace}/{name}/restart", s.handleRestartWorkload)
 			r.Post("/workloads/{kind}/{namespace}/{name}/scale", s.handleScaleWorkload)
+			r.Get("/workloads/{kind}/{namespace}/{name}/images", s.handleGetWorkloadImages)
+			r.Post("/workloads/{kind}/{namespace}/{name}/images", s.handleSetWorkloadImages)
 			r.Get("/workloads/{kind}/{namespace}/{name}/revisions", s.handleWorkloadRevisions)
 			r.Post("/workloads/{kind}/{namespace}/{name}/rollback", s.handleRollbackWorkload)
 
@@ -1234,8 +1239,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	caps.Deployment = k8s.DeploymentInfo{Mode: deploymentMode()}
 	caps.CloudConnect = s.cloudConnectCapability()
 	caps.Features = k8s.FeatureCapabilities{
-		YAMLReview:  true,
-		YAMLSchemas: true,
+		YAMLReview:     true,
+		YAMLSchemas:    true,
+		WorkloadImages: true,
 	}
 	caps.AuthEnabled = s.authConfig.Enabled()
 	if user := auth.UserFromContext(r.Context()); user != nil {
