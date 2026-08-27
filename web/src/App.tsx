@@ -2035,7 +2035,10 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
           retained background list out of the focus order + a11y tree (the visual
           cover already blocks pointer events). */}
       {contentReady && <div className="flex-1 flex overflow-hidden" inert={expandedView}>
-        <ErrorBoundary>
+        {/* Search included, not just the path: selection inside a view rides in
+            the query (?resource=, ?release=), so a path-only key would still
+            strand a crash on the view that produced it. */}
+        <ErrorBoundary resetKey={location.pathname + location.search}>
         {/* Home dashboard */}
         {mainView === 'home' && (
           <HomeView
