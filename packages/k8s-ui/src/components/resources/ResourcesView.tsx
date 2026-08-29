@@ -140,6 +140,7 @@ import {
   healthColors,
 } from './resource-utils'
 import { getGenericResourceStatus } from './generic-status'
+import { getIstioGatewayServerCount, getIstioGatewaySelectorString } from './resource-utils-istio'
 import {
   type PrinterColumnDef, type PrinterTable, PRINTER_COLUMN_PREFIX, formatPrinterCell, printerCellSortValue,
   printerCellTone, printerColumnKey, printerColumnWidth, printerTableKey, printerTableMatchesKind, readPrinterCell,
@@ -4409,17 +4410,28 @@ export function ResourcesView({
       case 'age':
         return meta.creationTimestamp ? new Date(meta.creationTimestamp).getTime() : 0
       case 'status':
-        // Uncurated kinds sort on the text their badge shows: they have no
-        // phase to sort on when the status came from a condition or a replica
-        // count, so phase ordered them all as equal.
+        // Phase first for a curated kind: it keeps the most-used lists — Pods,
+        // Deployments, Nodes — ordering as they always have.
         //
-        // Curated kinds sort on phase. Their cell already shows something
-        // richer, but routing the sort through the per-kind readers would
-        // reorder the most-used lists — Pods, Deployments, Nodes — and cost a
-        // status derivation per comparison.
-        return hasCuratedColumns(selectedKind.name, selectedKind.group)
-          ? (status.phase || '')
-          : (getGenericResourceStatus(resource)?.text ?? '')
+        // Everything else routes through getCellFilterValue, the same reader
+        // the cell and the filter dropdown use, so all three agree on one
+        // string. Deriving it here instead ordered rows on a status the row
+        // never displayed: a Gateway shows `Programmed` while the generic
+        // ladder, which knows neither Programmed nor Accepted, called it
+        // `Accepted` — so a healthy Gateway and a pending one sorted equal.
+        // getCellFilterValue ends in that same generic derivation, so an
+        // uncurated kind still sorts on the text its badge shows.
+        if (hasCuratedColumns(selectedKind.name, selectedKind.group) && status.phase) {
+          return status.phase
+        }
+        return getCellFilterValue(resource, 'status', kindLower)
+      case 'servers':
+        // Numeric so 10 does not sort before 9.
+        if (kindLower === 'istiogateways') return getIstioGatewayServerCount(resource)
+        return ''
+      case 'selector':
+        if (kindLower === 'istiogateways') return getIstioGatewaySelectorString(resource)
+        return ''
       case 'containers':
         // Pod containers column — sort by readiness ratio
         if (status.containerStatuses) {
@@ -4617,17 +4629,24 @@ export function ResourcesView({
     // the built-in getSortValue for their key.
     if (sortColumn && sortDirection) {
       const extra = extraColumnsByKey.get(sortColumn)
-      result = [...result].sort((a: any, b: any) => {
-        const aVal = extra?.getSortValue ? extra.getSortValue(a) : getSortValue(a, sortColumn, selectedKind.name)
-        const bVal = extra?.getSortValue ? extra.getSortValue(b) : getSortValue(b, sortColumn, selectedKind.name)
+      // Normalized, matching the filter call sites: a group-qualified kind
+      // (istiogateways, cnpgclusters) otherwise arrives here as its bare plural
+      // and misses its own sort readers. Hoisted out of the comparator.
+      const sortKind = normalizeKindToPlural(selectedKind.name, selectedKind.group)
+      const keyOf = extra?.getSortValue ?? ((r: any) => getSortValue(r, sortColumn, sortKind))
+      // Derived once per row, not once per comparison: a sort visits O(n log n)
+      // pairs, and the status key now runs a per-kind status derivation.
+      const decorated = result.map((r: any) => ({ r, k: keyOf(r) }))
+      decorated.sort((a, b) => {
         let comparison = 0
-        if (typeof aVal === 'number' && typeof bVal === 'number') {
-          comparison = aVal - bVal
+        if (typeof a.k === 'number' && typeof b.k === 'number') {
+          comparison = a.k - b.k
         } else {
-          comparison = String(aVal).localeCompare(String(bVal))
+          comparison = String(a.k).localeCompare(String(b.k))
         }
         return sortDirection === 'desc' ? -comparison : comparison
       })
+      result = decorated.map(d => d.r)
     } else {
       // Default sort by kind
       const kindLower = normalizeKindToPlural(selectedKind.name, selectedKind.group)
