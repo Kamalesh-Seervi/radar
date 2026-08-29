@@ -45,6 +45,7 @@ interface Config {
   argoCdUrl?: string
   argoCdInsecureTls?: boolean
   mcp?: boolean | null
+  restoreLastDesktopContext?: boolean | null
 }
 
 interface ConfigResponse {
@@ -102,6 +103,7 @@ function normalizeStartup(c: Config) {
     historyLimit: c.historyLimit ?? null,
     mcp: c.mcp ?? true,
     opencostCurrency: c.opencostCurrency?.trim().toUpperCase() ?? '',
+    restoreLastDesktopContext: c.restoreLastDesktopContext ?? true,
   }
 }
 
@@ -159,7 +161,8 @@ export function SettingsDialog({
   const clusterDirty =
     edN.kubeconfig !== svN.kubeconfig ||
     edN.kubeconfigDirs !== svN.kubeconfigDirs ||
-    edN.namespace !== svN.namespace
+    edN.namespace !== svN.namespace ||
+    edN.restoreLastDesktopContext !== svN.restoreLastDesktopContext
   const serverDirty =
     edN.port !== svN.port || edN.noBrowser !== svN.noBrowser || edN.browser !== svN.browser
   const mcpDirty = edN.mcp !== svN.mcp
@@ -504,6 +507,7 @@ export function SettingsDialog({
                 <ClusterSection
                   config={editedConfig}
                   effectiveConfig={configData?.effective}
+                  isDesktop={isDesktop}
                   onChange={updateConfigField}
                 />
               </div>
@@ -1052,10 +1056,12 @@ function AIUnavailableNotice() {
 function ClusterSection({
   config,
   effectiveConfig,
+  isDesktop,
   onChange,
 }: {
   config: Config
   effectiveConfig?: Config
+  isDesktop: boolean
   onChange: <K extends keyof Config>(field: K, value: Config[K]) => void
 }) {
   const kubeconfigDirs = effectiveConfig ? (effectiveConfig.kubeconfigDirs ?? []) : config.kubeconfigDirs
@@ -1087,6 +1093,14 @@ function ClusterSection({
         placeholder="All namespaces"
         onChange={(v) => onChange('namespace', v || undefined)}
       />
+      {isDesktop && (
+        <ConfigToggle
+          label="Reopen on the last used cluster"
+          description="Come back to the cluster you were working in. Turn off to use your kubeconfig's current context on the next Desktop start."
+          value={config.restoreLastDesktopContext ?? true}
+          onChange={(v) => onChange('restoreLastDesktopContext', v ? undefined : false)}
+        />
+      )}
     </>
   )
 }

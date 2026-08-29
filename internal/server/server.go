@@ -5067,6 +5067,9 @@ func deploymentMode() k8s.DeploymentMode {
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	loaded := settings.Load()
+	// Desktop's own state: on a shared instance this would hand every viewer
+	// the cluster name from whenever this $HOME last ran the Desktop app.
+	loaded.LastDesktopContext = nil
 	if cloudMode() {
 		// Strip user-scoped fields — Cloud's intercept layer fills them from
 		// user_preferences. Audit stays because it's cluster-shared policy.
@@ -5104,6 +5107,8 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The response echoes the merged struct — same reason as handleGetSettings.
+	result.LastDesktopContext = nil
 	if cloudMode() {
 		result.Theme = ""
 		result.PinnedKinds = nil

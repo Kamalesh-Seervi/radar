@@ -16,6 +16,7 @@ import (
 
 	"github.com/skyhook-io/radar/internal/auth"
 	"github.com/skyhook-io/radar/internal/config"
+	"github.com/skyhook-io/radar/internal/errorlog"
 	"github.com/skyhook-io/radar/internal/helm"
 	"github.com/skyhook-io/radar/internal/k8s"
 	mcppkg "github.com/skyhook-io/radar/internal/mcp"
@@ -32,46 +33,49 @@ var clusterConnectionProbe = k8s.TestClusterConnection
 
 // AppConfig holds all parsed configuration for the Radar application.
 type AppConfig struct {
-	Kubeconfig               string
-	KubeconfigDirs           []string
-	Namespace                string
-	Namespaces               []string
-	Port                     int
-	ListenAddress            string
-	ShowRemoteAccessHint     bool
-	BasePath                 string
-	NoBrowser                bool
-	Browser                  string
-	DevMode                  bool
-	HistoryLimit             int
-	DebugEvents              bool
-	FakeInCluster            bool
-	DisableHelmWrite         bool
-	DisableExec              bool
-	DisableLocalTerminal     bool
-	PodShellDefault          string
-	DebugImage               string
-	ReachabilityImage        string
-	ListPageSize             int64
-	NamespaceScope           bool
-	TimelineStorage          string
-	TimelineDBPath           string
-	TimelineRetention        time.Duration
-	TimelineMaxSizeBytes     int64
-	PrometheusURL            string
-	OpenCostCurrency         string
-	OpenCostFlagSet          bool
-	PrometheusHeaders        map[string]string
-	PrometheusHeadersFromEnv map[string]string
-	BeylaJobSelector         string
-	Version                  string
-	MCPEnabled               bool
-	AIHistory                bool   // persist AI investigations across restarts
-	AIHistoryDBPath          string // "" = ~/.radar/ai-runs.db
-	AuthConfig               auth.Config
-	HubAPIURL                string // Hub API origin override ("" = hosted default)
-	HubAppURL                string // Hub frontend origin override ("" = derived)
-	CloudTunnelConfigured    bool   // --cloud-url was set on this process
+	Kubeconfig     string
+	KubeconfigDirs []string
+	// Zero value is the deliberate one: an entrypoint that never sets this
+	// starts on the kubeconfig's current-context. Only cmd/desktop opts in.
+	RestoreLastDesktopContext bool
+	Namespace                 string
+	Namespaces                []string
+	Port                      int
+	ListenAddress             string
+	ShowRemoteAccessHint      bool
+	BasePath                  string
+	NoBrowser                 bool
+	Browser                   string
+	DevMode                   bool
+	HistoryLimit              int
+	DebugEvents               bool
+	FakeInCluster             bool
+	DisableHelmWrite          bool
+	DisableExec               bool
+	DisableLocalTerminal      bool
+	PodShellDefault           string
+	DebugImage                string
+	ReachabilityImage         string
+	ListPageSize              int64
+	NamespaceScope            bool
+	TimelineStorage           string
+	TimelineDBPath            string
+	TimelineRetention         time.Duration
+	TimelineMaxSizeBytes      int64
+	PrometheusURL             string
+	OpenCostCurrency          string
+	OpenCostFlagSet           bool
+	PrometheusHeaders         map[string]string
+	PrometheusHeadersFromEnv  map[string]string
+	BeylaJobSelector          string
+	Version                   string
+	MCPEnabled                bool
+	AIHistory                 bool   // persist AI investigations across restarts
+	AIHistoryDBPath           string // "" = ~/.radar/ai-runs.db
+	AuthConfig                auth.Config
+	HubAPIURL                 string // Hub API origin override ("" = hosted default)
+	HubAppURL                 string // Hub frontend origin override ("" = derived)
+	CloudTunnelConfigured     bool   // --cloud-url was set on this process
 }
 
 // SetGlobals applies debug/test flags to global state.
@@ -108,9 +112,16 @@ func validateNamespaceFanout(namespaces []string, ctxNs string, maxCandidates in
 
 // InitializeK8s creates and configures the Kubernetes client.
 func InitializeK8s(cfg AppConfig) error {
-	err := k8s.Initialize(k8s.InitOptions{
-		KubeconfigPath: cfg.Kubeconfig,
-		KubeconfigDirs: cfg.KubeconfigDirs,
+	preferredContext, err := startupContextPreference(cfg)
+	if err != nil {
+		log.Printf("[context] failed to read the remembered Desktop context: %v", err)
+		errorlog.Record("k8s-init", "warning",
+			"could not read the Desktop cluster memory from local settings. Starting on the kubeconfig's current-context instead; check ~/.radar/settings.json.")
+	}
+	err = k8s.Initialize(k8s.InitOptions{
+		KubeconfigPath:   cfg.Kubeconfig,
+		KubeconfigDirs:   cfg.KubeconfigDirs,
+		PreferredContext: preferredContext,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize K8s client: %w", err)
@@ -221,6 +232,8 @@ func BuildTimelineStoreConfig(cfg AppConfig) timeline.StoreConfig {
 func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 	k8s.RegisterHelmFuncs(helm.ResetClient, helm.ReinitClient)
 
+	RegisterLastContextMemory(cfg)
+
 	k8s.RegisterTimelineFuncs(func() {
 		// Reset the store AND the per-cluster event-pipeline metrics: RecentDrops
 		// name resources from the previous cluster and must not survive the switch.
@@ -264,25 +277,27 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 
 // CreateServer creates the HTTP server with the given configuration.
 func CreateServer(cfg AppConfig) *server.Server {
+	restoreLastDesktopContext := remembersLastContext(cfg)
 	effectiveCfg := &config.Config{
-		Kubeconfig:               cfg.Kubeconfig,
-		KubeconfigDirs:           cfg.KubeconfigDirs,
-		Namespace:                cfg.Namespace,
-		Namespaces:               cfg.Namespaces,
-		Port:                     cfg.Port,
-		NoBrowser:                cfg.NoBrowser,
-		Browser:                  cfg.Browser,
-		TimelineStorage:          cfg.TimelineStorage,
-		TimelineDBPath:           cfg.TimelineDBPath,
-		TimelineMaxSize:          fmt.Sprintf("%d", cfg.TimelineMaxSizeBytes),
-		HistoryLimit:             cfg.HistoryLimit,
-		PrometheusURL:            cfg.PrometheusURL,
-		OpenCostCurrency:         cfg.OpenCostCurrency,
-		PrometheusHeaders:        cfg.PrometheusHeaders,
-		PrometheusHeadersFromEnv: cfg.PrometheusHeadersFromEnv,
-		DebugImage:               cfg.DebugImage,
-		ReachabilityImage:        cfg.ReachabilityImage,
-		MCP:                      &cfg.MCPEnabled,
+		Kubeconfig:                cfg.Kubeconfig,
+		KubeconfigDirs:            cfg.KubeconfigDirs,
+		Namespace:                 cfg.Namespace,
+		Namespaces:                cfg.Namespaces,
+		Port:                      cfg.Port,
+		NoBrowser:                 cfg.NoBrowser,
+		Browser:                   cfg.Browser,
+		TimelineStorage:           cfg.TimelineStorage,
+		TimelineDBPath:            cfg.TimelineDBPath,
+		TimelineMaxSize:           fmt.Sprintf("%d", cfg.TimelineMaxSizeBytes),
+		HistoryLimit:              cfg.HistoryLimit,
+		PrometheusURL:             cfg.PrometheusURL,
+		OpenCostCurrency:          cfg.OpenCostCurrency,
+		PrometheusHeaders:         cfg.PrometheusHeaders,
+		PrometheusHeadersFromEnv:  cfg.PrometheusHeadersFromEnv,
+		DebugImage:                cfg.DebugImage,
+		ReachabilityImage:         cfg.ReachabilityImage,
+		MCP:                       &cfg.MCPEnabled,
+		RestoreLastDesktopContext: &restoreLastDesktopContext,
 	}
 
 	serverCfg := server.Config{
