@@ -24,6 +24,27 @@ listener must be reachable through a published container port or Kubernetes
 Service. Desktop Radar and temporary `radar diagnose` servers remain
 loopback-only.
 
+## Desktop Window Behavior
+
+On macOS, closing the Radar window hides the app rather than quitting it. The
+Dock icon stays; a Dock click, Cmd+Tab, or Radar → Show All brings the window
+back with the session intact. File → Close Window (Cmd+W) hides it the same way
+the close button does. To quit, use Radar → Quit Radar (Cmd+Q).
+
+Radar keeps running while hidden. That is the point — MCP clients stay
+connected across a window close — but it means a hidden Radar still:
+
+- serves its loopback HTTP and MCP endpoints, under your kubeconfig identity;
+- holds watches open against the API server for every cached resource kind;
+- holds the memory backing those caches.
+
+None of that stops until you quit. If you close the window expecting Radar to
+release its cluster access, quit explicitly.
+
+On Linux and Windows, closing the window always quits. Neither gives Radar
+anything to reopen from — no Dock, and Wails v2 ships no tray icon — so hiding
+there would leave a running process with no way to reach it.
+
 ## Persistent Configuration
 
 Radar stores configuration in two files under `~/.radar/`:
