@@ -478,6 +478,157 @@ func TestUnknownOnsetUsesZeroCELSentinel(t *testing.T) {
 	}
 }
 
+func TestFutureProblemOnsetIsUnknown(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	issue := fromProblem(k8s.Detection{
+		Kind:             "PersistentVolumeClaim",
+		Namespace:        "prod",
+		Name:             "data",
+		Severity:         "critical",
+		Reason:           "Missing StorageClass",
+		OnsetAt:          now.Add(time.Minute),
+		IssueTiming:      "started_at_resource_creation",
+		IssueTimingBasis: "spec",
+	}, now, SourceProblem)
+	if !issue.FirstSeen.IsZero() || !issue.OnsetUnknown {
+		t.Fatalf("future-onset normalization = %+v", issue)
+	}
+	if issue.IssueTiming != "" || issue.IssueTimingBasis != "" {
+		t.Fatalf("future-onset timing metadata = %q/%q, want empty", issue.IssueTiming, issue.IssueTimingBasis)
+	}
+}
+
+func TestProblemOnsetRequiresExactEvidence(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	createdAt := time.Unix(1_000, 0)
+	withoutEvidence := fromProblem(k8s.Detection{
+		Kind: "Deployment", Namespace: "prod", Name: "api", Severity: "critical",
+		Reason: "Unavailable", AgeSeconds: 9_000, DurationSeconds: 9_000, ResourceCreatedAt: createdAt,
+		IssueTiming: "started_at_resource_creation", IssueTimingBasis: "condition",
+	}, now, SourceProblem)
+	if !withoutEvidence.FirstSeen.IsZero() || !withoutEvidence.OnsetUnknown || !withoutEvidence.ResourceCreatedAt.Equal(createdAt) || withoutEvidence.IssueTiming != "" || withoutEvidence.IssueTimingBasis != "" {
+		t.Fatalf("age-only detection fabricated onset: %+v", withoutEvidence)
+	}
+
+	for _, tc := range []struct {
+		basis string
+	}{
+		{basis: "owner_condition"},
+		{basis: "pod_creation"},
+		{basis: "spec"},
+	} {
+		issue := fromProblem(k8s.Detection{
+			Kind: "Deployment", Namespace: "prod", Name: "api", Severity: "critical",
+			Reason: "Unavailable", OnsetUnknown: true, ResourceCreatedAt: createdAt,
+			IssueTiming: "started_at_resource_creation", IssueTimingBasis: tc.basis,
+		}, now, SourceProblem)
+		if !issue.FirstSeen.IsZero() || !issue.OnsetUnknown || issue.IssueTiming != "started_at_resource_creation" || issue.IssueTimingBasis != tc.basis {
+			t.Errorf("independent %s timing evidence was lost: %+v", tc.basis, issue)
+		}
+	}
+
+	onsetAt := now.Add(-500 * time.Millisecond)
+	withEvidence := fromProblem(k8s.Detection{
+		Kind: "Deployment", Namespace: "prod", Name: "api", Severity: "critical",
+		Reason: "Unavailable", OnsetAt: onsetAt, ResourceCreatedAt: createdAt,
+	}, now, SourceProblem)
+	if withEvidence.OnsetUnknown || !withEvidence.FirstSeen.Equal(onsetAt) {
+		t.Fatalf("exact sub-second onset was lost: %+v", withEvidence)
+	}
+	activation := issueToActivation(withoutEvidence)
+	if activation["resource_created_at"] != createdAt.Unix() {
+		t.Fatalf("resource_created_at CEL binding = %#v, want %d", activation["resource_created_at"], createdAt.Unix())
+	}
+	mixed := withEvidence
+	mixed.OnsetCoverage = &issuesapi.OnsetCoverage{Known: 2, Unknown: 48}
+	mixedActivation := issueToActivation(mixed)
+	if mixedActivation["onset_unknown"] != false || mixedActivation["onset_coverage_unknown"] != int64(48) {
+		t.Fatalf("onset coverage CEL bindings = %#v", mixedActivation)
+	}
+}
+
+func TestTimingSummaryExplainsIndependentAndPartialProvenance(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		issue Issue
+		want  string
+	}{
+		{
+			name:  "owner condition does not date child reason",
+			issue: Issue{OnsetUnknown: true, IssueTiming: "started_at_resource_creation", IssueTimingBasis: "owner_condition"},
+			want:  "Exact onset of this specific issue is unknown. Its owner workload never became healthy after deployment.",
+		},
+		{
+			name:  "pod creation does not date child reason",
+			issue: Issue{OnsetUnknown: true, IssueTiming: "started_at_resource_creation", IssueTimingBasis: "pod_creation"},
+			want:  "Exact onset of this specific issue is unknown. The affected pod failed during startup of its workload revision.",
+		},
+		{
+			name:  "partial group",
+			issue: Issue{FirstSeen: now, OnsetCoverage: &issuesapi.OnsetCoverage{Known: 2, Unknown: 1}},
+			want:  "Some signals were active at least since 2026-08-29T12:00:00Z; exact onset is unknown for 1 other signal.",
+		},
+		{
+			name: "partial group retains independent evidence",
+			issue: Issue{
+				FirstSeen:        now,
+				OnsetCoverage:    &issuesapi.OnsetCoverage{Known: 2, Unknown: 1},
+				IssueTiming:      "started_at_resource_creation",
+				IssueTimingBasis: "owner_condition",
+			},
+			want: "Some signals were active at least since 2026-08-29T12:00:00Z; exact onset is unknown for 1 other signal. Workload-level evidence shows the owner never became healthy after deployment.",
+		},
+		{
+			name:  "all unknown group retains independent evidence",
+			issue: Issue{OnsetCoverage: &issuesapi.OnsetCoverage{Unknown: 3}, IssueTiming: "started_at_resource_creation", IssueTimingBasis: "owner_condition"},
+			want:  "Exact onset is unknown for all 3 contributing signals. Workload-level evidence shows the owner never became healthy after deployment.",
+		},
+		{
+			name:  "grouped pod evidence does not claim one revision",
+			issue: Issue{OnsetCoverage: &issuesapi.OnsetCoverage{Unknown: 3}, IssueTiming: "started_at_resource_creation", IssueTimingBasis: "pod_creation"},
+			want:  "Exact onset is unknown for all 3 contributing signals. Pod-level evidence shows failures in pods created during workload startup.",
+		},
+		{
+			name:  "exact onset needs no explanation",
+			issue: Issue{FirstSeen: now, IssueTiming: "started_at_resource_creation", IssueTimingBasis: "owner_condition"},
+			want:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := timingSummary(tt.issue); got != tt.want {
+				t.Fatalf("timingSummary() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFinalizeAddsTimingSummaryToPublicIssue(t *testing.T) {
+	out, _ := finalizeShapedIssues([]Issue{{
+		Name:             "missing-secret",
+		OnsetUnknown:     true,
+		IssueTiming:      "started_at_resource_creation",
+		IssueTimingBasis: "owner_condition",
+	}}, Filters{Limit: NoLimit}, false, true)
+	if len(out) != 1 || out[0].TimingSummary != "Exact onset of this specific issue is unknown. Its owner workload never became healthy after deployment." {
+		t.Fatalf("public timing summary = %+v", out)
+	}
+}
+
+func TestPublicIssueTimesNormalizeToUTC(t *testing.T) {
+	local := time.FixedZone("test-offset", 3*60*60)
+	out, _ := finalizeShapedIssues([]Issue{{
+		Name:              "offset",
+		FirstSeen:         time.Date(2026, 8, 10, 1, 30, 0, 0, local),
+		ResourceCreatedAt: time.Date(2026, 8, 10, 1, 0, 0, 0, local),
+		LastSeen:          time.Date(2026, 8, 10, 2, 0, 0, 0, local),
+	}}, Filters{Limit: NoLimit}, false, true)
+	if len(out) != 1 || out[0].FirstSeen.Location() != time.UTC || out[0].ResourceCreatedAt.Location() != time.UTC || out[0].LastSeen.Location() != time.UTC {
+		t.Fatalf("public issue times were not normalized to UTC: %+v", out)
+	}
+}
+
 func TestCompose_NormalizesProblemSeverity(t *testing.T) {
 	p := &fakeProvider{
 		problems: []k8s.Detection{
@@ -935,7 +1086,7 @@ func TestCompose_SuppressedParentDonatesIssueTimingToChildren(t *testing.T) {
 	t.Run("after-healthy donates to non-cycling child", func(t *testing.T) {
 		p := &fakeProvider{
 			problems: []k8s.Detection{
-				{Kind: "Deployment", Namespace: "ns", Name: "web", Group: "apps", Severity: "critical", Reason: "1/3 available", IssueTiming: "started_after_resource_was_healthy", IssueTimingBasis: "condition"},
+				{Kind: "Deployment", Namespace: "ns", Name: "web", Group: "apps", Severity: "critical", Reason: "1/3 available", OnsetAt: time.Now().Add(-time.Hour), IssueTiming: "started_after_resource_was_healthy", IssueTimingBasis: "condition"},
 				{Kind: "Pod", Namespace: "ns", Name: "web-abc", Severity: "critical", Reason: "ImagePullBackOff", OwnerKind: "Deployment", OwnerName: "web"},
 			},
 		}
@@ -954,7 +1105,7 @@ func TestCompose_SuppressedParentDonatesIssueTimingToChildren(t *testing.T) {
 	t.Run("after-healthy blocked for crashloop child", func(t *testing.T) {
 		p := &fakeProvider{
 			problems: []k8s.Detection{
-				{Kind: "Deployment", Namespace: "ns", Name: "web", Group: "apps", Severity: "critical", Reason: "1/3 available", IssueTiming: "started_after_resource_was_healthy", IssueTimingBasis: "condition"},
+				{Kind: "Deployment", Namespace: "ns", Name: "web", Group: "apps", Severity: "critical", Reason: "1/3 available", OnsetAt: time.Now().Add(-time.Hour), IssueTiming: "started_after_resource_was_healthy", IssueTimingBasis: "condition"},
 				{Kind: "Pod", Namespace: "ns", Name: "web-abc", Severity: "critical", Reason: "CrashLoopBackOff", OwnerKind: "Deployment", OwnerName: "web"},
 			},
 		}
@@ -971,7 +1122,7 @@ func TestCompose_SuppressedParentDonatesIssueTimingToChildren(t *testing.T) {
 		// restart-cycling children.
 		p := &fakeProvider{
 			problems: []k8s.Detection{
-				{Kind: "Deployment", Namespace: "ns", Name: "web", Group: "apps", Severity: "critical", Reason: "1/3 available", IssueTiming: "started_at_resource_creation", IssueTimingBasis: "condition"},
+				{Kind: "Deployment", Namespace: "ns", Name: "web", Group: "apps", Severity: "critical", Reason: "1/3 available", OnsetAt: time.Now().Add(-time.Hour), IssueTiming: "started_at_resource_creation", IssueTimingBasis: "condition"},
 				{Kind: "Pod", Namespace: "ns", Name: "web-abc", Severity: "critical", Reason: "CrashLoopBackOff", OwnerKind: "Deployment", OwnerName: "web"},
 			},
 		}
@@ -995,11 +1146,11 @@ func TestCompose_PVCPendingDedupesOverMissingStorageClass(t *testing.T) {
 			{
 				Kind: "PersistentVolumeClaim", Namespace: "ns", Name: "stuck-pvc", Severity: "high", Reason: "Pending",
 				Cause: "Storage provisioner failed to create a volume.", Action: "Check the CSI controller logs.",
-				IssueTiming: "started_at_resource_creation", IssueTimingBasis: "phase",
+				OnsetAt: time.Now().Add(-time.Hour), IssueTiming: "started_at_resource_creation", IssueTimingBasis: "phase",
 			},
 		},
 		missingRefs: []k8s.Detection{
-			{Kind: "PersistentVolumeClaim", Namespace: "ns", Name: "stuck-pvc", Severity: "critical", Reason: "Missing StorageClass", Fingerprint: "Missing StorageClass|abc", IssueTiming: "started_at_resource_creation", IssueTimingBasis: "phase"},
+			{Kind: "PersistentVolumeClaim", Namespace: "ns", Name: "stuck-pvc", Severity: "critical", Reason: "Missing StorageClass", Fingerprint: "Missing StorageClass|abc", OnsetAt: time.Now().Add(-time.Hour), IssueTiming: "started_at_resource_creation", IssueTimingBasis: "phase"},
 		},
 	}
 	out := Compose(p, Filters{})
