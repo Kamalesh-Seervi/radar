@@ -190,6 +190,80 @@ describe('condition vocabulary beyond Accepted', () => {
     expect(getGatewayPolicyStatus(p)).toMatchObject({ text: '2/3 failed', tone: 'unhealthy' })
   })
 
+  // The badge says "2/3 failed"; the tooltip must say which Gateway failed
+  // how, or the operator digs through raw status for the names.
+  it('names each failed ancestor and its reason in the tooltip', () => {
+    const p = policy(
+      { ancestorRef: { kind: 'Gateway', namespace: 'team-a', name: 'gw-a' }, conditions: [cond('Accepted', 'False', 'NotAllowed')] },
+      { ancestorRef: { kind: 'Gateway', name: 'gw-b' }, conditions: [cond('Accepted', 'False', 'ResourceNotFound')] },
+      anc(cond('Accepted', 'True')),
+    )
+    expect(getGatewayPolicyStatus(p)).toMatchObject({
+      text: '2/3 failed',
+      tone: 'unhealthy',
+      reason: 'team-a/gw-a: NotAllowed; gw-b: ResourceNotFound',
+    })
+  })
+
+  // GEP-713 keys ancestor status on ancestorRef + controllerName: the same
+  // Gateway appears once per controller, and a bare ns/name label would
+  // attribute both verdicts to one indistinguishable thing.
+  it('tells colliding labels apart by controller', () => {
+    const p = policy(
+      { ancestorRef: { namespace: 'team-a', name: 'gw' }, controllerName: 'ctrl-a.example', conditions: [cond('Accepted', 'False', 'NotAllowed')] },
+      { ancestorRef: { namespace: 'team-a', name: 'gw' }, controllerName: 'ctrl-b.example', conditions: [cond('Accepted', 'False', 'ResourceNotFound')] },
+    )
+    expect(getGatewayPolicyStatus(p)?.reason)
+      .toBe('team-a/gw (ctrl-a.example): NotAllowed; team-a/gw (ctrl-b.example): ResourceNotFound')
+  })
+
+  // sectionName and a non-Gateway kind are part of the identity and short
+  // enough to always carry.
+  it('carries section and kind in the label', () => {
+    const p = policy(
+      { ancestorRef: { namespace: 'team-a', name: 'gw', sectionName: 'tls' }, conditions: [cond('Accepted', 'False', 'NotAllowed')] },
+      { ancestorRef: { kind: 'Service', namespace: 'team-a', name: 'svc' }, conditions: [cond('Accepted', 'False', 'ResourceNotFound')] },
+    )
+    expect(getGatewayPolicyStatus(p)?.reason)
+      .toBe('team-a/gw:tls: NotAllowed; Service team-a/svc: ResourceNotFound')
+  })
+
+  // The collision that qualifies a controller may be with an ancestor that
+  // SUCCEEDED: two controllers on one Gateway, one failing, must still say
+  // which one failed.
+  it('names the controller when the collision is with a successful ancestor', () => {
+    const p = policy(
+      { ancestorRef: { namespace: 'team-a', name: 'gw' }, controllerName: 'ctrl-a.example', conditions: [cond('Accepted', 'False', 'NotAllowed')] },
+      { ancestorRef: { namespace: 'team-a', name: 'gw' }, controllerName: 'ctrl-b.example', conditions: [cond('Accepted', 'True')] },
+      { ancestorRef: { name: 'gw-b' }, conditions: [cond('Accepted', 'False', 'ResourceNotFound')] },
+    )
+    expect(getGatewayPolicyStatus(p)?.reason)
+      .toBe('team-a/gw (ctrl-a.example): NotAllowed; gw-b: ResourceNotFound')
+  })
+
+  // group and port are part of the composite key too: entries differing only
+  // by them must not render identically.
+  it('carries group and port in the label', () => {
+    const p = policy(
+      { ancestorRef: { group: 'multicluster.x-k8s.io', kind: 'ServiceImport', namespace: 'team-a', name: 'svc' }, conditions: [cond('Accepted', 'False', 'NotAllowed')] },
+      { ancestorRef: { namespace: 'team-a', name: 'gw', port: 443 }, conditions: [cond('Accepted', 'False', 'ResourceNotFound')] },
+    )
+    expect(getGatewayPolicyStatus(p)?.reason)
+      .toBe('ServiceImport.multicluster.x-k8s.io team-a/svc: NotAllowed; team-a/gw:443: ResourceNotFound')
+  })
+
+  // Reasons may be 1024 chars and foreign CRDs need not honor the 16-ancestor
+  // cap, so the list is bounded rather than trusted.
+  it('caps the tooltip detail list', () => {
+    const p = policy(
+      ...[1, 2, 3, 4, 5, 6].map(i => ({
+        ancestorRef: { name: `gw-${i}` },
+        conditions: [cond('Accepted', 'False', `R${i}`)],
+      })),
+    )
+    expect(getGatewayPolicyStatus(p)?.reason).toBe('gw-1: R1; gw-2: R2; gw-3: R3; gw-4: R4; +2 more')
+  })
+
   it('keeps the reason when every failure agrees', () => {
     const p = policy(anc(cond('Accepted', 'False', 'NotAllowed')), anc(cond('Accepted', 'False', 'NotAllowed')))
     expect(getGatewayPolicyStatus(p)).toMatchObject({ text: 'NotAllowed (2/2)', tone: 'unhealthy' })

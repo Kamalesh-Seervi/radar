@@ -201,9 +201,10 @@ func TestSummary_FluxHelmRelease(t *testing.T) {
 
 // Mirrors gateway-policy-status.test.ts. The two implementations feed the UI
 // and the MCP answers respectively, so they have to agree about every case a
-// controller actually produces. The one deliberate difference is the
-// reason-less fallback spelling ("NotAccepted" here, "Not Accepted" there) —
-// see policyProblem.
+// controller actually produces. Two deliberate differences: the reason-less
+// fallback spelling ("NotAccepted" here, "Not Accepted" there — see
+// policyProblem), and where per-ancestor failure detail goes on mixed reasons
+// (the UI has a tooltip; MCP only has the text, so here it rides in-text).
 func TestGatewayPolicyStatus(t *testing.T) {
 	cond := func(t, s, reason string) map[string]any {
 		c := map[string]any{"type": t, "status": s}
@@ -218,6 +219,34 @@ func TestGatewayPolicyStatus(t *testing.T) {
 			out = append(out, c)
 		}
 		return map[string]any{"conditions": out}
+	}
+	named := func(ns, name string, a map[string]any) map[string]any {
+		ref := map[string]any{"name": name}
+		if ns != "" {
+			ref["namespace"] = ns
+		}
+		a["ancestorRef"] = ref
+		return a
+	}
+	withController := func(controller string, a map[string]any) map[string]any {
+		a["controllerName"] = controller
+		return a
+	}
+	withSection := func(section string, a map[string]any) map[string]any {
+		a["ancestorRef"].(map[string]any)["sectionName"] = section
+		return a
+	}
+	withKind := func(kind string, a map[string]any) map[string]any {
+		a["ancestorRef"].(map[string]any)["kind"] = kind
+		return a
+	}
+	withGroup := func(group string, a map[string]any) map[string]any {
+		a["ancestorRef"].(map[string]any)["group"] = group
+		return a
+	}
+	withPort := func(port int64, a map[string]any) map[string]any {
+		a["ancestorRef"].(map[string]any)["port"] = port
+		return a
 	}
 	policy := func(ancestors ...map[string]any) *unstructured.Unstructured {
 		out := make([]any, 0, len(ancestors))
@@ -280,11 +309,55 @@ func TestGatewayPolicyStatus(t *testing.T) {
 		{"ResolvedRefs alone is not a verdict", policy(anc(cond("ResolvedRefs", "True", ""))), "Pending", true},
 		{"partially applied is not success", policy(anc(cond("Accepted", "True", ""), cond("Programmed", "True", "PartiallyProgrammed"))), "PartiallyProgrammed", true},
 		// Reporting the first reason with a count claims they all failed that way.
-		{"mixed failure reasons report a count", policy(
+		{"mixed failure reasons report a count and each ancestor's reason", policy(
 			anc(cond("Accepted", "False", "NotAllowed")),
 			anc(cond("Accepted", "False", "ResourceNotFound")),
 			anc(cond("Accepted", "True", "")),
-		), "2/3 failed", true},
+		), "2/3 failed (NotAllowed; ResourceNotFound)", true},
+		// "2/3 failed" without naming the Gateways sends the reader digging
+		// through raw status for which ancestor failed how.
+		{"mixed failures name the Gateway that failed each way", policy(
+			named("team-a", "gw-a", anc(cond("Accepted", "False", "NotAllowed"))),
+			named("", "gw-b", anc(cond("Accepted", "False", "ResourceNotFound"))),
+			anc(cond("Accepted", "True", "")),
+		), "2/3 failed (team-a/gw-a: NotAllowed; gw-b: ResourceNotFound)", true},
+		// GEP-713 keys ancestor status on ancestorRef + controllerName: the same
+		// Gateway appears once per controller, and a bare ns/name label would
+		// attribute both verdicts to one indistinguishable thing.
+		{"colliding labels are told apart by controller", policy(
+			withController("ctrl-a.example", named("team-a", "gw", anc(cond("Accepted", "False", "NotAllowed")))),
+			withController("ctrl-b.example", named("team-a", "gw", anc(cond("Accepted", "False", "ResourceNotFound")))),
+		), "2/2 failed (team-a/gw (ctrl-a.example): NotAllowed; team-a/gw (ctrl-b.example): ResourceNotFound)", true},
+		// sectionName and a non-Gateway kind are part of the identity and short
+		// enough to always carry.
+		{"section and kind ride in the label", policy(
+			withSection("tls", named("team-a", "gw", anc(cond("Accepted", "False", "NotAllowed")))),
+			withKind("Service", named("team-a", "svc", anc(cond("Accepted", "False", "ResourceNotFound")))),
+		), "2/2 failed (team-a/gw:tls: NotAllowed; Service team-a/svc: ResourceNotFound)", true},
+		// The collision that qualifies a controller may be with an ancestor that
+		// SUCCEEDED: two controllers on one Gateway, one failing, must still say
+		// which one failed.
+		{"a collision with a successful ancestor still names the controller", policy(
+			withController("ctrl-a.example", named("team-a", "gw", anc(cond("Accepted", "False", "NotAllowed")))),
+			withController("ctrl-b.example", named("team-a", "gw", anc(cond("Accepted", "True", "")))),
+			named("", "gw-b", anc(cond("Accepted", "False", "ResourceNotFound"))),
+		), "2/3 failed (team-a/gw (ctrl-a.example): NotAllowed; gw-b: ResourceNotFound)", true},
+		// group and port are part of the composite key too: entries differing
+		// only by them must not render identically.
+		{"group and port ride in the label", policy(
+			withGroup("multicluster.x-k8s.io", withKind("ServiceImport", named("team-a", "svc", anc(cond("Accepted", "False", "NotAllowed"))))),
+			withPort(443, named("team-a", "gw", anc(cond("Accepted", "False", "ResourceNotFound")))),
+		), "2/2 failed (ServiceImport.multicluster.x-k8s.io team-a/svc: NotAllowed; team-a/gw:443: ResourceNotFound)", true},
+		// Reasons may be 1024 chars and foreign CRDs need not honor the
+		// 16-ancestor cap, so the list is bounded rather than trusted.
+		{"the detail list is capped", policy(
+			named("", "gw-1", anc(cond("Accepted", "False", "R1"))),
+			named("", "gw-2", anc(cond("Accepted", "False", "R2"))),
+			named("", "gw-3", anc(cond("Accepted", "False", "R3"))),
+			named("", "gw-4", anc(cond("Accepted", "False", "R4"))),
+			named("", "gw-5", anc(cond("Accepted", "False", "R5"))),
+			named("", "gw-6", anc(cond("Accepted", "False", "R6"))),
+		), "6/6 failed (gw-1: R1; gw-2: R2; gw-3: R3; gw-4: R4; +2 more)", true},
 		{"matching failure reasons keep the reason", policy(
 			anc(cond("Accepted", "False", "NotAllowed")),
 			anc(cond("Accepted", "False", "NotAllowed")),

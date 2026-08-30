@@ -483,6 +483,81 @@ func summarizeGenericCRD(obj *unstructured.Unstructured) *ResourceSummary {
 // Programmed=False — the controller took ownership and then could not apply it
 // — and reading acceptance first calls that healthy. Mirrors
 // getGatewayPolicyStatus in packages/k8s-ui.
+// policyAncestorLabel identifies the ancestor a failure belongs to. GEP-713
+// keys an ancestor's status on the full ancestorRef plus the controllerName —
+// the same Gateway can appear once per controller, section, or kind — so the
+// label carries the short parts outright; the long controllerName is appended
+// by the caller only when two labels would otherwise collide.
+func policyAncestorLabel(ancestor map[string]any) string {
+	ref, _ := ancestor["ancestorRef"].(map[string]any)
+	name, _ := ref["name"].(string)
+	if name == "" {
+		return ""
+	}
+	label := name
+	if ns, _ := ref["namespace"].(string); ns != "" {
+		label = ns + "/" + name
+	}
+	prefix := ""
+	if kind, _ := ref["kind"].(string); kind != "" && kind != "Gateway" {
+		prefix = kind
+	}
+	if group, _ := ref["group"].(string); group != "" && group != "gateway.networking.k8s.io" {
+		if prefix != "" {
+			prefix += "." + group
+		} else {
+			prefix = group
+		}
+	}
+	if prefix != "" {
+		label = prefix + " " + label
+	}
+	if section, _ := ref["sectionName"].(string); section != "" {
+		label += ":" + section
+	}
+	switch port := ref["port"].(type) {
+	case int64:
+		label += fmt.Sprintf(":%d", port)
+	case float64:
+		label += fmt.Sprintf(":%d", int64(port))
+	}
+	return label
+}
+
+type policyFailureDetail struct {
+	label      string
+	controller string
+	problem    string
+}
+
+// Reasons are usually short CamelCase tokens, but the API allows 1024 chars
+// and this reader accepts any CRD with an ancestors array, so the in-text list
+// is capped rather than trusted to stay small.
+const maxPolicyFailureDetails = 4
+
+// Collisions are counted across every ancestor, not just the failed ones: a
+// failure and a success for the same Gateway under different controllers must
+// still say which controller failed.
+func renderPolicyFailureDetails(failures []policyFailureDetail, labelCounts map[string]int) string {
+	entries := make([]string, 0, len(failures))
+	for _, f := range failures {
+		label := f.label
+		if label != "" && labelCounts[f.label] > 1 && f.controller != "" {
+			label += " (" + f.controller + ")"
+		}
+		if label != "" {
+			entries = append(entries, label+": "+f.problem)
+		} else {
+			entries = append(entries, f.problem)
+		}
+	}
+	if len(entries) > maxPolicyFailureDetails {
+		hidden := len(entries) - maxPolicyFailureDetails
+		return strings.Join(entries[:maxPolicyFailureDetails], "; ") + fmt.Sprintf("; +%d more", hidden)
+	}
+	return strings.Join(entries, "; ")
+}
+
 func gatewayPolicyStatus(obj *unstructured.Unstructured) (string, bool) {
 	// NoCopy rather than NestedSlice: this is a read-only summary on a request
 	// path, and NestedSlice deep-copies every ancestor — and panics outright on
@@ -509,12 +584,19 @@ func gatewayPolicyStatus(obj *unstructured.Unstructured) (string, bool) {
 	// Ancestors can fail for different reasons; reporting the first with a count
 	// would claim they all failed that way.
 	failureReasons := map[string]struct{}{}
+	// Which Gateway failed with what. MCP has no tooltip channel, so on mixed
+	// reasons this rides in the text itself.
+	var failureDetails []policyFailureDetail
+	ancestorLabelCounts := map[string]int{}
 	verdict := ""
 
 	for _, a := range ancestors {
 		aMap, ok := a.(map[string]any)
 		if !ok {
 			continue
+		}
+		if label := policyAncestorLabel(aMap); label != "" {
+			ancestorLabelCounts[label]++
 		}
 		rawConds, _, _ := unstructured.NestedFieldNoCopy(aMap, "conditions")
 		conds, _ := rawConds.([]any)
@@ -568,6 +650,12 @@ func gatewayPolicyStatus(obj *unstructured.Unstructured) (string, bool) {
 				failure = broke
 			}
 			failureReasons[broke] = struct{}{}
+			controller, _ := aMap["controllerName"].(string)
+			failureDetails = append(failureDetails, policyFailureDetail{
+				label:      policyAncestorLabel(aMap),
+				controller: controller,
+				problem:    broke,
+			})
 		case warned != "":
 			degraded++
 			if warning == "" {
@@ -589,7 +677,7 @@ func gatewayPolicyStatus(obj *unstructured.Unstructured) (string, bool) {
 	switch {
 	case failed > 0:
 		if len(failureReasons) > 1 {
-			return fmt.Sprintf("%d/%d failed", failed, total), true
+			return fmt.Sprintf("%d/%d failed (%s)", failed, total, renderPolicyFailureDetails(failureDetails, ancestorLabelCounts)), true
 		}
 		return failure + scope(failed), true
 	case degraded > 0:
