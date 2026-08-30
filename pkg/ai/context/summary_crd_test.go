@@ -198,3 +198,159 @@ func TestSummary_FluxHelmRelease(t *testing.T) {
 		t.Errorf("Image (chart) = %q, want redis", s.Image)
 	}
 }
+
+// Mirrors gateway-policy-status.test.ts. The two implementations feed the UI
+// and the MCP answers respectively, so they have to agree about every case a
+// controller actually produces. The one deliberate difference is the
+// reason-less fallback spelling ("NotAccepted" here, "Not Accepted" there) —
+// see policyProblem.
+func TestGatewayPolicyStatus(t *testing.T) {
+	cond := func(t, s, reason string) map[string]any {
+		c := map[string]any{"type": t, "status": s}
+		if reason != "" {
+			c["reason"] = reason
+		}
+		return c
+	}
+	anc := func(conds ...map[string]any) map[string]any {
+		out := make([]any, 0, len(conds))
+		for _, c := range conds {
+			out = append(out, c)
+		}
+		return map[string]any{"conditions": out}
+	}
+	policy := func(ancestors ...map[string]any) *unstructured.Unstructured {
+		out := make([]any, 0, len(ancestors))
+		for _, a := range ancestors {
+			out = append(out, a)
+		}
+		return &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{"ancestors": out},
+		}}
+	}
+
+	tests := []struct {
+		name string
+		obj  *unstructured.Unstructured
+		want string
+		ok   bool
+	}{
+		// A live EnvoyPatchPolicy: taken up by the controller, then not applied.
+		// Reading acceptance first would call this healthy.
+		{"accepted then not applied", policy(anc(cond("Accepted", "True", "Accepted"), cond("Programmed", "False", "ResourceNotFound"))), "ResourceNotFound", true},
+		{"plain accepted", policy(anc(cond("Accepted", "True", "Accepted"))), "Accepted", true},
+		{"rejected carries the reason", policy(anc(cond("Accepted", "False", "Conflicted"))), "Conflicted", true},
+		{"rejected without a reason", policy(anc(cond("Accepted", "False", ""))), "NotAccepted", true},
+		{"warning is not hidden by acceptance", policy(anc(cond("Accepted", "True", ""), cond("Warning", "True", "ShadowedRules"))), "ShadowedRules", true},
+		{"failure anywhere wins and is counted", policy(
+			anc(cond("Accepted", "True", "")),
+			anc(cond("Accepted", "False", "NotAllowed")),
+			anc(cond("Accepted", "True", "")),
+		), "NotAllowed (1/3)", true},
+		{"no count for a single ancestor", policy(anc(cond("Accepted", "False", "NotAllowed"))), "NotAllowed", true},
+		{"an ancestor with no verdict is not accepted", policy(anc(cond("Accepted", "True", "")), anc()), "Pending (1/2)", true},
+		{"unknown is undecided, not failed", policy(anc(cond("Accepted", "Unknown", "Pending"))), "Pending", true},
+		{"healthy only when every ancestor accepted", policy(anc(cond("Accepted", "True", "")), anc(cond("Accepted", "True", ""))), "Accepted", true},
+		// One slot for both kinds of problem reported the warning's reason with
+		// the failure's count, reading as though the warning was the failure.
+		{"failure wins over an earlier warning", policy(
+			anc(cond("Accepted", "True", ""), cond("Warning", "True", "ShadowedRules")),
+			anc(cond("Accepted", "False", "NotAllowed")),
+		), "NotAllowed (1/2)", true},
+		{"warning still reported when nothing failed", policy(
+			anc(cond("Accepted", "True", ""), cond("Warning", "True", "ShadowedRules")),
+			anc(cond("Accepted", "True", "")),
+		), "ShadowedRules (1/2)", true},
+		// Accepted=False reads as NotAccepted; Warning=True means there IS a
+		// warning, so the same construction would invert it.
+		{"reason-less warning keeps its own name", policy(anc(cond("Accepted", "True", ""), cond("Warning", "True", ""))), "Warning", true},
+		// Not a verdict: a dual-shape policy falls back to its top-level
+		// conditions, and one with nothing else renders as absent.
+		{"attaches to nothing", policy(), "", false},
+		// GKE reports attachment with its own condition; BackendTLSPolicy
+		// requires ResolvedRefs as well as Accepted.
+		{"Attached=False is a failure", policy(anc(cond("Accepted", "True", ""), cond("Attached", "False", "InvalidTarget"))), "InvalidTarget", true},
+		{"ResolvedRefs=False is a failure", policy(anc(cond("Accepted", "True", ""), cond("ResolvedRefs", "False", "InvalidCACertificateRef"))), "InvalidCACertificateRef", true},
+		// GEP-713 lists Reconciling as a legitimate in-flight state.
+		{"Reconciling is in-flight, not failed", policy(anc(cond("Accepted", "True", ""), cond("Programmed", "False", "Reconciling"))), "Reconciling", true},
+		// GKE's healthy shape carries no Accepted condition at all.
+		{"a verdict not spelled Accepted still counts", policy(anc(cond("Attached", "True", ""))), "Attached", true},
+		{"Programmed alone is a verdict", policy(anc(cond("Programmed", "True", ""))), "Programmed", true},
+		// Refs resolving is a precondition, not a verdict.
+		{"ResolvedRefs alone is not a verdict", policy(anc(cond("ResolvedRefs", "True", ""))), "Pending", true},
+		{"partially applied is not success", policy(anc(cond("Accepted", "True", ""), cond("Programmed", "True", "PartiallyProgrammed"))), "PartiallyProgrammed", true},
+		// Reporting the first reason with a count claims they all failed that way.
+		{"mixed failure reasons report a count", policy(
+			anc(cond("Accepted", "False", "NotAllowed")),
+			anc(cond("Accepted", "False", "ResourceNotFound")),
+			anc(cond("Accepted", "True", "")),
+		), "2/3 failed", true},
+		{"matching failure reasons keep the reason", policy(
+			anc(cond("Accepted", "False", "NotAllowed")),
+			anc(cond("Accepted", "False", "NotAllowed")),
+		), "NotAllowed (2/2)", true},
+		{"not a policy", &unstructured.Unstructured{Object: map[string]any{"status": map[string]any{"conditions": []any{}}}}, "", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := gatewayPolicyStatus(tc.obj)
+			if ok != tc.ok {
+				t.Fatalf("recognized = %v, want %v", ok, tc.ok)
+			}
+			if got != tc.want {
+				t.Errorf("status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGatewayPolicyStatusToleratesMalformedInput(t *testing.T) {
+	// Entries that are the wrong shape but still valid unstructured content are
+	// skipped, not fatal: one usable ancestor still yields a verdict.
+	mixed := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"ancestors": []any{
+			nil,
+			"nope",
+			map[string]any{"conditions": "not-a-slice"},
+			map[string]any{"conditions": []any{map[string]any{"type": "Accepted", "status": "True"}}},
+		}},
+	}}
+	got, ok := gatewayPolicyStatus(mixed)
+	if !ok {
+		t.Fatal("a list with one usable ancestor is still a PolicyStatus")
+	}
+	// Three of the four ancestors produced no verdict, so this is not healthy.
+	if got != "Pending (3/4)" {
+		t.Errorf("status = %q, want %q", got, "Pending (3/4)")
+	}
+
+	// Content the API server could never return — a bare Go int is not valid
+	// unstructured JSON. NestedSlice panics on this rather than erroring, which
+	// is why the reader takes the field without copying and asserts the shape
+	// itself. The entry is skipped and the remaining ancestors still resolve.
+	odd := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"ancestors": []any{42}},
+	}}
+	var got2 string
+	var ok2 bool
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("reading a PolicyStatus must not panic, got: %v", r)
+			}
+		}()
+		got2, ok2 = gatewayPolicyStatus(odd)
+	}()
+	if !ok2 || got2 != "Pending" {
+		t.Errorf("status = %q ok = %v, want %q true", got2, ok2, "Pending")
+	}
+
+	// A field that is not a list at all is not a PolicyStatus.
+	notAList := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"ancestors": map[string]any{}},
+	}}
+	if _, ok := gatewayPolicyStatus(notAList); ok {
+		t.Error("a non-list ancestors field should fall through, not be reported as a policy")
+	}
+}
