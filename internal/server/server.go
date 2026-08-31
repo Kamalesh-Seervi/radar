@@ -410,6 +410,7 @@ func (s *Server) setupAppRoutes(r chi.Router) {
 	// Middleware (applied to all routes)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(s.protectUnauthenticatedLoopback)
 	// Note: Timeout middleware is applied per-group below to exempt streaming endpoints
 
 	// gzip response compression (content-type aware: JSON yes, SSE/WS no).
@@ -1257,6 +1258,8 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	responseCaps := *caps
+	caps = &responseCaps
 
 	caps.MCPEnabled = s.mcpHandler != nil
 	caps.Deployment = k8s.DeploymentInfo{Mode: deploymentMode()}
@@ -1267,6 +1270,8 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		WorkloadImages: true,
 	}
 	caps.AuthEnabled = s.authConfig.Enabled()
+	status, _ := s.localTerminalUnavailable(r)
+	caps.LocalTerminal = status == 0
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		caps.Username = user.Username
 	}
