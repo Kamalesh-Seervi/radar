@@ -882,24 +882,36 @@ export interface OpenCostNamespaceCost {
 
 export type CostUnavailableReason =
   | "no_prometheus"
+  | "no_cost_source"
   | "no_metrics"
   | "query_error"
   | "access_denied"
-  | "not_found";
+  | "not_found"
+  | "source_unavailable"
+  | "authentication_error"
+  | "configuration_mismatch"
+  | "deployment_configuration_error"
+  | "history_unsupported"
+  | "insufficient_history";
+
+export type CostDataSource = "prometheus" | "kubecost";
 
 export interface OpenCostSummary {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
+  dataThrough?: string;
   currency?: string;
   window?: string;
   totalHourlyCost?: number;
   totalStorageCost?: number;
   totalIdleCost?: number;
   clusterEfficiency?: number;
+  namespaceScope?: string[];
   namespaces?: OpenCostNamespaceCost[];
 }
 
-const noPrometheusFirstSeenAt = new Map<string, number>();
+const costDiscoveryFirstSeenAt = new Map<string, number>();
 
 function costRefetchInterval(
   defaultInterval: number | false = COST_REFRESH_INTERVAL_MS,
@@ -915,15 +927,18 @@ function costRefetchInterval(
   }) => {
     const data = query.state.data;
     const queryID = `${contextName ?? "unknown"}:${query.queryHash ?? JSON.stringify(query.queryKey ?? "opencost")}`;
-    if (data?.available === false && data.reason === "no_prometheus") {
+    if (
+      data?.available === false &&
+      (data.reason === "no_prometheus" || data.reason === "no_cost_source")
+    ) {
       const now = Date.now();
-      const firstSeenAt = noPrometheusFirstSeenAt.get(queryID) ?? now;
-      noPrometheusFirstSeenAt.set(queryID, firstSeenAt);
+      const firstSeenAt = costDiscoveryFirstSeenAt.get(queryID) ?? now;
+      costDiscoveryFirstSeenAt.set(queryID, firstSeenAt);
       return now - firstSeenAt < COST_DISCOVERY_GRACE_MS
         ? COST_DISCOVERY_RETRY_INTERVAL_MS
         : defaultInterval;
     }
-    noPrometheusFirstSeenAt.delete(queryID);
+    costDiscoveryFirstSeenAt.delete(queryID);
     return defaultInterval;
   };
 }
@@ -963,6 +978,9 @@ export interface OpenCostWorkloadCost {
 export interface OpenCostWorkloadResponse {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
+  window?: string;
+  dataThrough?: string;
   currency?: string;
   namespace: string;
   workloads: OpenCostWorkloadCost[];
@@ -991,6 +1009,9 @@ export function useOpenCostWorkloads(
 export interface OpenCostWorkloadDetailResponse {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
+  window?: string;
+  dataThrough?: string;
   currency?: string;
   namespace: string;
   kind: string;
@@ -1036,8 +1057,12 @@ export interface OpenCostTrendSeries {
 export interface OpenCostTrendResponse {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
   currency?: string;
   range: string;
+  windowStart?: number;
+  windowEnd?: number;
+  dataThrough?: string;
   series?: OpenCostTrendSeries[];
 }
 
@@ -1058,6 +1083,7 @@ export function useOpenCostTrend(range_: CostTimeRange = "24h") {
 export interface OpenCostWorkloadTrendResponse {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
   currency?: string;
   namespace: string;
   kind: string;
@@ -1131,6 +1157,9 @@ export interface OpenCostApplicationWorkloadCost extends OpenCostApplicationWork
 export interface OpenCostApplicationCostResponse {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
+  window?: string;
+  dataThrough?: string;
   currency?: string;
   partial?: boolean;
   totals: OpenCostApplicationCostTotals;
@@ -1146,6 +1175,7 @@ export interface OpenCostApplicationCostTrendSeries extends OpenCostApplicationW
 export interface OpenCostApplicationCostTrendResponse {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
   currency?: string;
   range: string;
   partial?: boolean;
@@ -1238,6 +1268,8 @@ export interface OpenCostNodeCost {
 export interface OpenCostNodeResponse {
   available: boolean;
   reason?: CostUnavailableReason;
+  source?: CostDataSource;
+  dataThrough?: string;
   currency?: string;
   nodes?: OpenCostNodeCost[];
 }

@@ -31,6 +31,7 @@ type Owner = string
 const (
 	OwnerPrometheus Owner = "prometheus"
 	OwnerTraffic    Owner = "traffic"
+	OwnerCost       Owner = "cost"
 )
 
 // metricsForward is one owner's active port-forward state.
@@ -242,6 +243,20 @@ func Stop(owner Owner) {
 	if f := reg.forwards[owner]; f != nil {
 		stopForwardLocked(f)
 	}
+}
+
+// StopIfAddress stops the owner's forward only when it is still the connection
+// identified by address. This keeps cleanup for a stale caller from tearing down
+// a replacement that claimed the same owner in the meantime.
+func StopIfAddress(owner Owner, address string) bool {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	f := reg.forwards[owner]
+	if f == nil || !f.active || f.info().Address != address {
+		return false
+	}
+	stopForwardLocked(f)
+	return true
 }
 
 // stopForwardLocked stops one owner's forward (caller must hold reg.mu).

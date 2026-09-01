@@ -1151,15 +1151,48 @@ PolicyReport findings are policy posture, not live operational failure, so they 
 | Certificate | `networking.internal.knative.dev/v1alpha1` | — | Yes | — |
 | ServerlessService | `networking.internal.knative.dev/v1alpha1` | — | Yes | — |
 
-## OpenCost
+## OpenCost and Kubecost
 
 [OpenCost](https://www.opencost.io/) is a CNCF tool for Kubernetes cost monitoring, exposing cloud provider pricing and workload resource allocation as Prometheus metrics.
 
-Radar discovers if OpenCost metrics are available in the already-discovered Prometheus. If OpenCost is installed and scraping into Prometheus, cost data appears automatically. The integration is passive and read-only.
+Radar supports two read-only cost paths. Auto mode keeps OpenCost-compatible metrics from the
+already-discovered Prometheus when representative cost data is usable; when those metrics are
+absent, it tries the current allocation and asset APIs of a Kubecost 3 Aggregator. Source selection
+can also be pinned to `prometheus` or `kubecost` in Settings → Cost, `config.json`, or Helm. When
+Auto positively finds neither source, Radar reports that state and retries discovery; it does not
+label an absent Prometheus source as active. Settings tests Auto and Kubecost before saving, while an
+explicit Prometheus selection remains a saveable preference for installations being configured in
+stages.
 
-OpenCost's Prometheus metrics contain numeric values but no currency metadata. When Radar auto-discovers Prometheus in the connected cluster, it looks for `currencyCode` in the pricing ConfigMap referenced by an active OpenCost or Kubecost workload, or a literal `DISPLAY_CURRENCY` on an active Kubecost Deployment or StatefulSet. `DISPLAY_CURRENCY` takes precedence over ConfigMap evidence; conflicting or indirect values are treated as ambiguous. If the evidence is unavailable or ambiguous, Radar uses USD. Radar skips cluster inference for a manually configured Prometheus URL because it may serve another cluster. Override the label in Settings → Cost or `opencostCurrency` (CLI: `--opencost-currency`; Helm: `cost.currency`). CLI and Helm overrides remain authoritative while Radar runs and after restart. Radar labels the values but does not convert them.
+For Kubecost, Radar auto-discovers only an active Aggregator StatefulSet and its matching Service
+with the official named `tcp-api` port 9004. In-cluster Radar connects through Service DNS; local
+Radar uses a scoped port-forward. An explicit URL is required for federated agent-only clusters,
+which have a FinOps Agent but no local Aggregator, and for alternate endpoints such as a deployment's
+intentionally unauthenticated port 9008. Radar accepts either a root API URL or one ending in
+`/model`, can send an optional service-account key as `X-API-KEY`, and requires an exact cluster ID
+to filter a central Aggregator. It detects one literal `CLUSTER_ID` from an active FinOps Agent or
+Aggregator; indirect, missing, or conflicting values require an override. Radar binds a cluster-ID
+override saved in Settings to the active kubeconfig context. It also binds a saved API key when the
+URL is blank and Radar auto-discovers a local Aggregator. Both fail closed after a context switch
+until the cluster-specific value is cleared or updated; an explicit central Aggregator URL and its
+key may still be shared.
 
-Kubecost Enterprise 3.x agent-only federated clusters do not have the Aggregator workload or its Prometheus cost metrics in the connected cluster. Those clusters need an explicit currency override, and their cost data is outside this Prometheus-backed integration.
+OpenCost-compatible Prometheus data powers current cost and historical charts. Kubecost REST powers
+the current namespace summary, workload/application compute allocation, node costs, and the cluster
+namespace trend from the allocation history retained by its Aggregator. Workload and application
+history remain unavailable for Kubecost. Radar never mixes current data from one source with history
+from another.
+
+Cost values contain no reliable per-response currency metadata. When the selected source is tied to
+the connected cluster, Radar looks for `currencyCode` in the pricing ConfigMap referenced by an
+active OpenCost/Kubecost workload, or literal `DISPLAY_CURRENCY` on an active Kubecost Deployment or
+StatefulSet. `DISPLAY_CURRENCY` takes precedence; conflicting or indirect values are treated as
+ambiguous. A manually configured Prometheus URL skips cluster inference because it may serve another
+cluster, while a selected Kubecost source still uses its connected-cluster workload evidence. If
+evidence is unavailable, Radar uses USD. Override the label in Settings → Cost or
+`opencostCurrency` (CLI: `--opencost-currency`; Helm: `cost.currency`). Radar labels values but does
+not convert them. The Settings currency preference saves independently of the live source action,
+so changing its label never requires the source probe to succeed.
 
 ### What Radar Shows
 
@@ -1170,16 +1203,23 @@ Kubecost Enterprise 3.x agent-only federated clusters do not have the Aggregator
 **Cost Insights View (`/cost`):**
 - Header: cluster hourly/monthly cost, efficiency %, idle cost projection
 - Resource cost split bar: CPU / Memory / Storage percentage breakdown
-- Cost trend chart with 6h/24h/7d range selector and per-namespace hover tooltips
+- Cost trend chart with 6h/24h/7d range selector and per-namespace hover tooltips for OpenCost or retained Kubecost allocation history
 - Namespace breakdown table (sortable by cost, efficiency, CPU/memory split) — click any row to expand per-workload costs on demand
 - Node costs table: instance type, region, and hourly/monthly pricing per machine
 - Efficiency color coding: green (50%+), amber (25–50%), red (below 25%)
 
 ### Prerequisites
 
-1. OpenCost (or Kubecost) deployed in your cluster, with its metrics being scraped by Prometheus
+One of:
 
-OpenCost cost data is not CRD-based — no custom resources are required. Cost views appear automatically when metrics are detected; they are hidden when no OpenCost metrics are found in Prometheus.
+1. OpenCost-compatible cost metrics scraped into Prometheus; or
+2. A Kubecost 3 Aggregator in the connected cluster; or
+3. An explicit central Kubecost Aggregator URL and cluster ID for a federated agent-only cluster.
+
+Cost data is not CRD-based — no custom resources are required. Cost views appear when either path
+returns usable current allocation data. Configure declarative Kubecost access with
+`cost.source`, `cost.kubecost.url`, `cost.kubecost.clusterId`, and an optional Secret in the Helm
+chart.
 
 ---
 
