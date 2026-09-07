@@ -3,19 +3,25 @@
 //  - expanded: a master-detail workspace that fills ONLY the content area (does
 //    not cover the left nav rail or top bar) — recent list on the left, the
 //    selected investigation/report on the right.
-import { useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   Sparkles,
   X,
   Maximize2,
   Minimize2,
-  ChevronLeft,
   Settings2,
   MoreVertical,
   TerminalSquare,
   Copy,
   Check,
   Plus,
+  PanelLeftOpen,
   Link,
   Lock,
   Users,
@@ -23,6 +29,8 @@ import {
 import { Tooltip } from "../ui/Tooltip";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Badge } from "@skyhook-io/k8s-ui/components/ui/Badge";
+import { useAnimatedUnmount } from "../../hooks/useAnimatedUnmount";
+import { TRANSITION_BACKDROP, TRANSITION_DRAWER } from "../../utils/animation";
 import {
   useDiagnose,
   useDiagnoseLayout,
@@ -32,7 +40,7 @@ import {
 } from "./DiagnoseContext";
 import { useDiagnoseCustomization } from "../../context/DiagnoseCustomization";
 import { InvestigationView } from "./InvestigationView";
-import { RecentList } from "./Home";
+import { RecentList, absoluteTime, statusWord } from "./Home";
 import { AgentSetupNotice } from "./AgentSetupNotice";
 import { ConsentCard } from "./parts";
 import { buildLaunchCommand, launchAgentLabel, openInTerminal } from "./launch";
@@ -43,6 +51,9 @@ import {
 } from "../../api/diagnose";
 import { routePath } from "../../api/config";
 import { useCapabilitiesContext } from "../../contexts/CapabilitiesContext";
+import { useContexts } from "../../api/client";
+import { formatInvestigationTarget } from "./target";
+import type { DiagnosisResourceRef } from "./diagnoseEvidenceTypes";
 
 function capWord(s: string): string {
   return s ? s[0].toUpperCase() + s.slice(1) : s;
@@ -78,15 +89,35 @@ function buildConfigLine(cfg: {
 function InvestigationMenu({ run }: { run: RunSummary }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
   const { localTerminal } = useCapabilitiesContext();
   const label = launchAgentLabel(run);
   const command = buildLaunchCommand(
     run,
     `${window.location.origin}${routePath("/mcp")}`,
   );
+
+  // The diagnose root is a CSS container, so a position:fixed click-away layer
+  // inside it is panel-bound rather than viewport-bound. Dismiss from the
+  // document instead; the anchored menu itself can stay next to its trigger.
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
   // No resumable session yet (or stale run) → nothing to hand off.
   if (!command) return null;
-
   const toggle = () => {
     setCopied(false);
     setOpen((v) => !v);
@@ -101,7 +132,7 @@ function InvestigationMenu({ run }: { run: RunSummary }) {
   };
 
   return (
-    <div className="relative flex items-center">
+    <div ref={menuRef} className="relative flex items-center">
       <Tooltip content="More" position="bottom">
         <button
           onClick={toggle}
@@ -114,42 +145,39 @@ function InvestigationMenu({ run }: { run: RunSummary }) {
         </button>
       </Tooltip>
       {open && (
-        <>
-          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-full z-20 mt-1 w-64 rounded-lg border border-theme-border bg-theme-surface py-1 shadow-theme-lg">
-            <button
-              onClick={copy}
-              className="flex w-full items-start gap-2 px-3 py-1.5 text-left text-sm text-theme-text-primary hover:bg-theme-hover"
-            >
-              {copied ? (
-                <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
-              ) : (
-                <Copy className="mt-0.5 h-4 w-4 shrink-0 text-theme-text-tertiary" />
-              )}
-              <span>
-                {copied ? "Copied ✓" : `Copy command to continue in ${label}`}
-                {!copied && (
-                  <span className="block text-[11px] text-theme-text-tertiary">
-                    Paste it wherever you run {label} — resumes this exact
-                    session.
-                  </span>
-                )}
-              </span>
-            </button>
-            {localTerminal && (
-              <button
-                onClick={() => {
-                  openInTerminal(command, "Diagnose");
-                  setOpen(false);
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-theme-text-primary hover:bg-theme-hover"
-              >
-                <TerminalSquare className="h-4 w-4 shrink-0 text-theme-text-tertiary" />
-                Run in a Radar terminal
-              </button>
+        <div className="absolute right-0 top-full z-20 mt-1 w-64 rounded-lg border border-theme-border bg-theme-surface py-1 shadow-theme-lg">
+          <button
+            onClick={copy}
+            className="flex w-full items-start gap-2 px-3 py-1.5 text-left text-sm text-theme-text-primary hover:bg-theme-hover"
+          >
+            {copied ? (
+              <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
+            ) : (
+              <Copy className="mt-0.5 h-4 w-4 shrink-0 text-theme-text-tertiary" />
             )}
-          </div>
-        </>
+            <span>
+              {copied ? "Copied ✓" : `Copy command to continue in ${label}`}
+              {!copied && (
+                <span className="block text-[11px] text-theme-text-tertiary">
+                  Paste it wherever you run {label} — resumes this exact
+                  session.
+                </span>
+              )}
+            </span>
+          </button>
+          {localTerminal && (
+            <button
+              onClick={() => {
+                openInTerminal(command, "Radar Investigation");
+                setOpen(false);
+              }}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-theme-text-primary hover:bg-theme-hover"
+            >
+              <TerminalSquare className="h-4 w-4 shrink-0 text-theme-text-tertiary" />
+              Run in a Radar terminal
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
@@ -161,10 +189,17 @@ export function canCopyRunLink(
   return typeof run?.radarUrl === "string" && run.radarUrl.length > 0;
 }
 
-function CopyRunLink({ radarUrl, visibility }: { radarUrl: string; visibility: RunSummary["visibility"] }) {
-  const label = visibility === "private"
-    ? "Copy private link (only you can open it)"
-    : "Copy investigation link";
+function CopyRunLink({
+  radarUrl,
+  visibility,
+}: {
+  radarUrl: string;
+  visibility: RunSummary["visibility"];
+}) {
+  const label =
+    visibility === "private"
+      ? "Copy private link (only you can open it)"
+      : "Copy investigation link";
   const [copyState, setCopyState] = useState<"idle" | "copied" | "error">(
     "idle",
   );
@@ -225,7 +260,10 @@ function VisibilityControl({
         </Badge>
       </Tooltip>
     ) : run.visibility === "private" ? (
-      <Tooltip content="Only you can view this investigation. Other organization members don’t have access." position="bottom">
+      <Tooltip
+        content="Only you can view this investigation. Other organization members don’t have access."
+        position="bottom"
+      >
         <Badge severity="neutral" size="sm" className="shrink-0">
           <Lock className="h-3 w-3" />
           Private
@@ -303,12 +341,11 @@ function VisibilityControl({
 //                 the last focused run. Without this the button dispatches an
 //                 agent — real tokens — from a screen showing an unrelated list.
 //   run           nothing to take a resource from.
-//   running/stopping a human start is handed back the live run, so the click does
-//                 nothing. An automatic run is a different, immutable session,
-//                 so it deliberately keeps the fresh human escape hatch.
-//   stale         the body already offers "Re-run on current cluster" WITH the
-//                 warning that the context changed; a bare + carries none of it,
-//                 and the resource may not exist in the context it'd run against.
+//   running/stopping human starts reuse the live run. Automatic investigations
+//                 are immutable, so they retain a separate fresh human start.
+//   stale         the original session is closed after a cluster switch;
+//                 the resource may not exist in the active context. Do not
+//                 silently start a different-cluster investigation from here.
 //   needsConsent  the consent card owns the surface until it's answered.
 export function canStartNewInvestigation(
   view: DiagnoseView,
@@ -325,8 +362,158 @@ export function canStartNewInvestigation(
   );
 }
 
-export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
+// Home shows a list plus retained detail only when the surface has room.
+// Keep these Tailwind literals aligned with the measured rail threshold.
+// Detail uses one stable history toggle; below this width it opens an overlay.
+export const INVESTIGATION_HISTORY_MIN_WIDTH = 1750;
+export const MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS =
+  "@min-[1750px]/diagnose-surface:hidden";
+export const MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS =
+  "hidden @min-[1750px]/diagnose-surface:flex";
+export const MAXIMIZED_HOME_RUN_HEADER_VISIBILITY_CLASS =
+  "hidden @min-[1750px]/diagnose-surface:block";
+export const MAXIMIZED_RUN_META_VISIBILITY_CLASS =
+  "hidden @min-[1750px]/diagnose-surface:flex";
+// The panel is a bounded absolute frame whose descendants own scrolling. If
+// overflow remains visible here, a tall Activity/Findings tree contributes its
+// full scroll height to the document even though the frame itself is viewport-
+// sized, producing a large blank page tail below Radar. This applies equally to
+// docked and maximized modes; their intended scroll roots are inside the frame.
+export const DIAGNOSE_SURFACE_FRAME_CLASS =
+  "@container/diagnose-surface absolute z-40 flex min-h-0 flex-col overflow-hidden border-l border-theme-border bg-theme-surface shadow-drawer";
+
+export function investigationHeaderPresentation(input: {
+  view: DiagnoseView;
+  maximized: boolean;
+  hasVisibleRunDetail: boolean;
+}): {
+  genericIdentityClass: string | null;
+  detailIdentityClass: string | null;
+  runActionsClass: string | null;
+} {
+  if (input.view !== "home") {
+    return {
+      genericIdentityClass: null,
+      detailIdentityClass: "",
+      runActionsClass: input.hasVisibleRunDetail ? "" : null,
+    };
+  }
+  const hasWideRetainedDetail = input.maximized && input.hasVisibleRunDetail;
+  return {
+    genericIdentityClass: hasWideRetainedDetail
+      ? MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS
+      : "",
+    detailIdentityClass: hasWideRetainedDetail
+      ? MAXIMIZED_HOME_RUN_HEADER_VISIBILITY_CLASS
+      : null,
+    runActionsClass: hasWideRetainedDetail
+      ? MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS
+      : null,
+  };
+}
+
+function DiagnoseHeaderIdentity({
+  className,
+  title,
+  configLine,
+  runMeta,
+  onOpenSettings,
+}: {
+  className: string;
+  title: string;
+  configLine: string;
+  runMeta?: {
+    label: string;
+    labelClass: string;
+    dateTime: string;
+    time: string;
+  };
+  onOpenSettings: (() => void) | null;
+}) {
+  return (
+    <div className={`min-w-0 ${className}`}>
+      <div className="flex min-w-0 items-center gap-2">
+        <div className="min-w-0 flex-1 truncate text-sm font-medium text-theme-text-primary">
+          {title}
+        </div>
+        {runMeta ? (
+          <div
+            className={`${MAXIMIZED_RUN_META_VISIBILITY_CLASS} shrink-0 items-center gap-1 text-[11px] tabular-nums text-theme-text-tertiary`}
+          >
+            <span className={`font-medium ${runMeta.labelClass}`}>
+              {runMeta.label}
+            </span>
+            <span aria-hidden>·</span>
+            <time dateTime={runMeta.dateTime}>{runMeta.time}</time>
+          </div>
+        ) : null}
+      </div>
+      <div className="flex items-center gap-1 text-xs text-theme-text-tertiary">
+        <span className="truncate">{configLine}</span>
+        {onOpenSettings && (
+          <Tooltip content="AI settings" position="bottom">
+            <button
+              onClick={onOpenSettings}
+              className="shrink-0 rounded p-0.5 text-theme-text-tertiary hover:text-theme-text-primary"
+              aria-label="AI settings"
+            >
+              <Settings2 className="h-3 w-3" />
+            </button>
+          </Tooltip>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function openInvestigationEvidenceResource(
+  ref: DiagnosisResourceRef,
+  onOpenResource: (ref: DiagnosisResourceRef) => void,
+  setMaximized: (maximized: boolean) => void,
+  closeDiagnose: () => void,
+  dockedPanelWouldOverlay: boolean,
+) {
+  // A resource destination must be visible after the handoff. On a wide canvas,
+  // restoring the docked panel leaves Radar and the investigation side by side.
+  // At tighter widths that same panel overlays the host content, so close it
+  // before navigating instead of making the click appear to do nothing.
+  if (dockedPanelWouldOverlay) {
+    // Closing already exposes the destination; retain the user's maximized
+    // preference for the next time they open investigations.
+    closeDiagnose();
+  } else {
+    setMaximized(false);
+  }
+  onOpenResource(ref);
+}
+
+export function DiagnoseSurface({
+  topInset = 0,
+  onOpenResource,
+}: {
+  topInset?: number;
+  /** Resolves an evidence subject into the embedding Radar surface. */
+  onOpenResource?: (ref: DiagnosisResourceRef) => void;
+}) {
   const d = useDiagnose();
+  const { data: contexts } = useContexts();
+  const currentContext = contexts?.find((context) => context.isCurrent)?.name;
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
+  const [historyOverlayOpen, setHistoryOverlayOpen] = useState(false);
+  const [surfaceWidth, setSurfaceWidth] = useState(0);
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const historyRef = useRef<HTMLElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => {
+    const element = surfaceRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(() =>
+      setSurfaceWidth(element.clientWidth),
+    );
+    setSurfaceWidth(element.clientWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
   // Injected settings action: undefined = Radar's own Settings dialog;
   // null = hide the gear + links.
   const { consentCopy, onOpenSettings: hostOpenSettings } =
@@ -342,6 +529,41 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
     panelBounds: { min: minW, max: maxW },
     panelWidthKey: widthKey,
   } = useDiagnoseLayout();
+  const wideHistory =
+    maximized && surfaceWidth >= INVESTIGATION_HISTORY_MIN_WIDTH;
+  const historyOverlay =
+    !wideHistory && historyOverlayOpen && d.view !== "home";
+  const { shouldRender: historyOverlayPresent, isOpen: historySlideOpen } =
+    useAnimatedUnmount(historyOverlay);
+  const dismissHistory = useCallback(() => {
+    setHistoryOverlayOpen(false);
+    historyButtonRef.current?.focus({ preventScroll: true });
+  }, []);
+  useEffect(() => {
+    setHistoryOverlayOpen(false);
+  }, [wideHistory, maximized, d.view]);
+  useEffect(() => {
+    if (historyOverlay) {
+      const target =
+        historyRef.current?.querySelector<HTMLElement>(
+          '[aria-current="true"]',
+        ) ?? historyRef.current?.querySelector<HTMLElement>("button");
+      (target ?? historyRef.current)?.focus({ preventScroll: true });
+    }
+  }, [historyOverlay]);
+  const openEvidenceResource = useCallback(
+    (ref: DiagnosisResourceRef) => {
+      if (!onOpenResource) return;
+      openInvestigationEvidenceResource(
+        ref,
+        onOpenResource,
+        setMaximized,
+        d.close,
+        narrow,
+      );
+    },
+    [d.close, narrow, onOpenResource, setMaximized],
+  );
 
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -371,29 +593,42 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
     d.setupState === "needs-install" || d.setupState === "needs-restart";
 
   const activeRun = d.runs.find((r) => r.id === d.activeRunId) ?? null;
-  // Docked Home is a list, not the previously focused run. Scope every header
-  // label/action to what is visibly on screen so Copy/Share cannot act on a run
-  // the user has navigated away from. Expanded mode remains master-detail and
-  // therefore keeps the selected run active beside its history list.
-  const headerRun = !maximized && d.view === "home" ? null : activeRun;
+  // Consent replaces the detail pane even if goHome retained an older run id.
+  // Header identity and actions must describe what is actually visible.
+  const visibleRunDetail = d.needsConsent ? null : activeRun;
   // A focused run shows the agent it actually ran with; Home reflects the current pick.
-  const activeAgentLabel = headerRun?.agent
-    ? agentLabelFor(headerRun.agent)
+  const activeAgentLabel = visibleRunDetail?.agent
+    ? agentLabelFor(visibleRunDetail.agent)
     : d.agentLabel;
-  // Header subtitle: the config a focused run actually used (it records agent /
-  // profile / model / effort), or the current defaults on Home. Codex shows mode
-  // + reasoning effort; model is shown only when overridden. Clicking opens Settings.
-  const configLine = buildConfigLine(
-    headerRun ?? {
-      agent: d.selectedAgent,
-      profile: d.hosted ? undefined : d.profile,
-      model: d.model,
-      effort: d.effort,
-    },
+  const defaultHeaderConfig = {
+    agent: d.selectedAgent,
+    profile: d.hosted ? undefined : d.profile,
+    model: d.model,
+    effort: d.effort,
+  };
+  const genericConfigLine = buildConfigLine(defaultHeaderConfig);
+  const focusedConfigLine = buildConfigLine(
+    visibleRunDetail ?? defaultHeaderConfig,
   );
-  const detailTitle = headerRun
-    ? `${headerRun.kind} ${headerRun.namespace ? `${headerRun.namespace}/` : ""}${headerRun.name}`
+  const focusedTitle = visibleRunDetail
+    ? formatInvestigationTarget(visibleRunDetail)
     : "AI investigations";
+  const headerPresentation = investigationHeaderPresentation({
+    view: d.view,
+    maximized,
+    hasVisibleRunDetail: !!visibleRunDetail,
+  });
+  const focusedRunMeta = visibleRunDetail
+    ? {
+        label: statusWord(visibleRunDetail.status).text,
+        labelClass: statusWord(visibleRunDetail.status).cls,
+        dateTime: visibleRunDetail.updatedAt,
+        time: absoluteTime(
+          new Date(visibleRunDetail.updatedAt).getTime(),
+          Date.now(),
+        ),
+      }
+    : undefined;
 
   // Absolute within the body frame: maximized fills it; docked is a right slot.
   // topInset clears the header (the frame spans the full column incl. the header).
@@ -424,6 +659,7 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
       run={activeRun}
       agentLabel={activeAgentLabel}
       maximized={maximized}
+      onOpenResource={onOpenResource ? openEvidenceResource : undefined}
     />
   ) : d.activeRunId && !d.runsLoaded ? (
     // Deep-linked to a run before the list has ever loaded: show the load
@@ -467,20 +703,51 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
     </div>
   ) : (
     <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-theme-text-tertiary">
-      Select an investigation, or open a resource and click Diagnose.
+      Select an investigation, or open a resource and click Investigate.
     </div>
   );
+  const compactHistory = (
+    <>
+      {setupPending && <AgentSetupNotice setupState={d.setupState} />}
+      {(!setupPending || d.runs.length > 0) && (
+        <RecentList
+          currentContext={currentContext}
+          agentLabel={d.agentLabel}
+          runs={d.runs}
+          onSelect={d.openRun}
+          historyDegraded={d.historyDegraded}
+        />
+      )}
+    </>
+  );
 
-  const showBreadcrumb = !maximized && d.view !== "home";
-  // The maximized workspace always shows the recent-investigations list (there's
-  // room for it in full-wide) — it's the master pane of the master-detail layout.
-  const showHistory = maximized;
+  const showHistory = !setupPending || d.runs.length > 0;
+  const historyVisible =
+    showHistory &&
+    (wideHistory ? !historyCollapsed || d.view === "home" : historyOverlay);
+
+  useLayoutEffect(() => {
+    if (
+      !historyVisible &&
+      historyRef.current?.contains(document.activeElement)
+    ) {
+      historyButtonRef.current?.focus({ preventScroll: true });
+    }
+  }, [historyVisible]);
 
   return (
     <div
+      ref={surfaceRef}
       role="dialog"
       aria-label="AI investigations"
-      className="absolute z-40 flex flex-col border-l border-theme-border bg-theme-surface shadow-drawer"
+      onKeyDownCapture={(event) => {
+        if (historyOverlay && event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          dismissHistory();
+        }
+      }}
+      className={DIAGNOSE_SURFACE_FRAME_CLASS}
       style={{
         ...positionStyle,
         animation: "slide-in-from-right 0.22s cubic-bezier(0.32,0.72,0,1)",
@@ -498,42 +765,63 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
 
       {/* Header */}
       <div className="flex items-center justify-between border-b border-theme-border px-4 py-2.5">
-        <div className="flex min-w-0 items-center gap-2">
-          {!showBreadcrumb && (
-            <Sparkles className="h-4 w-4 shrink-0 text-accent" />
-          )}
-          <div className="min-w-0">
-            {showBreadcrumb && (
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          {d.view !== "home" && showHistory ? (
+            <Tooltip
+              content={
+                historyVisible
+                  ? "Hide investigation history"
+                  : "Show investigation history"
+              }
+              position="bottom"
+              className="pointer-events-none"
+            >
               <button
-                onClick={d.goHome}
-                className="-ml-1 mb-0.5 flex items-center gap-0.5 rounded px-1 text-[11px] text-theme-text-tertiary hover:text-theme-text-primary"
+                ref={historyButtonRef}
+                type="button"
+                aria-label="Investigations"
+                aria-expanded={historyVisible}
+                aria-controls="investigation-history"
+                onClick={() =>
+                  wideHistory
+                    ? setHistoryCollapsed((value) => !value)
+                    : historyOverlay
+                      ? dismissHistory()
+                      : setHistoryOverlayOpen(true)
+                }
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-theme-text-secondary hover:bg-theme-hover focus-visible:ring-2 focus-visible:ring-accent"
               >
-                <ChevronLeft className="h-3 w-3" />
-                Investigations
+                <PanelLeftOpen className="h-4 w-4" />
               </button>
+            </Tooltip>
+          ) : (
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center">
+              <Sparkles className="h-4 w-4 text-accent" />
+            </span>
+          )}
+          <div className="min-w-0 flex-1">
+            {headerPresentation.genericIdentityClass !== null && (
+              <DiagnoseHeaderIdentity
+                className={headerPresentation.genericIdentityClass}
+                title="AI investigations"
+                configLine={genericConfigLine}
+                onOpenSettings={openSettings}
+              />
             )}
-            <div className="truncate text-sm font-medium text-theme-text-primary">
-              {detailTitle}
-            </div>
-            <div className="flex items-center gap-1 text-xs text-theme-text-tertiary">
-              <span className="truncate">{configLine}</span>
-              {openSettings && (
-                <Tooltip content="AI settings" position="bottom">
-                  <button
-                    onClick={openSettings}
-                    className="shrink-0 rounded p-0.5 text-theme-text-tertiary hover:text-theme-text-primary"
-                    aria-label="AI settings"
-                  >
-                    <Settings2 className="h-3 w-3" />
-                  </button>
-                </Tooltip>
-              )}
-            </div>
+            {headerPresentation.detailIdentityClass !== null && (
+              <DiagnoseHeaderIdentity
+                className={headerPresentation.detailIdentityClass}
+                title={focusedTitle}
+                configLine={focusedConfigLine}
+                runMeta={focusedRunMeta}
+                onOpenSettings={openSettings}
+              />
+            )}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
-          {headerRun &&
-            canStartNewInvestigation(d.view, headerRun, d.needsConsent) && (
+          {activeRun &&
+            canStartNewInvestigation(d.view, activeRun, d.needsConsent) && (
               <Tooltip
                 content="Start fresh — ignore earlier findings"
                 position="bottom"
@@ -541,10 +829,11 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
                 <button
                   onClick={() =>
                     d.openInvestigation({
-                      kind: headerRun.kind,
-                      namespace: headerRun.namespace,
-                      name: headerRun.name,
-                      issueId: headerRun.issueId,
+                      kind: activeRun.kind,
+                      group: activeRun.group,
+                      namespace: activeRun.namespace,
+                      name: activeRun.name,
+                      issueId: activeRun.issueId,
                       fresh: true,
                     })
                   }
@@ -555,13 +844,24 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
                 </button>
               </Tooltip>
             )}
-          {headerRun && (
-            <VisibilityControl run={headerRun} onChanged={d.updateRunSummary} />
+          {visibleRunDetail && headerPresentation.runActionsClass !== null && (
+            <div
+              className={`items-center gap-1 ${headerPresentation.runActionsClass || "flex"}`}
+            >
+              <VisibilityControl
+                key={visibleRunDetail.id}
+                run={visibleRunDetail}
+                onChanged={d.updateRunSummary}
+              />
+              {canCopyRunLink(visibleRunDetail) && (
+                <CopyRunLink
+                  radarUrl={visibleRunDetail.radarUrl}
+                  visibility={visibleRunDetail.visibility}
+                />
+              )}
+              <InvestigationMenu run={visibleRunDetail} />
+            </div>
           )}
-          {canCopyRunLink(headerRun) && (
-            <CopyRunLink radarUrl={headerRun.radarUrl} visibility={headerRun.visibility} />
-          )}
-          {headerRun && <InvestigationMenu run={headerRun} />}
           <Tooltip content={maximized ? "Restore" : "Expand"} position="bottom">
             <button
               onClick={() => setMaximized((v) => !v)}
@@ -592,38 +892,61 @@ export function DiagnoseSurface({ topInset = 0 }: { topInset?: number }) {
           (which would discard its transcript and re-run the agent). The aside
           only appears when expanded; keys keep the detail node identity-stable
           as it comes and goes. */}
-      <div className="flex min-h-0 flex-1">
-        {showHistory && (!setupPending || d.runs.length > 0) && (
+      <div className="relative flex min-h-0 flex-1">
+        {!wideHistory && historyOverlayPresent && (
+          <div
+            aria-hidden="true"
+            onClick={dismissHistory}
+            className={`absolute inset-0 z-10 bg-black/20 ${TRANSITION_BACKDROP} motion-reduce:transition-none ${historySlideOpen ? "opacity-100" : "opacity-0"} ${historyOverlay ? "" : "pointer-events-none"}`}
+          />
+        )}
+        {showHistory && (
           <aside
             key="recent"
-            className="w-72 shrink-0 overflow-y-auto border-r border-theme-border px-3 py-3"
+            ref={historyRef}
+            tabIndex={-1}
+            aria-label="Investigation history"
+            aria-hidden={!historyVisible}
+            inert={!historyVisible}
+            id="investigation-history"
+            className={`${historyVisible || (!wideHistory && historyOverlayPresent) ? "block" : "hidden"} ${wideHistory ? "" : `absolute inset-y-0 left-0 z-20 max-w-[calc(100%-2rem)] shadow-drawer ${TRANSITION_DRAWER} motion-reduce:transition-none ${historySlideOpen ? "translate-x-0 opacity-100" : "-translate-x-full opacity-0"}`} w-72 shrink-0 overflow-y-auto border-r border-theme-border bg-theme-surface px-3 py-3 outline-none`}
           >
             <RecentList
+              currentContext={currentContext}
               agentLabel={d.agentLabel}
               runs={d.runs}
               selectedId={d.activeRunId}
-              onSelect={d.openRun}
+              onSelect={(id) => {
+                d.openRun(id);
+                if (historyOverlay) dismissHistory();
+              }}
               historyDegraded={d.historyDegraded}
             />
           </aside>
         )}
-        {!maximized && d.view === "home" ? (
+        {d.view === "home" ? (
+          <>
+            <div
+              key="history"
+              className={`flex-1 overflow-y-auto overflow-x-hidden px-4 py-3 ${maximized ? MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS : ""}`}
+            >
+              {compactHistory}
+            </div>
+            {maximized && (
+              <div
+                key="main"
+                className={`${MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS} min-h-0 min-w-0 flex-1 flex-col`}
+              >
+                {detail}
+              </div>
+            )}
+          </>
+        ) : (
           <div
             key="main"
-            className="flex-1 overflow-y-auto overflow-x-hidden px-4 py-3"
+            inert={historyOverlay}
+            className="flex min-h-0 min-w-0 flex-1 flex-col"
           >
-            {setupPending && <AgentSetupNotice setupState={d.setupState} />}
-            {(!setupPending || d.runs.length > 0) && (
-              <RecentList
-                agentLabel={d.agentLabel}
-                runs={d.runs}
-                onSelect={d.openRun}
-                historyDegraded={d.historyDegraded}
-              />
-            )}
-          </div>
-        ) : (
-          <div key="main" className="flex min-h-0 min-w-0 flex-1 flex-col">
             {detail}
           </div>
         )}
