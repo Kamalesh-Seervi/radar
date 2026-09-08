@@ -27,18 +27,21 @@ interface PolicyReportRendererProps {
 }
 
 const resultColorMap: Record<string, string> = {
-  pass: 'bg-green-500/20 text-green-400',
-  fail: 'bg-red-500/20 text-red-400',
-  warn: 'bg-yellow-500/20 text-yellow-400',
-  error: 'bg-red-500/20 text-red-400',
-  skip: 'bg-blue-500/20 text-blue-400',
+  pass: 'status-green',
+  fail: 'status-red',
+  warn: 'status-amber',
+  error: 'status-red',
+  skip: 'status-blue',
 }
 
+// A severity gradient, not a set of categories: critical/high/medium are the
+// three tiers the theme defines for exactly this (see the alert tier in
+// DESIGN.md). low and info sit below the gradient and take a plain accent.
 const severityColorMap: Record<string, string> = {
-  critical: 'bg-red-500/20 text-red-400',
-  high: 'bg-orange-500/20 text-orange-400',
-  medium: 'bg-yellow-500/20 text-yellow-400',
-  low: 'bg-blue-500/20 text-blue-400',
+  critical: 'status-unhealthy',
+  high: 'status-alert',
+  medium: 'status-degraded',
+  low: 'status-blue',
   info: 'bg-theme-hover text-theme-text-tertiary',
 }
 
@@ -237,10 +240,10 @@ interface KyvernoPolicyRendererProps {
 }
 
 const ruleTypeColorMap: Record<string, string> = {
-  validate: 'bg-blue-500/20 text-blue-400',
-  mutate: 'bg-purple-500/20 text-purple-400',
-  generate: 'bg-green-500/20 text-green-400',
-  verifyImages: 'bg-orange-500/20 text-orange-400',
+  validate: 'status-blue',
+  mutate: 'status-purple',
+  generate: 'status-green',
+  verifyImages: 'status-orange',
 }
 
 export function KyvernoPolicyRenderer({ data, coverage, queued }: KyvernoPolicyRendererProps) {
@@ -273,10 +276,10 @@ export function KyvernoPolicyRenderer({ data, coverage, queued }: KyvernoPolicyR
             <span className={clsx(
               'badge',
               enforcement.blocks
-                ? 'bg-red-500/20 text-red-400'
+                ? 'status-red'
                 : enforcement.discrepancy
-                  ? 'bg-orange-500/20 text-orange-400'
-                  : 'bg-yellow-500/20 text-yellow-400',
+                  ? 'status-alert'
+                  : 'status-amber',
             )}>
               {enforcement.label}
             </span>
@@ -298,22 +301,22 @@ export function KyvernoPolicyRenderer({ data, coverage, queued }: KyvernoPolicyR
         {/* Rule count summary */}
         <div className="mt-3 flex flex-wrap gap-2">
           {ruleCountByType.validate > 0 && (
-            <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-blue-500/20 text-blue-400">
+            <span className="px-2 py-0.5 rounded text-[10px] font-medium status-blue">
               {ruleCountByType.validate} validate
             </span>
           )}
           {ruleCountByType.mutate > 0 && (
-            <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-purple-500/20 text-purple-400">
+            <span className="px-2 py-0.5 rounded text-[10px] font-medium status-purple">
               {ruleCountByType.mutate} mutate
             </span>
           )}
           {ruleCountByType.generate > 0 && (
-            <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-green-500/20 text-green-400">
+            <span className="px-2 py-0.5 rounded text-[10px] font-medium status-green">
               {ruleCountByType.generate} generate
             </span>
           )}
           {ruleCountByType.verifyImages > 0 && (
-            <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-orange-500/20 text-orange-400">
+            <span className="px-2 py-0.5 rounded text-[10px] font-medium status-orange">
               {ruleCountByType.verifyImages} verifyImages
             </span>
           )}
