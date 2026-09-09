@@ -10,6 +10,7 @@ import { Badge, type BadgeSeverity } from '../../ui/Badge'
 import type { RBACSubjectResponse, RBACPolicyRule, ResourceRef, HPADiagnosis, WorkloadPodInfo } from '../../../types'
 import { detectBlastRadius, rulePermissivenessScore } from '../../../utils/rbac-blast-radius'
 import { RBACErrorSection, isRBACUnavailable } from './RBACErrorSection'
+import { NamespaceLimitRangeLink } from './LimitRangeRenderer'
 import { hpaStateLabel, hpaStateLevel } from '../resource-utils-hpa'
 import {
   rbacVerbBadgeClass,
@@ -54,6 +55,9 @@ interface WorkloadRendererProps {
   policyData?: PolicyResourceResponse | null
   policyLoading?: boolean
   policyError?: Error | null
+  /** Names of the LimitRanges in this workload's namespace. Absent while the
+   *  lookup is pending or unreadable, which leaves the link unrendered. */
+  namespaceLimitRangeNames?: string[] | null
 }
 
 // Extract real problems from workload status (excludes normal rollout progress)
@@ -125,7 +129,7 @@ function compactHPASummary(diagnosis: HPADiagnosis): string {
   return diagnosis.summary
 }
 
-export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, isScalePending, scaleBlockedBy, scalerDiagnostics, workloadPods, onRequestRefresh, rbacData, rbacLoading, rbacError, policyData, policyLoading, policyError }: WorkloadRendererProps) {
+export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, isScalePending, scaleBlockedBy, scalerDiagnostics, workloadPods, onRequestRefresh, rbacData, rbacLoading, rbacError, policyData, policyLoading, policyError, namespaceLimitRangeNames }: WorkloadRendererProps) {
   const status = data.status || {}
   const spec = data.spec || {}
   const metadata = data.metadata || {}
@@ -374,6 +378,12 @@ export function WorkloadRenderer({ kind, data, onNavigate, onViewPods, onScale, 
 
       <Section title="Pod Template" defaultExpanded={false}>
         <PodTemplateSection template={spec.template} />
+        <NamespaceLimitRangeLink
+          namespace={metadata.namespace || ''}
+          names={namespaceLimitRangeNames}
+          scope="workload"
+          onNavigate={onNavigate}
+        />
       </Section>
 
       <ConditionsSection conditions={status.conditions} />

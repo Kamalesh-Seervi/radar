@@ -180,6 +180,27 @@ function renderCollidingKind(kind: string, apiVersion: string): string {
   )
 }
 
+describe('LimitRange dispatch', () => {
+  const limitRange = {
+    apiVersion: 'v1',
+    kind: 'LimitRange',
+    metadata: { name: 'team-limits', namespace: 'dev' },
+    spec: { limits: [{ type: 'Container', defaultRequest: { cpu: '100m' }, default: { cpu: '500m' } }] },
+  }
+
+  it('renders the declared rules instead of the generic fallback', () => {
+    const html = renderKind('limitranges', limitRange, 'dev')
+    expect(html).toContain('Defaults &amp; Constraints')
+    expect(html).toContain('100m')
+  })
+
+  // A LimitRange has no status. Reporting one would be an invention, and the
+  // drawer header would disagree with the object.
+  it('reports no health for a kind that has none', () => {
+    expect(getResourceStatus('limitranges', limitRange)).toBeNull()
+  })
+})
+
 describe('getResourceStatus — workload rollout activity', () => {
   const steadyDegraded = {
     metadata: { generation: 4 },

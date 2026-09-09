@@ -231,6 +231,7 @@ import {
   PriorityClassRenderer,
   RuntimeClassRenderer,
   LeaseRenderer,
+  LimitRangeRenderer,
   TraefikIngressRouteRenderer,
   TraefikMiddlewareRenderer,
   TraefikServiceRenderer,
@@ -473,7 +474,7 @@ const KNOWN_KINDS = new Set([
   'virtualservices', 'destinationrules', 'serviceentries',
   'peerauthentications', 'authorizationpolicies',
   'mutatingwebhookconfigurations', 'validatingwebhookconfigurations',
-  'ingressclasses', 'priorityclasses', 'runtimeclasses', 'leases',
+  'ingressclasses', 'priorityclasses', 'runtimeclasses', 'leases', 'limitranges',
   'knativeservices', 'knativeconfigurations', 'knativerevisions', 'knativeroutes',
   'brokers', 'triggers', 'eventtypes', 'pingsources', 'apiserversources', 'containersources', 'sinkbindings',
   'channels', 'inmemorychannels', 'subscriptions', 'sequences', 'parallels',
@@ -920,6 +921,7 @@ export function ResourceRendererDispatch({
         {kind === 'priorityclasses' && <PriorityClassRenderer data={data} />}
         {kind === 'runtimeclasses' && <RuntimeClassRenderer data={data} />}
         {kind === 'leases' && <LeaseRenderer data={data} />}
+        {kind === 'limitranges' && <LimitRangeRenderer data={data} />}
         {/* Knative Serving */}
         {(kind === 'services' && data?.apiVersion?.includes('serving.knative.dev')) && <KnativeServiceRenderer data={data} onNavigate={onNavigate} />}
         {kind === 'knativeservices' && <KnativeServiceRenderer data={data} onNavigate={onNavigate} />}
