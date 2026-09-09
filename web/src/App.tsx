@@ -2481,6 +2481,29 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
             }
             navigateFromIssue(resource)
           }}
+          onOpenTimeline={({ namespace, name }) => {
+            // Scope state and URL move together, as the Timeline's own
+            // namespace prompt does: the URL-write effect would otherwise
+            // restore the previous scope over the destination's `namespaces`
+            // while the URL-read effect applies it, and the two would alternate.
+            const params = new URLSearchParams({ q: name })
+            if (namespace) {
+              params.set('namespaces', namespace)
+              setNamespaces([namespace])
+              setActiveNamespace.mutate({ namespaces: [namespace] })
+            } else {
+              // A cluster-scoped subject changes nothing about scope, so the
+              // destination keeps the current one. That means a namespace
+              // filter can hide the very change that was clicked, because the
+              // Timeline drops events whose namespace is outside it. Widening
+              // instead has to move scope, URL and the server pick together —
+              // three coupled effects with their own ordering rules — so it is
+              // a change to make against that machinery, not here.
+              const globalNamespaces = searchParams.get('namespaces')
+              if (globalNamespaces) params.set('namespaces', globalNamespaces)
+            }
+            navigate({ pathname: '/timeline', search: params.toString() })
+          }}
         />
       )}
 

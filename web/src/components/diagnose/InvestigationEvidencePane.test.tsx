@@ -25,6 +25,7 @@ import type { DiagnosisResourceRef } from "./diagnoseEvidenceTypes";
 import type { Diagnosis } from "../../api/diagnose";
 import { AssessmentSources, ResultCard } from "./parts";
 import { investigationEvidenceCoverageLimited } from "./investigationState";
+import { groupEvidenceCoverage } from "./investigationEvidencePresentation";
 
 const onViewSource = vi.fn();
 const target = {
@@ -2166,5 +2167,669 @@ describe("InvestigationEvidencePane honest result states", () => {
     expect(html).toContain("Previous observations");
     expect(html).toContain("Earlier does not mean resolved.");
     expect(html).toContain("CrashLoopBackOff");
+  });
+});
+
+describe("Track A evidence bodies and deep links", () => {
+  const changeArgs = JSON.stringify({
+    kind: "Deployment",
+    namespace: "shop",
+    name: "api",
+  });
+  const change = {
+    kind: "Deployment",
+    apiVersion: "apps/v1",
+    namespace: "shop",
+    name: "api",
+    changeType: "update",
+    timestamp: "2026-09-02T09:00:00Z",
+  };
+
+  function renderWithNav(
+    projection: InvestigationEvidenceProjection,
+    nav: {
+      onOpenResource?: (ref: DiagnosisResourceRef) => void;
+      onOpenTimeline?: (scope: { namespace?: string; name: string }) => void;
+    },
+  ): string {
+    return renderToStaticMarkup(
+      <InvestigationEvidencePane
+        projection={projection}
+        collecting={false}
+        animateGroupIds={new Set()}
+        onViewSource={onViewSource}
+        onViewActivity={() => {}}
+        onOpenResource={nav.onOpenResource}
+        onOpenTimeline={nav.onOpenTimeline}
+      />,
+    );
+  }
+
+  it("renders each workload-logs stream as its own card from one source", () => {
+    const projection = project(
+      tool(
+        "wl",
+        "get_workload_logs",
+        {
+          workload: "deployments/shop/api",
+          pods: 1,
+          logs: [
+            {
+              pod: "api-68c7b766dc-fmphn",
+              container: "api",
+              logs: {
+                lines: [
+                  "2026-09-07T08:00:21Z MongoServerError: Authentication failed.",
+                ],
+                totalLines: 50,
+                matchedLines: 1,
+                fallback: false,
+              },
+            },
+            {
+              pod: "api-68c7b766dc-fmphn",
+              container: "istio-proxy",
+              logs: {
+                lines: ["2026-09-07T08:00:19Z info Envoy proxy is ready"],
+                totalLines: 12,
+                matchedLines: 0,
+                fallback: true,
+              },
+            },
+          ],
+        },
+        {
+          summary: JSON.stringify({
+            namespace: "shop",
+            name: "api",
+            kind: "deployment",
+          }),
+        },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.main.map((group) => group.latest.title)).toEqual([
+      "Current logs · api-68c7b766dc-fmphn / api",
+    ]);
+    expect(partition.workload.map((group) => group.latest.title)).toEqual([
+      "Current logs · api-68c7b766dc-fmphn / istio-proxy",
+    ]);
+    const html = render(projection, false, undefined, undefined, () => {});
+    expect(html).toContain("MongoServerError: Authentication failed.");
+    expect(html).toContain("Unfiltered log tail");
+    expect(html).toContain(
+      "Open current Pod shop/api-68c7b766dc-fmphn in Radar",
+    );
+    expect(
+      html.match(
+        new RegExp(investigationEvidenceSourceDomId("turn-0-step-wl"), "g"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("renders a firing alert rule with its target instance first and the rule text", () => {
+    const projection = project(
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        resourceContext: { tier: "basic" },
+        logsCurrent: [
+          {
+            pod: "api-68c7b766dc-fmphn",
+            container: "api",
+            logs: {
+              lines: ["ready"],
+              totalLines: 1,
+              matchedLines: 0,
+              fallback: true,
+            },
+          },
+        ],
+      }),
+      tool(
+        "rules",
+        "get_prometheus_rules",
+        {
+          count: 1,
+          rules: [
+            {
+              group: "kubernetes-apps",
+              type: "alerting",
+              name: "KubePodCrashLooping",
+              query:
+                'max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}[5m]) >= 1',
+              state: "firing",
+              health: "ok",
+              labels: { severity: "warning" },
+              annotations: {
+                summary: "Pod is crash looping.",
+                description:
+                  "Pod {{ $labels.namespace }}/{{ $labels.pod }} is in waiting state (reason: CrashLoopBackOff).",
+              },
+              alerts: [
+                {
+                  state: "firing",
+                  activeAt: "2026-09-07T07:58:00Z",
+                  value: "1e+00",
+                  labels: { namespace: "monitoring", pod: "other-abc" },
+                },
+                {
+                  state: "firing",
+                  activeAt: "2026-09-07T07:58:00Z",
+                  value: "1e+00",
+                  labels: {
+                    namespace: "shop",
+                    pod: "api-68c7b766dc-fmphn",
+                    container: "api",
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        { summary: JSON.stringify({ state: "firing" }) },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(
+      partition.main
+        .map((group) => group.latest.title)
+        .filter((title) => title.startsWith("KubePodCrashLooping")),
+    ).toEqual(["KubePodCrashLooping firing"]);
+    const html = render(projection);
+    expect(html).toContain("2 active instances, 1 naming Deployment shop/api");
+    expect(html).toContain("names this resource");
+    expect(html.indexOf("api-68c7b766dc-fmphn")).toBeLessThan(
+      html.indexOf("other-abc"),
+    );
+    expect(html).toContain("Pod is crash looping.");
+    expect(html).toContain("Rule expression");
+    expect(html).toContain("kube_pod_container_status_waiting_reason");
+    expect(html).toContain("a firing rule alone does not establish the cause");
+    expect(html).not.toContain("Open current");
+  });
+
+  it("renders a Helm release with its operation, health issue, and managed resources", () => {
+    const onOpenResource = vi.fn();
+    const projection = project(
+      tool(
+        "helm",
+        "get_helm_release",
+        {
+          name: "shop",
+          namespace: "shop",
+          chart: "shop",
+          chartVersion: "1.4.2",
+          appVersion: "2.0.0",
+          status: "pending-upgrade",
+          revision: 8,
+          updated: "2026-09-07T07:00:00Z",
+          description: "Preparing upgrade",
+          healthIssue: "Deployment shop/api has 0/1 ready replicas",
+          lastOperation: {
+            kind: "pending",
+            status: "stuck_pending",
+            source: "helm_status",
+            confidence: "high",
+            message: "Revision 8 has been pending-upgrade for 42m",
+          },
+          resources: [
+            {
+              kind: "Deployment",
+              apiVersion: "apps/v1",
+              name: "api",
+              namespace: "shop",
+              status: "Running",
+              ready: "0/1",
+              issue: "0/1 ready",
+            },
+            {
+              kind: "Job",
+              apiVersion: "batch/v1",
+              name: "shop-migrate",
+              namespace: "shop",
+              status: "Complete",
+              summary: "1/1 succeeded",
+            },
+          ],
+        },
+        { summary: JSON.stringify({ namespace: "shop", name: "shop" }) },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.main.map((group) => group.latest.title)).toEqual([
+      "Helm release shop/shop",
+    ]);
+    const html = render(
+      projection,
+      false,
+      undefined,
+      undefined,
+      onOpenResource,
+    );
+    expect(html).toContain("pending-upgrade");
+    expect(html).toContain("shop 1.4.2");
+    expect(html).toContain("revision 8");
+    expect(html).toContain("Last operation");
+    expect(html).toContain("stuck pending");
+    expect(html).toContain("Revision 8 has been pending-upgrade for 42m");
+    expect(html).toContain("Deployment shop/api has 0/1 ready replicas");
+    expect(html).toContain("0/1 ready");
+    expect(html).toContain("1/1 succeeded");
+    expect(html).toContain("Open current HelmRelease shop/shop in Radar");
+  });
+
+  it("renders an access check verdict and a subject's bindings", () => {
+    const projection = project(
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+          spec: { template: { spec: { serviceAccountName: "api-sa" } } },
+        },
+        resourceContext: { tier: "basic" },
+      }),
+      tool(
+        "check",
+        "get_subject_permissions",
+        {
+          subject: {
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+          },
+          accessCheck: {
+            verb: "get",
+            resource: "secrets",
+            namespace: "shop",
+            resourceName: "db-credentials",
+            allowed: false,
+            reason: "",
+          },
+        },
+        {
+          summary: JSON.stringify({
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+            verb: "get",
+            resource: "secrets",
+          }),
+        },
+      ),
+      tool(
+        "subject",
+        "get_subject_permissions",
+        {
+          subject: {
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+          },
+          bindings: [
+            {
+              bindingKind: "RoleBinding",
+              bindingNamespace: "shop",
+              bindingName: "api-reader",
+              roleKind: "Role",
+              roleNamespace: "shop",
+              roleName: "reader",
+              rulesCount: 3,
+            },
+            {
+              bindingKind: "ClusterRoleBinding",
+              bindingName: "system:basic-user",
+              roleKind: "ClusterRole",
+              roleName: "system:basic-user",
+              rulesCount: 1,
+              inheritedFromGroup: "system:authenticated",
+            },
+          ],
+          flatRules: [{ verbs: ["get"], resources: ["pods"] }],
+          usedByPods: ["shop/api-68c7b766dc-fmphn"],
+        },
+        {
+          summary: JSON.stringify({
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+          }),
+        },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(
+      partition.main
+        .map((group) => group.latest.title)
+        .filter((title) => title.includes("api-sa")),
+    ).toEqual(["Service Account shop/api-sa cannot get secrets"]);
+    expect(
+      partition.workload
+        .map((group) => group.latest.title)
+        .filter((title) => title.includes("api-sa")),
+    ).toEqual(["Permissions of Service Account shop/api-sa"]);
+    const html = render(projection, false, undefined, undefined, () => {});
+    expect(html).toContain("not allowed");
+    expect(html).toContain("db-credentials");
+    expect(html).toContain("No RBAC rule allows it · namespace shop");
+    expect(html).toContain("api-reader");
+    expect(html).toContain("system:basic-user");
+    expect(html).toContain("via system:authenticated");
+    expect(html).toContain("3 rules");
+    expect(html).toContain("1 effective rules");
+    expect(html).toContain("shop/api-68c7b766dc-fmphn");
+    expect(html).toContain("Open current Service Account shop/api-sa in Radar");
+    expect(html).toContain("not what the workload has exercised");
+  });
+
+  it("offers a Timeline link only for changes cards whose producer named a resource", () => {
+    const onOpenTimeline = vi.fn();
+    const projection = project(
+      tool(
+        "changes",
+        "get_changes",
+        { changes: [change] },
+        { summary: changeArgs },
+      ),
+      tool(
+        "changes-ns",
+        "get_changes",
+        { changes: [change] },
+        { summary: JSON.stringify({ namespace: "shop" }) },
+      ),
+    );
+    const withLink = renderWithNav(projection, { onOpenTimeline });
+    expect(withLink.match(/Open the Timeline for shop\/api/g)).toHaveLength(1);
+    expect(withLink).not.toContain("Open the Timeline for shop<");
+    const withoutLink = renderWithNav(projection, {});
+    expect(withoutLink).not.toContain("Open the Timeline");
+  });
+
+  it("opens the relationship root's resource page from a relationships card", () => {
+    const projection = project(
+      tool(
+        "neighborhood",
+        "get_neighborhood",
+        {
+          root: {
+            kind: "Deployment",
+            group: "apps",
+            namespace: "shop",
+            name: "api",
+          },
+          subgraph: {
+            nodes: [
+              { id: "deployment/shop/api", kind: "Deployment", name: "api" },
+            ],
+            edges: [],
+          },
+          truncated: false,
+        },
+        {
+          summary: JSON.stringify({
+            kind: "Deployment",
+            namespace: "shop",
+            name: "api",
+          }),
+        },
+      ),
+    );
+    const html = render(projection, false, undefined, undefined, () => {});
+    expect(html).toContain("Relationships around Deployment api");
+    expect(html).toContain("Open current Deployment shop/api in Radar");
+  });
+
+  it("leads collapsed event cards with the event, keeping counts secondary", () => {
+    const projection = project(
+      tool(
+        "events",
+        "get_events",
+        {
+          events: [
+            {
+              reason: "BackOff",
+              message: "Back-off restarting failed container",
+              type: "Warning",
+              count: 4,
+              lastTimestamp: "2026-09-02T10:00:00Z",
+            },
+          ],
+        },
+        { summary: changeArgs },
+      ),
+    );
+    const html = render(projection);
+    const title = html.indexOf("Kubernetes events");
+    const lead = html.indexOf("BackOff: Back-off restarting failed container");
+    expect(lead).toBeGreaterThan(title);
+    expect(html).not.toContain("1 event group");
+    expect(html).toMatch(/BackOff<span[^>]*>×4<\/span>/);
+  });
+});
+
+describe("cited broader cards and coverage rows", () => {
+  const helmPayload = {
+    name: "prometheus",
+    namespace: "opencost",
+    chart: "prometheus",
+    chartVersion: "25.8.0",
+    status: "failed",
+    revision: 1,
+    updated: "2026-09-07T07:00:00Z",
+    healthIssue: "6/12 pods Unschedulable",
+    resources: [],
+  };
+  const permissionsPayload = {
+    subject: { kind: "ServiceAccount", namespace: "other", name: "worker" },
+    accessCheck: {
+      verb: "get",
+      resource: "secrets",
+      namespace: "other",
+      allowed: true,
+      reason: 'RBAC: allowed by ClusterRoleBinding "worker"',
+    },
+  };
+  const rulesPayload = {
+    count: 1,
+    rules: [
+      {
+        group: "general",
+        type: "alerting",
+        name: "TargetDown",
+        query: "up == 0",
+        state: "firing",
+        health: "ok",
+        labels: { severity: "warning" },
+        alerts: [
+          {
+            state: "firing",
+            labels: { namespace: "monitoring", job: "node-exporter" },
+          },
+        ],
+      },
+    ],
+  };
+
+  it("admits a cited helm, permissions or alerts card and counts the rest as withheld", () => {
+    const helmRef = evidenceRef("a", "b");
+    const permRef = evidenceRef("a", "c");
+    const rulesRef = evidenceRef("a", "d");
+    const projection = project(
+      tool("helm", "get_helm_release", helmPayload, {
+        summary: JSON.stringify({ namespace: "opencost", name: "prometheus" }),
+        evidenceRef: helmRef,
+      }),
+      tool("perm", "get_subject_permissions", permissionsPayload, {
+        summary: JSON.stringify({
+          kind: "ServiceAccount",
+          namespace: "other",
+          name: "worker",
+        }),
+        evidenceRef: permRef,
+      }),
+      tool("rules", "get_prometheus_rules", rulesPayload, {
+        summary: JSON.stringify({}),
+        evidenceRef: rulesRef,
+      }),
+      tool("cm", "get_resource", {
+        apiVersion: "v1",
+        kind: "ConfigMap",
+        metadata: { namespace: "shop", name: "vars" },
+      }),
+    );
+    const uncited = partitionInvestigationEvidence(projection.groups);
+    expect(uncited.main).toHaveLength(0);
+    expect(uncited.workload).toHaveLength(0);
+    expect(uncited.hiddenBroader).toBe(4);
+    expect(render(projection)).toContain(
+      "4 results about other resources are not shown; they appear here when the assessment cites them.",
+    );
+
+    const resolution = resolveInvestigationRootCauseEvidence(
+      projection,
+      { status: "linked", refs: [helmRef, permRef, rulesRef] },
+      0,
+    );
+    const cited = partitionInvestigationEvidence(projection.groups, resolution);
+    expect(cited.main.map((group) => group.latest.title).sort()).toEqual([
+      "Helm release opencost/prometheus",
+      "Service Account other/worker can get secrets",
+      "TargetDown firing",
+    ]);
+    expect(cited.hiddenBroader).toBe(1);
+    const html = render(projection, false, undefined, resolution);
+    expect(html).toContain("6/12 pods Unschedulable");
+    expect(html).toContain(
+      "1 result about another resource is not shown; it appears here when the assessment cites it.",
+    );
+  });
+
+  it("files a complete, empty events query as a checked receipt, not a coverage gap", () => {
+    const projection = project(
+      tool(
+        "events-empty",
+        "get_events",
+        { events: null },
+        {
+          summary: JSON.stringify({
+            kind: "Pod",
+            namespace: "shop",
+            name: "api-a",
+          }),
+        },
+      ),
+    );
+    expect(projection.limitations).toHaveLength(0);
+    const receipts = projection.groups.filter(
+      (group) => group.latest.data.type === "receipt",
+    );
+    expect(receipts.map((group) => group.latest.title)).toEqual([
+      "No events matched",
+    ]);
+    expect(receipts[0].latest.data).toMatchObject({
+      type: "receipt",
+      checked: "events",
+    });
+    const html = render(projection);
+    expect(html).not.toContain("Evidence coverage is incomplete");
+    expect(html).not.toContain("does not establish that no events occurred");
+  });
+
+  it("renders a single-limitation coverage group once, with its source link", () => {
+    const narrowed = {
+      events: null,
+      narrowHint: "Pass a name to narrow the query.",
+    };
+    const projection = project(
+      tool("events-a", "get_events", narrowed, {
+        summary: JSON.stringify({
+          kind: "Pod",
+          namespace: "shop",
+          name: "api-a",
+        }),
+      }),
+      tool("events-b", "get_events", narrowed, {
+        summary: JSON.stringify({
+          kind: "Pod",
+          namespace: "shop",
+          name: "api-b",
+        }),
+      }),
+      tool("events-c", "get_events", narrowed, {
+        summary: JSON.stringify({
+          kind: "Pod",
+          namespace: "shop",
+          name: "api-c",
+        }),
+      }),
+    );
+    expect(projection.limitations).toHaveLength(1);
+    expect(projection.limitations[0].sources).toHaveLength(3);
+    const html = render(projection);
+    const message =
+      "Kubernetes events was narrowed to keep this investigation bounded. Additional matching evidence may exist.";
+    // Live region, strip summary, the group row's label and its text: never
+    // a second identical detail row beneath it.
+    expect(
+      html.match(
+        new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
+      ),
+    ).toHaveLength(4);
+    expect(html).toContain("View latest in Activity");
+    expect(html).not.toContain('aria-controls=":r');
+
+    const twoRows = project(
+      tool(
+        "changes-err",
+        "get_changes",
+        { changes: [], sourcesErrored: ["timeline: permission denied"] },
+        { summary: JSON.stringify({ namespace: "shop" }) },
+      ),
+      tool(
+        "changes-hint",
+        "get_changes",
+        { changes: [], narrowHint: "narrow with since=" },
+        { summary: JSON.stringify({ namespace: "shop" }) },
+      ),
+    );
+    const grouped = groupEvidenceCoverage(twoRows.limitations);
+    expect(
+      grouped.find((group) => group.label === "Recent changes")?.limitations
+        .length,
+    ).toBeGreaterThan(1);
+    expect(render(twoRows)).toContain('aria-expanded="false"');
+  });
+});
+
+describe("grouped startup cards", () => {
+  it("opens to the pod names when several pods share one blocker", () => {
+    const blocker = (name: string) => ({
+      kind: "Pod",
+      name,
+      reason: "Unschedulable",
+      severity: "critical",
+      message: "1 node(s) no free host ports",
+    });
+    const projection = project(
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        resourceContext: { tier: "basic" },
+        pods: 2,
+        startupBlockers: [blocker("api-abc"), blocker("api-def")],
+      }),
+    );
+    const html = render(projection);
+    expect(html).toContain("2 pods · 1 node(s) no free host ports");
+    expect(html).toContain(">api-abc<");
+    expect(html).toContain(">api-def<");
+    expect(html).toContain('aria-expanded="false"');
   });
 });
