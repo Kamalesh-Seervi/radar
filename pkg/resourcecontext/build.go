@@ -235,9 +235,7 @@ func Build(ctx context.Context, obj runtime.Object, opts Options) *ResourceConte
 			toContextRefs(selected),
 			"selectedBy", omitted)
 
-		rc.ScaledBy = filterRefs(ctx, opts.AccessChecker,
-			toContextRefs(rel.Scalers),
-			"scaledBy", omitted)
+		rc.ScaledBy = buildScaledBy(ctx, rel.Scalers, opts.Provider, opts.AccessChecker, omitted)
 	}
 
 	// 3. Pod-specific: RunsOn (Node) + Uses (ConfigMap/Secret/PVC/SA).
@@ -1202,6 +1200,74 @@ func buildCronJobSummary(ctx context.Context, obj runtime.Object, ac RefAccessCh
 	return out
 }
 
+// buildScaledBy gates the scaler refs first and only then looks up the HPA
+// object, so a scaler the caller cannot read never reaches the diagnosis and
+// nothing about it (state, bounds, metric names) can leak through the summary.
+func buildScaledBy(ctx context.Context, scalers []topology.ResourceRef, provider topology.ResourceProvider, ac RefAccessChecker, omitted *omittedTracker) []ScalerRef {
+	refs := filterRefs(ctx, ac, toContextRefs(scalers), "scaledBy", omitted)
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]ScalerRef, 0, len(refs))
+	var hpas []*autoscalingv2.HorizontalPodAutoscaler
+	hpasLoaded := false
+	for _, ref := range refs {
+		entry := ScalerRef{ContextRef: ref}
+		if isHPARef(ref) && provider != nil {
+			if !hpasLoaded {
+				hpas, _ = provider.HorizontalPodAutoscalers()
+				hpasLoaded = true
+			}
+			if hpa := findHPA(hpas, ref.Namespace, ref.Name); hpa != nil {
+				entry.HPASummary = buildHPASummary(hpa)
+				entry.ManagedBy = kedaScaledObjectRef(ctx, hpa, ac, omitted)
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// Topology refs carry the autoscaling group only when discovery resolved it;
+// without a dynamic provider the group is empty, as it is for core kinds.
+func isHPARef(ref ContextRef) bool {
+	return ref.Kind == "HorizontalPodAutoscaler" && (ref.Group == "" || ref.Group == "autoscaling")
+}
+
+// KEDA owns the HPAs it creates and also labels them with the ScaledObject
+// name; either is enough to attribute the HPA. The pointer is gated like any
+// other ref so a ScaledObject the caller cannot read is not named.
+func kedaScaledObjectRef(ctx context.Context, hpa *autoscalingv2.HorizontalPodAutoscaler, ac RefAccessChecker, omitted *omittedTracker) *ContextRef {
+	name := ""
+	for _, owner := range hpa.OwnerReferences {
+		if owner.Kind == "ScaledObject" && groupFromAPIVersion(owner.APIVersion) == "keda.sh" {
+			name = owner.Name
+			break
+		}
+	}
+	if name == "" {
+		name = hpa.Labels["scaledobject.keda.sh/name"]
+	}
+	if name == "" {
+		return nil
+	}
+	ref := &ContextRef{Kind: "ScaledObject", Group: "keda.sh", Namespace: hpa.Namespace, Name: name}
+	if !checkRef(ctx, ac, ref) {
+		omitted.add("scaledBy.managedBy", OmittedRBACDenied)
+		return nil
+	}
+	return ref
+}
+
+func findHPA(hpas []*autoscalingv2.HorizontalPodAutoscaler, namespace, name string) *autoscalingv2.HorizontalPodAutoscaler {
+	for _, hpa := range hpas {
+		if hpa != nil && hpa.Namespace == namespace && hpa.Name == name {
+			return hpa
+		}
+	}
+	return nil
+}
+
 func buildHPASummary(obj runtime.Object) *HPASummary {
 	hpa, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler)
 	if !ok || hpa == nil {
@@ -1240,9 +1306,11 @@ func buildHPASummary(obj runtime.Object) *HPASummary {
 	}
 	for _, reason := range diagnosis.Reasons {
 		out.Reasons = append(out.Reasons, HPAReasonSummary{
-			ID:      string(reason.ID),
-			Message: reason.Message,
-			Detail:  reason.Detail,
+			ID:              string(reason.ID),
+			Message:         reason.Message,
+			Detail:          reason.Detail,
+			ConditionType:   reason.ConditionType,
+			ConditionReason: reason.ConditionReason,
 		})
 	}
 	return out

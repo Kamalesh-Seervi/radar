@@ -3091,3 +3091,152 @@ describe("InvestigationEvidencePane metrics cards", () => {
     expect(html).toContain("Open current Deployment shop/api in Radar");
   });
 });
+
+describe("InvestigationEvidencePane scaled-by section", () => {
+  const scaledDeployment = (scaledBy: unknown) =>
+    tool("workload", "diagnose", {
+      resource: {
+        apiVersion: "apps/v1",
+        kind: "Deployment",
+        metadata: { namespace: "shop", name: "api" },
+      },
+      resourceContext: {
+        tier: "basic",
+        workloadSummary: { replicas: { desired: 5, ready: 5 } },
+        scaledBy,
+      },
+    });
+
+  it("shows the HPA's own diagnosis on the workload card", () => {
+    const html = render(
+      project(
+        scaledDeployment([
+          {
+            kind: "HorizontalPodAutoscaler",
+            namespace: "shop",
+            name: "api-hpa",
+            hpaSummary: {
+              state: "limited_max",
+              summary: "Wants 8 replicas but is capped at maxReplicas=5",
+              target: { kind: "Deployment", group: "apps", name: "api" },
+              bounds: { min: 1, max: 5, current: 5, desired: 5 },
+              reasons: [
+                {
+                  id: "limited_max",
+                  message: "HPA is capped at maxReplicas=5",
+                  detail:
+                    "the desired replica count is more than the maximum replica count",
+                  conditionType: "ScalingLimited",
+                  conditionReason: "TooManyReplicas",
+                },
+                {
+                  id: "missing_current_metric",
+                  message: "HPA is missing current metric values",
+                  detail: "cpu",
+                },
+              ],
+            },
+          },
+        ]),
+      ),
+    );
+    expect(html).toContain("Scaled by");
+    expect(html).toContain("api-hpa");
+    expect(html).toContain("Maxed");
+    expect(html).toContain("Wants 8 replicas but is capped at maxReplicas=5");
+    expect(html).toContain("5/5 replicas · bounds 1-5");
+    expect(html).not.toContain("HPA is capped at maxReplicas=5");
+    expect(html).toContain(
+      "Kubernetes ScalingLimited · TooManyReplicas: “the desired replica count is more than the maximum replica count”",
+    );
+    expect(html).toContain("HPA is missing current metric values");
+    expect(html).toContain("· cpu");
+  });
+
+  it("names the KEDA ScaledObject that owns the HPA and links it only when listed", () => {
+    const kedaHPA = (listed: boolean) =>
+      scaledDeployment([
+        {
+          kind: "HorizontalPodAutoscaler",
+          namespace: "shop",
+          name: "keda-hpa-api",
+          managedBy: {
+            kind: "ScaledObject",
+            group: "keda.sh",
+            namespace: "shop",
+            name: "api",
+          },
+          hpaSummary: {
+            state: "limited_min",
+            summary: "HPA is holding at minReplicas=2",
+            bounds: { min: 2, max: 10, current: 2, desired: 2 },
+            reasons: [
+              {
+                id: "limited_min",
+                message: "HPA is held at minReplicas=2",
+                detail:
+                  "the desired replica count is less than the minimum replica count",
+                conditionType: "ScalingLimited",
+                conditionReason: "TooFewReplicas",
+              },
+            ],
+          },
+        },
+        ...(listed
+          ? [
+              {
+                kind: "ScaledObject",
+                group: "keda.sh",
+                namespace: "shop",
+                name: "api",
+              },
+            ]
+          : []),
+      ]);
+    const open = () => {};
+    const linked = render(
+      project(kedaHPA(true)),
+      false,
+      undefined,
+      undefined,
+      open,
+    );
+    expect(linked).toContain("managed by KEDA ScaledObject");
+    expect(linked).toContain("HPA is holding at minReplicas=2");
+    expect(linked).not.toContain("HPA is held at minReplicas=2");
+    expect(linked).toContain(
+      "Kubernetes ScalingLimited · TooFewReplicas: “the desired replica count is less than the minimum replica count”",
+    );
+    expect(linked).toMatch(/<button[^>]*>api<\/button>/);
+    const unlisted = render(
+      project(kedaHPA(false)),
+      false,
+      undefined,
+      undefined,
+      open,
+    );
+    expect(unlisted).toContain("managed by KEDA ScaledObject");
+    expect(unlisted).not.toMatch(/<button[^>]*>api<\/button>/);
+  });
+
+  it("stays quiet for scalers Radar did not diagnose", () => {
+    const html = render(
+      project(
+        scaledDeployment([
+          {
+            kind: "ScaledObject",
+            group: "keda.sh",
+            namespace: "shop",
+            name: "api-scaler",
+          },
+          {
+            kind: "HorizontalPodAutoscaler",
+            namespace: "shop",
+            name: "api-hpa",
+          },
+        ]),
+      ),
+    );
+    expect(html).not.toContain("Scaled by");
+  });
+});

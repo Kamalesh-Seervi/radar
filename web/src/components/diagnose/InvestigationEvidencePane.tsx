@@ -41,6 +41,8 @@ import {
   defaultConditionTone,
   displayKind,
   formatRelativeAgeTime,
+  hpaStateLabel,
+  hpaStateLevel,
   mapHealthToTone,
   ResourceLink,
   stripAnsi,
@@ -75,7 +77,11 @@ import {
   type InvestigationEvidenceSource,
   type InvestigationEvidenceTier,
 } from "./investigationEvidence";
-import type { DiagnosisResourceRef } from "./diagnoseEvidenceTypes";
+import type {
+  DiagnosisResourceContext,
+  DiagnosisResourceRef,
+  DiagnosisScalerRef,
+} from "./diagnoseEvidenceTypes";
 import { InvestigationResourceEvidence } from "./InvestigationResourceEvidence";
 import { investigationResourceEvidenceHasDetails } from "./investigationResourceEvidenceModel";
 import type { InvestigationSourceExcerpt } from "./investigationSourceFocus";
@@ -1424,6 +1430,7 @@ function evidenceHasDetails(
         investigationResourceEvidenceHasDetails(data.resource) ||
         replicas?.desired !== undefined ||
         data.resourceContext?.statusSummary?.conditions?.length ||
+        diagnosedScalers(data.resourceContext).length ||
         data.gitOpsDiagnosis ||
         data.warnings.length,
       );
@@ -1559,6 +1566,7 @@ function ResourceBody({ data }: { data: EvidenceDataOf<"resource"> }) {
   const ready = replicas ? (replicas.ready ?? 0) : undefined;
   const shortfall =
     desired !== undefined && ready !== undefined && ready < desired;
+  const scalers = diagnosedScalers(data.resourceContext);
   return (
     <div className="space-y-3">
       <InvestigationResourceEvidence resource={data.resource} />
@@ -1614,6 +1622,12 @@ function ResourceBody({ data }: { data: EvidenceDataOf<"resource"> }) {
           </div>
         </div>
       ) : null}
+      {scalers.length > 0 ? (
+        <ScaledBySection
+          scalers={scalers}
+          allScalers={data.resourceContext?.scaledBy ?? []}
+        />
+      ) : null}
       {data.warnings.length > 0 ? (
         <ul className="space-y-1 text-xs text-theme-text-secondary">
           {data.warnings.map((warning) => (
@@ -1624,6 +1638,130 @@ function ResourceBody({ data }: { data: EvidenceDataOf<"resource"> }) {
           ))}
         </ul>
       ) : null}
+    </div>
+  );
+}
+
+type DiagnosedScaler = DiagnosisScalerRef &
+  Required<Pick<DiagnosisScalerRef, "hpaSummary">>;
+
+function diagnosedScalers(
+  context: DiagnosisResourceContext | undefined,
+): DiagnosedScaler[] {
+  return (context?.scaledBy ?? []).filter(
+    (scaler): scaler is DiagnosedScaler => scaler.hpaSummary !== undefined,
+  );
+}
+
+function ScaledBySection({
+  scalers,
+  allScalers,
+}: {
+  scalers: DiagnosedScaler[];
+  allScalers: DiagnosisScalerRef[];
+}) {
+  const { onOpenResource } = useContext(EvidenceNavigationContext);
+  // The ScaledObject is only a link when Radar listed it as a scaler too; a
+  // name read off the HPA's owner reference alone is not a resource we hold.
+  const listedScaler = (ref: DiagnosisResourceRef) =>
+    allScalers.some(
+      (scaler) =>
+        scaler.kind === ref.kind &&
+        scaler.name === ref.name &&
+        (scaler.namespace ?? "") === (ref.namespace ?? ""),
+    );
+  return (
+    <div>
+      <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-theme-text-tertiary">
+        Scaled by
+      </div>
+      <div className="space-y-2">
+        {scalers.map((scaler) => {
+          const summary = scaler.hpaSummary;
+          const bounds = summary.bounds;
+          // The reason that named the state is the summary in other words;
+          // only the controller's own sentence behind it adds anything.
+          const stateReasons = (summary.reasons ?? []).filter(
+            (reason) =>
+              reason.id === summary.state || reason.message === summary.summary,
+          );
+          const otherReasons = (summary.reasons ?? []).filter(
+            (reason) => !stateReasons.includes(reason),
+          );
+          return (
+            <div
+              key={`${scaler.namespace ?? ""}/${scaler.name}`}
+              className="space-y-1 text-xs"
+            >
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="font-medium text-theme-text-primary">
+                  {displayKind(scaler.kind)} {scaler.name}
+                </span>
+                {scaler.managedBy ? (
+                  <span className="text-theme-text-tertiary">
+                    managed by KEDA {displayKind(scaler.managedBy.kind)}{" "}
+                    <ResourceLink
+                      name={scaler.managedBy.name}
+                      kind={scaler.managedBy.kind}
+                      namespace={scaler.managedBy.namespace ?? ""}
+                      group={scaler.managedBy.group}
+                      onNavigate={
+                        onOpenResource && listedScaler(scaler.managedBy)
+                          ? (ref) => onOpenResource(ref)
+                          : undefined
+                      }
+                    />
+                  </span>
+                ) : null}
+                <span className="inline-flex items-center gap-1.5 text-theme-text-secondary">
+                  <StatusDot
+                    tone={mapHealthToTone(hpaStateLevel(summary.state))}
+                    className="shrink-0"
+                  />
+                  {hpaStateLabel(summary.state)}
+                </span>
+                {bounds ? (
+                  <span className="font-mono tabular-nums text-theme-text-tertiary">
+                    {bounds.current}/{bounds.desired} replicas · bounds{" "}
+                    {bounds.min}-{bounds.max}
+                  </span>
+                ) : null}
+              </div>
+              <p className="text-theme-text-secondary">{summary.summary}</p>
+              {stateReasons.map((reason) =>
+                reason.detail ? (
+                  <p
+                    key={`${reason.id}-${reason.detail}`}
+                    className="text-theme-text-tertiary"
+                  >
+                    Kubernetes
+                    {reason.conditionType ? ` ${reason.conditionType}` : ""}
+                    {reason.conditionReason
+                      ? ` · ${reason.conditionReason}`
+                      : ""}
+                    : &ldquo;{reason.detail}&rdquo;
+                  </p>
+                ) : null,
+              )}
+              {otherReasons.length > 0 ? (
+                <ul className="list-disc space-y-0.5 pl-4 text-theme-text-secondary marker:text-theme-text-tertiary">
+                  {otherReasons.map((reason) => (
+                    <li key={`${reason.id}-${reason.message}`}>
+                      {reason.message}
+                      {reason.detail ? (
+                        <span className="text-theme-text-tertiary">
+                          {" "}
+                          · {reason.detail}
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

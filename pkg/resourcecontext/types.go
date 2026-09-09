@@ -38,7 +38,7 @@ type ResourceContext struct {
 	ReferencedBy    *ReferencedBy      `json:"referencedBy,omitempty"`
 	Uses            *UsesBlock         `json:"uses,omitempty"`
 	RunsOn          *ContextRef        `json:"runsOn,omitempty"`
-	ScaledBy        []ContextRef       `json:"scaledBy,omitempty"`
+	ScaledBy        []ScalerRef        `json:"scaledBy,omitempty"`
 	StatusSummary   *StatusSummary     `json:"statusSummary,omitempty"`
 	Scheduling      *SchedulingSummary `json:"scheduling,omitempty"`
 	PodSummary      *PodSummary        `json:"podSummary,omitempty"`
@@ -77,6 +77,18 @@ type ContextRef struct {
 	Group     string `json:"group,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
 	Name      string `json:"name"`
+}
+
+// ScalerRef is one scaledBy entry: the scaler's identity plus, when the
+// scaler is an HPA the caller may read, the same diagnosis the HPA's own
+// context carries under hpaSummary. Scalers Radar does not diagnose (KEDA
+// ScaledObject/ScaledJob) carry the identity alone.
+type ScalerRef struct {
+	ContextRef
+	// ManagedBy names the KEDA ScaledObject that owns this HPA, when the HPA
+	// is one KEDA created rather than one a person wrote.
+	ManagedBy  *ContextRef `json:"managedBy,omitempty"`
+	HPASummary *HPASummary `json:"hpaSummary,omitempty"`
 }
 
 // ManagedByRef is the compact form of a "managed-by" pointer used in
@@ -576,9 +588,11 @@ type HPAReplicaBounds struct {
 }
 
 type HPAReasonSummary struct {
-	ID      string `json:"id"`
-	Message string `json:"message"`
-	Detail  string `json:"detail,omitempty"`
+	ID              string `json:"id"`
+	Message         string `json:"message"`
+	Detail          string `json:"detail,omitempty"`
+	ConditionType   string `json:"conditionType,omitempty"`
+	ConditionReason string `json:"conditionReason,omitempty"`
 }
 
 type HPAMetricSummary struct {
