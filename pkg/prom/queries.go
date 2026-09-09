@@ -215,9 +215,12 @@ func buildPodQuery(namespace, podName string, category MetricCategory, filterCon
 
 	switch category {
 	case CategoryRestarts:
-		// changes() over a 1h window gives the count of restarts during that window;
-		// using a long window keeps the chart legible (most pods never restart).
-		// Sums across containers so a multi-container pod surfaces one line per pod.
+		// changes() counts samples that differ from the one before, so several
+		// restarts between two scrapes read as one. buildPodSetQueryInner
+		// counts the same category with increase() instead; the two disagree
+		// and only that one is exact. The long window keeps the chart legible,
+		// since most pods never restart, and the sum across containers gives a
+		// multi-container pod one line.
 		return fmt.Sprintf(
 			`sum by (pod,namespace) (changes(kube_pod_container_status_restarts_total{namespace='%s',pod='%s'}[1h]))`,
 			ns, pod)
@@ -321,4 +324,57 @@ func BuildHPAReplicasQueries(namespace, name string) (current, desired string) {
 	current = fmt.Sprintf(`kube_horizontalpodautoscaler_status_current_replicas{namespace="%s",horizontalpodautoscaler="%s"}`, ns, n)
 	desired = fmt.Sprintf(`kube_horizontalpodautoscaler_status_desired_replicas{namespace="%s",horizontalpodautoscaler="%s"}`, ns, n)
 	return current, desired
+}
+
+// BuildPodSetQuery aggregates one category over an explicit pod set: the
+// pods a caller has already resolved through the workload's selector, so a
+// Deployment named api never picks up api-worker pods the way the
+// "<name>-.*" workload pattern does. Pods match as pod=~'^(a|b|c)$' inside
+// namespace; the result is a single sum series. Empty when pods is empty or
+// the category has no expression.
+func BuildPodSetQuery(namespace string, pods []string, category MetricCategory) string {
+	return buildPodSetQueryInner(namespace, pods, category, true)
+}
+
+// BuildPodSetQueryNoContainerFilter is BuildPodSetQuery without the
+// container!=” filter, for clusters whose cAdvisor metrics lack the label.
+func BuildPodSetQueryNoContainerFilter(namespace string, pods []string, category MetricCategory) string {
+	return buildPodSetQueryInner(namespace, pods, category, false)
+}
+
+func buildPodSetQueryInner(namespace string, pods []string, category MetricCategory, filterContainer bool) string {
+	if len(pods) == 0 {
+		return ""
+	}
+	ns := SanitizeLabelValue(namespace)
+	names := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		names = append(names, EscapeRegexMeta(SanitizeLabelValue(pod)))
+	}
+	podPattern := "^(" + strings.Join(names, "|") + ")$"
+	cf := ""
+	if filterContainer {
+		cf = "container!='',"
+	}
+
+	switch category {
+	case CategoryRestarts:
+		// increase() reads the counter delta, so several restarts between two
+		// scrapes count as several; changes() would report one. Its
+		// extrapolation yields fractions, which round() settles per pod
+		// before the set is summed.
+		return fmt.Sprintf(
+			`sum(round(increase(kube_pod_container_status_restarts_total{namespace='%s',pod=~'%s'}[1h])))`,
+			ns, podPattern)
+	case CategoryCPU:
+		return fmt.Sprintf(
+			`sum(rate(container_cpu_usage_seconds_total{%snamespace='%s',pod=~'%s'}[5m]))`,
+			cf, ns, podPattern)
+	case CategoryMemory:
+		return fmt.Sprintf(
+			`sum(max by (pod,namespace,container) (container_memory_working_set_bytes{%snamespace='%s',pod=~'%s'}))`,
+			cf, ns, podPattern)
+	default:
+		return ""
+	}
 }
