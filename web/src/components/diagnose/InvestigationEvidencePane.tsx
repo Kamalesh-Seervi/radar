@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useId,
   useLayoutEffect,
   useRef,
@@ -69,6 +70,7 @@ import {
 import {
   investigationEvidenceSubjectRef,
   investigationEvidenceSourceDomId,
+  investigationSourceArgs,
   type InvestigationEvidenceData,
   type InvestigationEvidenceGroup,
   type InvestigationEvidenceObservation,
@@ -87,6 +89,13 @@ import { investigationResourceEvidenceHasDetails } from "./investigationResource
 import type { InvestigationSourceExcerpt } from "./investigationSourceFocus";
 import { evidenceSourceExcerpt } from "./investigationSourceFocus";
 import { Tooltip } from "../ui/Tooltip";
+import { AgentClaimNote, AgentRoleChip } from "./AgentCase";
+import {
+  investigationCaseObservationKey,
+  type InvestigationCaseItem,
+  type InvestigationCaseResolution,
+} from "./investigationCase";
+import type { DiagnosisEvidenceRole } from "../../api/diagnose";
 
 import {
   investigationDisclosureSettleDelay,
@@ -116,7 +125,50 @@ const EvidenceNavigationContext = createContext<{
   citedOrderByGroup?: ReadonlyMap<string, number>;
   /** Change markers for each metrics observation, keyed by its source id. */
   metricsMarkersBySource?: ReadonlyMap<string, ChartAnnotation[]>;
+  /** Card- and revision-placed agent items, keyed by group id. */
+  caseByGroup?: ReadonlyMap<string, InvestigationCaseItem[]>;
+  /** The hypothesis each `rules_out` item excludes, keyed by item. */
+  excludedByItem?: ReadonlyMap<string, string>;
 }>({});
+
+/** Item identity for the excluded-hypothesis lookup; index alone repeats across turns. */
+export function investigationCaseItemKey(item: InvestigationCaseItem): string {
+  return `${item.source.id}\u0000${item.index}`;
+}
+
+const EVIDENCE_ROLE_RANK: Readonly<Record<DiagnosisEvidenceRole, number>> = {
+  cause: 0,
+  symptom: 1,
+  // A ruled-out card keeps Radar's place in the list; the role only labels it.
+  rules_out: 2,
+  context: 3,
+  benign: 4,
+  demoted: 5,
+};
+const UNLABELLED_RANK = 2;
+
+function sourceNamesOneResource(source: InvestigationEvidenceSource): boolean {
+  const args = investigationSourceArgs(source);
+  return (
+    typeof args?.kind === "string" &&
+    args.kind !== "" &&
+    typeof args.name === "string" &&
+    args.name !== ""
+  );
+}
+
+export function investigationCaseByGroup(
+  investigationCase?: InvestigationCaseResolution,
+): Map<string, InvestigationCaseItem[]> {
+  const byGroup = new Map<string, InvestigationCaseItem[]>();
+  for (const item of investigationCase?.items ?? []) {
+    if (!item.groupId || item.placement === "source") continue;
+    const items = byGroup.get(item.groupId) ?? [];
+    items.push(item);
+    byGroup.set(item.groupId, items);
+  }
+  return byGroup;
+}
 
 function evidenceTypePrefersFullRow(
   type: InvestigationEvidenceData["type"],
@@ -154,12 +206,31 @@ type EvidenceCollection = "main" | "workload" | "earlier";
 export function partitionInvestigationEvidence(
   groups: InvestigationEvidenceGroup[],
   resolution?: InvestigationRootCauseEvidenceResolution,
+  investigationCase?: InvestigationCaseResolution,
+  /**
+   * What a later turn cited, with the source that cited it. A follow-up adds
+   * to what the displayed assessment selected and never takes a selection
+   * away. The source travels with it because promoting a broader card needs
+   * one: an id alone selects the group but leaves the broader gate below
+   * unable to find who cited it, and the card stays withheld.
+   */
+  alsoSelected?: readonly {
+    groupId: string;
+    source: InvestigationEvidenceSource;
+  }[],
 ) {
-  const selected = new Set(
-    resolution?.status === "linked"
+  // Selection: legacy root-cause links plus every placed agent item, of any
+  // role (placement promotes a group into main the way a citation does; the
+  // role does not matter here). Ordering below is the only place roles act,
+  // and nothing the agent sends can remove a group from a collection.
+  const caseByGroup = investigationCaseByGroup(investigationCase);
+  const selected = new Set([
+    ...(resolution?.status === "linked"
       ? resolution.links.map((link) => link.originalGroupId)
-      : [],
-  );
+      : []),
+    ...caseByGroup.keys(),
+    ...(alsoSelected ?? []).map((entry) => entry.groupId),
+  ]);
   const collections: Record<EvidenceCollection, InvestigationEvidenceGroup[]> =
     {
       main: [],
@@ -181,17 +252,26 @@ export function partitionInvestigationEvidence(
     const broader = group.latest.relevance === "broader";
     // Citations select tool results, not individual rows in a broad search.
     // Only a focused, unambiguous fact can be promoted by a source citation.
-    if (broader) {
-      const link = resolution?.links.find(
-        (item) => item.originalGroupId === group.id,
-      );
+    // An agent item names this observation when its subject does, or when the
+    // call it cites was itself scoped to one resource; a subject-less item on
+    // a broad query only proves the query returned one row and is gated like
+    // a citation of its source.
+    const namedByAgent = (caseByGroup.get(group.id) ?? []).some(
+      (item) => item.subject || sourceNamesOneResource(item.source),
+    );
+    if (broader && !namedByAgent) {
+      const citingSource =
+        resolution?.links.find((item) => item.originalGroupId === group.id)
+          ?.source ??
+        caseByGroup.get(group.id)?.[0]?.source ??
+        alsoSelected?.find((entry) => entry.groupId === group.id)?.source;
       const focused = FOCUSED_EVIDENCE_TYPES.includes(group.latest.data.type);
-      const sourceGroups = link
+      const sourceGroups = citingSource
         ? groups.filter(
             (candidate) =>
               FOCUSED_EVIDENCE_TYPES.includes(candidate.latest.data.type) &&
               candidate.observations.some(
-                (observation) => observation.source.id === link.source.id,
+                (observation) => observation.source.id === citingSource.id,
               ),
           )
         : [];
@@ -220,13 +300,43 @@ export function partitionInvestigationEvidence(
     collections[collection].push(group);
     collectionByGroup.set(group.id, collection);
   }
-  collections.main.sort(
-    (left, right) =>
+  // A group takes its strongest role (lowest rank); within one role the
+  // agent's own item order decides. Unlabelled and ruled-out groups keep
+  // Radar's order among themselves.
+  const roleOrder = (group: InvestigationEvidenceGroup) => {
+    let rank: number | undefined;
+    let itemIndex = Number.POSITIVE_INFINITY;
+    for (const item of caseByGroup.get(group.id) ?? []) {
+      const itemRank = EVIDENCE_ROLE_RANK[item.role];
+      if (rank === undefined || itemRank < rank) {
+        rank = itemRank;
+        itemIndex = item.index;
+      } else if (itemRank === rank) {
+        itemIndex = Math.min(itemIndex, item.index);
+      }
+    }
+    if (rank === undefined || rank === UNLABELLED_RANK) {
+      return { rank: UNLABELLED_RANK, itemIndex: Number.POSITIVE_INFINITY };
+    }
+    return { rank, itemIndex };
+  };
+  collections.main.sort((left, right) => {
+    const leftRole = roleOrder(left);
+    const rightRole = roleOrder(right);
+    const agentOrder =
+      Number.isFinite(leftRole.itemIndex) ||
+      Number.isFinite(rightRole.itemIndex)
+        ? leftRole.itemIndex - rightRole.itemIndex
+        : 0;
+    return (
+      leftRole.rank - rightRole.rank ||
+      agentOrder ||
       Number(right.latest.tier === "key") -
         Number(left.latest.tier === "key") ||
       Number(adverse(right)) - Number(adverse(left)) ||
-      left.firstOrder - right.firstOrder,
-  );
+      left.firstOrder - right.firstOrder
+    );
+  });
   // A healthy workload's collection opens with several "nothing here"
   // receipts; the cards that carry facts (its vitals above all) come first,
   // and the receipts keep their order among themselves.
@@ -272,6 +382,8 @@ export function investigationEvidenceRevealCollection(
 export function InvestigationEvidencePane({
   projection,
   rootCauseEvidence,
+  alsoSelectedGroupIds,
+  investigationCase,
   collecting,
   animateGroupIds,
   onViewSource,
@@ -285,6 +397,13 @@ export function InvestigationEvidencePane({
   projection: InvestigationEvidenceProjection;
   /** Server-validated links for the current root cause; absent without one. */
   rootCauseEvidence?: InvestigationRootCauseEvidenceResolution;
+  /** What a later turn cited; adds to the assessment's selection. */
+  alsoSelectedGroupIds?: readonly {
+    groupId: string;
+    source: InvestigationEvidenceSource;
+  }[];
+  /** The current assessment's agent case, resolved against this projection. */
+  investigationCase?: InvestigationCaseResolution;
   collecting: boolean;
   animateGroupIds: ReadonlySet<string>;
   onViewSource: (
@@ -323,9 +442,57 @@ export function InvestigationEvidencePane({
   const partition = partitionInvestigationEvidence(
     projection.groups,
     rootCauseEvidence,
+    investigationCase,
+    alsoSelectedGroupIds,
   );
   const hasCurrentEvidence =
     partition.main.length + partition.workload.length > 0;
+  // A "Ruled out" link is an in-pane navigation to the placed observation. It
+  // reuses the Activity → Findings reveal path (open the card, open history
+  // when the observation is a superseded revision) and yields to a newer
+  // request from the parent.
+  const [caseReveal, setCaseReveal] = useState<
+    { sourceId: string; requestId: number } | undefined
+  >(undefined);
+  // A ruled-out reveal belongs to the case that produced it; a new parent
+  // request or a new assessment's case supersedes it.
+  useEffect(() => {
+    setCaseReveal(undefined);
+  }, [revealRequest?.requestId, investigationCase]);
+  const collectionByGroup = partition.collectionByGroup;
+  // A placed item can still sit on a withheld broader card; a link to it
+  // would have nowhere to go.
+  const visibleRuledOut = (investigationCase?.ruledOut ?? []).filter(
+    (entry) => entry.item.groupId && collectionByGroup.has(entry.item.groupId),
+  );
+  const revealCaseItem = useCallback(
+    (item: InvestigationCaseItem) => {
+      const { groupId, observation } = item;
+      if (!groupId || !observation) return;
+      // A placed group is normally in main, but a historical one lives in the
+      // nested "Previous observations" collection; open the way to it first.
+      const collection = collectionByGroup.get(groupId);
+      let settle = 0;
+      if (collection === "workload" || collection === "earlier") {
+        setWorkloadOpen(true);
+        settle = investigationDisclosureSettleDelay(prefersReducedMotion());
+      }
+      if (collection === "earlier") setEarlierOpen(true);
+      onGroupOpenChange(groupId, true);
+      setCaseReveal({ sourceId: observation.source.id, requestId: Date.now() });
+      window.setTimeout(() => {
+        window.requestAnimationFrame(() => {
+          const element = document.getElementById(groupId);
+          element?.scrollIntoView({
+            block: "start",
+            behavior: prefersReducedMotion() ? "auto" : "smooth",
+          });
+          element?.focus({ preventScroll: true });
+        });
+      }, settle);
+    },
+    [onGroupOpenChange, collectionByGroup],
+  );
   const revealCollection = revealRequest
     ? investigationEvidenceRevealCollection(
         projection,
@@ -446,6 +613,13 @@ export function InvestigationEvidencePane({
           />
         ) : null}
 
+        {/* What the agent considered and rejected belongs with the conclusion
+            it argues for, not after the evidence list among the withheld
+            counts, where it read as bookkeeping. */}
+        {visibleRuledOut.length > 0 ? (
+          <RuledOutBlock entries={visibleRuledOut} onReveal={revealCaseItem} />
+        ) : null}
+
         <div className="grid items-start gap-2.5">
           {partition.main.map((group) => (
             <EvidenceCard
@@ -521,8 +695,15 @@ export function InvestigationEvidencePane({
         onOpenTimeline,
         expandedGroupIds,
         onGroupOpenChange,
-        revealSourceId: revealRequest?.sourceId,
-        revealRequestId: revealRequest?.requestId,
+        revealSourceId: caseReveal?.sourceId ?? revealRequest?.sourceId,
+        revealRequestId: caseReveal?.requestId ?? revealRequest?.requestId,
+        caseByGroup: investigationCaseByGroup(investigationCase),
+        excludedByItem: new Map(
+          (investigationCase?.ruledOut ?? []).map((entry) => [
+            investigationCaseItemKey(entry.item),
+            entry.hypothesis,
+          ]),
+        ),
         metricsMarkersBySource: new Map(
           projection.groups.flatMap((group) =>
             group.observations.flatMap((observation) =>
@@ -549,6 +730,63 @@ export function InvestigationEvidencePane({
       {content}
       {afterEvidence}
     </EvidenceNavigationContext.Provider>
+  );
+}
+
+/**
+ * Hypotheses the agent dropped, each pointing at the Radar observation whose
+ * result contradicted it. Entries whose item could not be placed on an
+ * observation are filtered out by the resolver and never rendered here.
+ */
+function RuledOutBlock({
+  entries,
+  onReveal,
+}: {
+  entries: InvestigationCaseResolution["ruledOut"];
+  onReveal: (item: InvestigationCaseItem) => void;
+}) {
+  const headingId = useId();
+  return (
+    <section
+      aria-labelledby={headingId}
+      data-testid="investigation-ruled-out"
+      className="rounded-lg border border-theme-border/80 bg-theme-base/20 px-3 py-2.5"
+    >
+      <h3
+        id={headingId}
+        className="flex items-center gap-2 text-xs font-semibold text-theme-text-secondary"
+      >
+        Ruled out
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-accent-text">
+          Agent
+        </span>
+      </h3>
+      <ul className="mt-1.5 space-y-1.5">
+        {entries.map((entry, position) => {
+          const observation = entry.item.observation!;
+          return (
+            <li
+              key={position}
+              className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs"
+            >
+              <span className="min-w-0 text-theme-text-secondary [overflow-wrap:anywhere]">
+                {entry.hypothesis}
+              </span>
+              <button
+                type="button"
+                onClick={() => onReveal(entry.item)}
+                className="shrink-0 rounded text-accent-text hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+              >
+                See {observation.title}
+                {entry.item.placement === "revision"
+                  ? " (earlier observation)"
+                  : ""}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 
@@ -993,14 +1231,25 @@ function CoverageGroupRow({
 function previousDifferentObservations(
   group: InvestigationEvidenceGroup,
   citedOrder?: number,
+  boundOrders: ReadonlySet<number> = new Set(),
 ) {
   const seen = new Set([evidenceDisplaySnapshot(group.latest)]);
+  const pinned = (observation: InvestigationEvidenceObservation) =>
+    observation.source.order === citedOrder ||
+    boundOrders.has(observation.source.order);
   return [...group.observations].reverse().filter((observation) => {
+    if (observation === group.latest) return false;
+    // An observation bound to an agent item always keeps its own row: display
+    // equivalence is a folding rule for unpinned rechecks, never a reason to
+    // move a claim onto different content.
+    if (boundOrders.has(observation.source.order)) return true;
+    // A pinned observation wins over an unpinned twin with the same display
+    // content.
     if (
-      observation.source.order !== citedOrder &&
+      !pinned(observation) &&
       group.observations.some(
         (other) =>
-          other.source.order === citedOrder &&
+          pinned(other) &&
           evidenceDisplaySnapshot(other) ===
             evidenceDisplaySnapshot(observation),
       )
@@ -1016,6 +1265,8 @@ function previousDifferentObservations(
 export function investigationEvidenceShouldRevealHistory(
   group: InvestigationEvidenceGroup,
   sourceId?: string,
+  /** Sources whose observation carries an agent item and so always has a row. */
+  boundSourceIds: ReadonlySet<string> = new Set(),
 ): boolean {
   return (
     Boolean(sourceId) &&
@@ -1023,8 +1274,9 @@ export function investigationEvidenceShouldRevealHistory(
     group.observations.some(
       (observation) =>
         observation.source.id === sourceId &&
-        evidenceDisplaySnapshot(observation) !==
-          evidenceDisplaySnapshot(group.latest),
+        (boundSourceIds.has(observation.source.id) ||
+          evidenceDisplaySnapshot(observation) !==
+            evidenceDisplaySnapshot(group.latest)),
     )
   );
 }
@@ -1058,6 +1310,8 @@ function EvidenceCard({
     expandedGroupIds,
     onGroupOpenChange,
     metricsMarkersBySource,
+    caseByGroup,
+    excludedByItem,
   } = useContext(EvidenceNavigationContext);
   const open = expandedGroupIds?.has(group.id) ?? false;
   const setOpen = useCallback(
@@ -1071,7 +1325,17 @@ function EvidenceCard({
       ? parseLogLine(observation.summary).content
       : observation.summary;
   const citedOrder = citedOrderByGroup?.get(group.id);
-  const previousObservations = previousDifferentObservations(group, citedOrder);
+  const caseItems = caseByGroup?.get(group.id) ?? [];
+  const cardItems = caseItems.filter((item) => item.placement === "card");
+  const revisionItems = caseItems.filter(
+    (item) => item.placement === "revision",
+  );
+  const agentCause = cardItems.some((item) => item.role === "cause");
+  const previousObservations = previousDifferentObservations(
+    group,
+    citedOrder,
+    new Set(revisionItems.map((item) => item.observation!.source.order)),
+  );
   const meaningfulHistory = previousObservations.length > 0;
   const citedObservation = group.observations.find(
     (item) => item.source.order === citedOrder,
@@ -1089,6 +1353,7 @@ function EvidenceCard({
   const revealHistory = investigationEvidenceShouldRevealHistory(
     group,
     revealSourceId,
+    new Set(revisionItems.map((item) => item.observation!.source.id)),
   );
   useLayoutEffect(() => {
     const destination = revealSourceId
@@ -1169,7 +1434,14 @@ function EvidenceCard({
       aria-label={`${observation.title} evidence`}
       className={clsx(
         "@container/card scroll-mt-14 overflow-hidden outline-none focus:ring-2 focus:ring-accent/50 data-[source-related]:ring-2 data-[source-related]:ring-accent/35",
-        "rounded-lg border bg-theme-surface",
+        "rounded-lg border",
+        // The card the agent calls the cause sorts first and is often the
+        // calmest thing on screen: a cause is frequently a Secret or a
+        // ConfigMap that Radar has no reason to colour, while every card
+        // echoing the failure below it carries red. Lifting the surface marks
+        // it without borrowing a severity hue, and without touching the left
+        // rule (Radar's severity) or the ring (the source you are viewing).
+        agentCause ? "bg-theme-elevated shadow-theme-sm" : "bg-theme-surface",
         toneBorder(observation.tone, observation.tier, prominence),
         wide && "@min-[760px]/evidence:col-span-2",
         animateArrival && "animate-transcript-enter",
@@ -1242,6 +1514,24 @@ function EvidenceCard({
           ) : null}
         </div>
       </div>
+      {cardItems.some((item) => item.claim || item.role) ? (
+        <div
+          className={clsx(
+            "space-y-1.5",
+            prominence === "primary" ? "px-3 pb-2.5" : "px-2.5 pb-2",
+          )}
+        >
+          {cardItems.map((item) => (
+            <AgentClaimNote
+              key={item.index}
+              claim={item.claim}
+              role={item.role}
+              excludes={excludedByItem?.get(investigationCaseItemKey(item))}
+              className="pt-1.5"
+            />
+          ))}
+        </div>
+      ) : null}
       {canExpand ? (
         <div id={bodyId}>
           <Collapse open={open}>
@@ -1264,6 +1554,7 @@ function EvidenceCard({
                 <RevisionHistory
                   observations={previousObservations}
                   citedOrder={citedOrder}
+                  caseItems={revisionItems}
                   reveal={revealHistory}
                   revealRequestId={revealRequestId}
                   onViewSource={onViewSource}
@@ -3019,12 +3310,15 @@ function PermissionsBody({ data }: { data: EvidenceDataOf<"permissions"> }) {
 function RevisionHistory({
   observations,
   citedOrder,
+  caseItems = [],
   reveal,
   revealRequestId,
   onViewSource,
 }: {
   observations: InvestigationEvidenceObservation[];
   citedOrder?: number;
+  /** Agent items bound to a superseded observation of this group. */
+  caseItems?: InvestigationCaseItem[];
   reveal: boolean;
   revealRequestId?: number;
   onViewSource: (
@@ -3058,44 +3352,73 @@ function RevisionHistory({
       <div id={regionId} ref={elementRef}>
         <Collapse open={open}>
           <ol className="space-y-3 pt-2">
-            {observations.map((observation) => (
-              <li
-                key={`${observation.source.id}-${observation.revision}`}
-                className="flex min-w-0 items-start gap-2 text-xs"
-              >
-                <span className="mt-0.5 shrink-0 text-theme-text-tertiary">
-                  <span className="font-medium text-theme-text-secondary">
-                    {observation.source.order === citedOrder
-                      ? "Used for assessment"
-                      : phaseLabel(observation.source.phase)}
+            {observations.map((observation) => {
+              const key = investigationCaseObservationKey(observation);
+              const rowItems = caseItems.filter(
+                (item) =>
+                  item.observation &&
+                  investigationCaseObservationKey(item.observation) === key,
+              );
+              const rowRoles = [...new Set(rowItems.map((item) => item.role))];
+              return (
+                <li
+                  key={`${observation.source.id}-${observation.revision}`}
+                  data-case-observation={rowItems.length > 0 ? key : undefined}
+                  className="flex min-w-0 items-start gap-2 text-xs"
+                >
+                  <span className="mt-0.5 shrink-0 text-theme-text-tertiary">
+                    <span className="font-medium text-theme-text-secondary">
+                      {observation.source.order === citedOrder
+                        ? "Used for assessment"
+                        : phaseLabel(observation.source.phase)}
+                    </span>
                   </span>
-                </span>
-                <div className="min-w-0 flex-1 space-y-1 text-theme-text-secondary">
-                  <p>{observation.summary || observation.title}</p>
-                  {evidenceHasDetails(
-                    observation.data,
-                    observation.summary,
-                  ) && (
-                    <EvidenceBody
-                      data={observation.data}
-                      cardSummary={observation.summary}
-                      annotations={metricsMarkersBySource?.get(
+                  <div className="min-w-0 flex-1 space-y-1 text-theme-text-secondary">
+                    {rowRoles.length > 0 ? (
+                      <p className="flex flex-wrap items-center gap-1.5">
+                        <span>{observation.summary || observation.title}</span>
+                        {rowRoles.map((role) => (
+                          <AgentRoleChip key={role} role={role} />
+                        ))}
+                      </p>
+                    ) : (
+                      <p>{observation.summary || observation.title}</p>
+                    )}
+                    {rowItems
+                      .filter((item) => item.claim)
+                      .map((item) => (
+                        <AgentClaimNote
+                          key={item.index}
+                          claim={item.claim}
+                          role={rowRoles.length > 1 ? item.role : undefined}
+                          className="pt-1"
+                        />
+                      ))}
+                    {evidenceHasDetails(
+                      observation.data,
+                      observation.summary,
+                    ) && (
+                      <EvidenceBody
+                        data={observation.data}
+                        cardSummary={observation.summary}
+                        annotations={metricsMarkersBySource?.get(
+                          observation.source.id,
+                        )}
+                      />
+                    )}
+                  </div>
+                  <SourceButton
+                    ariaLabel={`View source for ${phaseLabel(observation.source.phase).toLowerCase()} observation of ${observation.title}`}
+                    onClick={() =>
+                      onViewSource(
                         observation.source.id,
-                      )}
-                    />
-                  )}
-                </div>
-                <SourceButton
-                  ariaLabel={`View source for ${phaseLabel(observation.source.phase).toLowerCase()} observation of ${observation.title}`}
-                  onClick={() =>
-                    onViewSource(
-                      observation.source.id,
-                      evidenceSourceExcerpt(observation.data),
-                    )
-                  }
-                />
-              </li>
-            ))}
+                        evidenceSourceExcerpt(observation.data),
+                      )
+                    }
+                  />
+                </li>
+              );
+            })}
           </ol>
         </Collapse>
       </div>
@@ -3275,6 +3598,13 @@ function toneBorder(
   prominence: "primary" | "supporting" | "secondary",
 ): string {
   if (prominence !== "primary") return "border-theme-border/70";
+  // A supporting adverse card is what the healthy-conflict banner points at,
+  // so it must be tellable from its neutral neighbours: a thin rule, lighter
+  // than the Key tier's.
+  if (tier === "supporting" && tone === "error")
+    return "border-l-2 border-l-semantic-error border-theme-border";
+  if (tier === "supporting" && (tone === "warning" || tone === "alert"))
+    return "border-l-2 border-l-semantic-warning border-theme-border";
   if (tier !== "key") return "border-theme-border";
   if (tone === "error")
     return "border-l-[3px] border-l-red-500 border-theme-border";

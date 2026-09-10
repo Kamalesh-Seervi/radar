@@ -54,6 +54,11 @@ import {
   type InvestigationRootCauseEvidenceResolution,
   type InvestigationEvidenceSource,
 } from "./investigationEvidence";
+import type {
+  InvestigationCaseItem,
+  InvestigationCaseResolution,
+} from "./investigationCase";
+import { AgentClaimNote } from "./AgentCase";
 
 import { useDisclosureReveal } from "./useDisclosureReveal";
 
@@ -615,6 +620,7 @@ export function TurnView({
   evidenceStepIds,
   onViewEvidence,
   sourceRevealRequest,
+  assessmentSources,
 }: {
   turn: Turn;
   agentLabel?: string;
@@ -622,6 +628,8 @@ export function TurnView({
   onViewExplanation?: () => void;
   onCheckStatus?: () => void;
   onRetryDiagnosis?: () => void;
+  /** Sources and agent items an answer turn cited; answers otherwise show none. */
+  assessmentSources?: ReactNode;
   // In the maximized workspace the pinned turn's conclusion renders in the side rail,
   // so the transcript suppresses its own copy (reasoning + tool calls still show).
   hideConclusion?: boolean;
@@ -725,6 +733,7 @@ export function TurnView({
             followup={followup}
             onCheckStatus={onCheckStatus}
             animate={turn.animateResult !== false}
+            assessmentSources={assessmentSources}
           />
         ) : (
           <EmptyResult animate={turn.animateResult !== false} />
@@ -1913,6 +1922,7 @@ export function ResultCard({
   showDisclaimer = true,
   coverageLimited = false,
   evidenceConflict = false,
+  evidenceConflictExplainedBy,
   compactActions = false,
   assessmentAction,
   assessmentSources,
@@ -1936,6 +1946,12 @@ export function ResultCard({
   coverageLimited?: boolean;
   /** Marks a healthy agent assessment that conflicts with same-turn Key evidence. */
   evidenceConflict?: boolean;
+  /**
+   * Titles of the conflicting cards when the agent placed a "not a problem"
+   * note on every one of them; the banner then points at the agent's reasons
+   * rather than accusing evidence it already addressed.
+   */
+  evidenceConflictExplainedBy?: string[];
   /** Show only the recommended (or first) action until the user asks for more. */
   compactActions?: boolean;
   actionNotice?: string;
@@ -1955,7 +1971,14 @@ export function ResultCard({
   // flag in its structured envelope. Never promote an ordinary answer into an
   // authoritative investigation conclusion.
   if (followup)
-    return <FollowupAnswer diagnosis={diagnosis} animate={animate} />;
+    return (
+      <>
+        <FollowupAnswer diagnosis={diagnosis} animate={animate} />
+        {assessmentSources ? (
+          <AssessmentSourceDetails>{assessmentSources}</AssessmentSourceDetails>
+        ) : null}
+      </>
+    );
   if (diagnosis.healthy && !diagnosis.rootCause)
     return section === "actions" ? null : (
       <AllClearCard
@@ -1964,6 +1987,7 @@ export function ResultCard({
         showDisclaimer={showDisclaimer}
         coverageLimited={coverageLimited}
         evidenceConflict={evidenceConflict}
+        evidenceConflictExplainedBy={evidenceConflictExplainedBy}
         assessmentAction={assessmentAction}
         assessmentSources={assessmentSources}
       />
@@ -2016,39 +2040,145 @@ export function ResultCard({
   );
 }
 
+/**
+ * Sources the assessment cites: root-cause links first, then every source an
+ * agent item cites. Each row shows the roles the agent gave that source; a
+ * claim the pane could not pin to one observation is shown here in full.
+ */
+export function assessmentSourceRows(
+  resolution: InvestigationRootCauseEvidenceResolution | undefined,
+  investigationCase: InvestigationCaseResolution | undefined,
+): Array<{
+  source: InvestigationEvidenceSource;
+  items: InvestigationCaseItem[];
+}> {
+  const rows = new Map<
+    string,
+    { source: InvestigationEvidenceSource; items: InvestigationCaseItem[] }
+  >();
+  if (resolution?.status === "linked") {
+    for (const link of resolution.links) {
+      rows.set(link.source.id, { source: link.source, items: [] });
+    }
+  }
+  for (const item of investigationCase?.items ?? []) {
+    const row = rows.get(item.source.id) ?? { source: item.source, items: [] };
+    row.items.push(item);
+    rows.set(item.source.id, row);
+  }
+  return [...rows.values()];
+}
+
+function joinTitles(titles: string[]): string {
+  if (titles.length <= 1) return titles[0] ?? "";
+  if (titles.length === 2) return `${titles[0]} and ${titles[1]}`;
+  return `${titles.slice(0, -1).join(", ")}, and ${titles[titles.length - 1]}`;
+}
+
+/**
+ * Provenance for one assessment: the exact tool results it cited, each with
+ * its source, and under a source only the agent notes that are not already
+ * shown on a card. Notes that live on cards are counted, not repeated; an
+ * earlier assessment no longer annotates the Evidence pane, so all of its
+ * notes are listed here instead of being lost.
+ */
 export function AssessmentSources({
   resolution,
+  investigationCase,
+  readOnly = false,
+  renderedGroupIds,
   onViewSource,
 }: {
   resolution?: InvestigationRootCauseEvidenceResolution;
+  investigationCase?: InvestigationCaseResolution;
+  readOnly?: boolean;
+  /**
+   * Groups the Evidence pane actually rendered. A card-placed note whose card
+   * was withheld is shown here instead of being counted as visible elsewhere;
+   * without this the note renders in neither place. Omitted by hosts that do
+   * not know, which keeps the original counting.
+   */
+  renderedGroupIds?: ReadonlySet<string>;
   onViewSource: (sourceId: string) => void;
 }) {
-  if (resolution?.status !== "linked" || !resolution.links.length) return null;
+  const rows = assessmentSourceRows(resolution, investigationCase);
+  if (rows.length === 0) return null;
   return (
     <div className="mt-3 border-t border-theme-border/60 pt-2">
-      <h4 className="text-xs font-medium text-theme-text-secondary">
+      <h4 className="text-[11px] font-semibold uppercase tracking-wide text-theme-text-tertiary">
         Sources used for this assessment
+        <span className="ml-1.5 font-medium normal-case tracking-normal text-theme-text-tertiary">
+          {rows.length}
+        </span>
       </h4>
-      <ul className="mt-1 space-y-1">
-        {resolution.links.map((link) => (
-          <li key={link.source.id}>
-            <button
-              type="button"
-              aria-label={`View ${prettyTool(link.source.tool)} source used for this assessment`}
-              onClick={() => onViewSource(link.source.id)}
-              className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-accent-text hover:bg-theme-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
-            >
-              <FileSearch className="h-3.5 w-3.5 shrink-0" aria-hidden />
-              <span className="min-w-0 flex-1">
-                <span className="font-medium">
-                  {prettyTool(link.source.tool)}
-                </span>
-                <CitedSourceScope source={link.source} />
-              </span>
-              <span className="shrink-0">View source</span>
-            </button>
-          </li>
-        ))}
+      <ul className="mt-1 divide-y divide-theme-border/50">
+        {rows.map(({ source, items }) => {
+          const shownOnCard = (item: InvestigationCaseItem) =>
+            !!item.claim &&
+            item.placement !== "source" &&
+            (!renderedGroupIds ||
+              (!!item.groupId && renderedGroupIds.has(item.groupId)));
+          const onCards = items.filter(shownOnCard).length;
+          const notes = items.filter(
+            (item) => item.claim && (readOnly || !shownOnCard(item)),
+          );
+          return (
+            <li key={source.id} className="py-1.5">
+              <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-2 px-2">
+                <FileSearch
+                  className="mt-0.5 h-3.5 w-3.5 shrink-0 text-theme-text-tertiary"
+                  aria-hidden
+                />
+                <div className="min-w-0 text-xs">
+                  <div className="font-medium text-theme-text-primary">
+                    {prettyTool(source.tool)}
+                  </div>
+                  <CitedSourceScope source={source} />
+                  {!readOnly && onCards > 0 ? (
+                    <div className="mt-0.5 text-[11px] text-theme-text-tertiary">
+                      {onCards === 1
+                        ? "1 agent note on an evidence card"
+                        : `${onCards} agent notes on evidence cards`}
+                    </div>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  aria-label={`View ${prettyTool(source.tool)} source used for this assessment`}
+                  onClick={() => onViewSource(source.id)}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs text-accent-text hover:bg-theme-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+                >
+                  View source
+                </button>
+              </div>
+              {notes.length > 0 ? (
+                <div
+                  className="ml-[1.9rem] mr-2 mt-1.5 space-y-1.5"
+                  data-source-placed-claims
+                >
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary">
+                    {readOnly
+                      ? "Notes from this assessment"
+                      : "Notes not shown on a card"}
+                  </div>
+                  {notes.map((item) => (
+                    <AgentClaimNote
+                      key={item.index}
+                      claim={item.claim}
+                      role={item.role}
+                      subject={
+                        item.placement === "source"
+                          ? undefined
+                          : item.observation?.title
+                      }
+                      className="border-t-0"
+                    />
+                  ))}
+                </div>
+              ) : null}
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
@@ -2518,6 +2648,7 @@ function AllClearCard({
   showDisclaimer,
   coverageLimited,
   evidenceConflict,
+  evidenceConflictExplainedBy,
   assessmentAction,
   assessmentSources,
 }: {
@@ -2526,6 +2657,7 @@ function AllClearCard({
   showDisclaimer: boolean;
   coverageLimited: boolean;
   evidenceConflict: boolean;
+  evidenceConflictExplainedBy?: string[];
   assessmentAction?: ReactNode;
   assessmentSources?: ReactNode;
 }) {
@@ -2539,11 +2671,16 @@ function AllClearCard({
   const summary = detailed
     ? "The agent found no active problem in the evidence it reviewed."
     : report;
+  const explained =
+    evidenceConflict &&
+    !!evidenceConflictExplainedBy &&
+    evidenceConflictExplainedBy.length > 0;
+  const unexplainedConflict = evidenceConflict && !explained;
   return (
     <div className={`mt-3 space-y-2 ${animate ? "animate-result-in" : ""}`}>
       <div
         className={`rounded-lg border p-3 ${
-          evidenceConflict
+          unexplainedConflict || explained
             ? "border-amber-500/40 bg-amber-500/5"
             : coverageLimited
               ? "border-amber-500/30 bg-amber-500/5"
@@ -2553,32 +2690,44 @@ function AllClearCard({
         <div className="mb-1 flex items-center justify-between gap-2">
           <div
             className={`flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide ${
-              evidenceConflict || coverageLimited
+              unexplainedConflict || explained || coverageLimited
                 ? "text-amber-500"
                 : "text-emerald-500"
             }`}
           >
-            {evidenceConflict || coverageLimited ? (
+            {unexplainedConflict || explained || coverageLimited ? (
               <AlertTriangle className="h-3.5 w-3.5" />
             ) : (
               <CheckCircle2 className="h-3.5 w-3.5" />
             )}
-            {evidenceConflict
+            {unexplainedConflict
               ? "Assessment conflicts with captured evidence"
-              : coverageLimited
-                ? "No problem identified in available evidence"
-                : "No problem found in checked evidence"}
+              : explained
+                ? "Agent reports no active problem; adverse evidence remains"
+                : coverageLimited
+                  ? "No problem identified in available evidence"
+                  : "No problem found in checked evidence"}
           </div>
           <CopyButton text={report} label="Copy assessment" />
         </div>
         <AIMarkdown className="text-sm text-theme-text-primary [overflow-wrap:anywhere] [&_code]:font-normal [&_li]:text-theme-text-primary [&_p]:my-1 [&_p]:text-theme-text-primary [&_p:first-child]:mt-0 [&_p:last-child]:mb-0">
           {summary}
         </AIMarkdown>
-        {evidenceConflict ? (
+        {unexplainedConflict ? (
           <p className="mt-2 text-xs text-theme-text-secondary">
             Radar also captured evidence of an active problem. Review that
             evidence before treating the agent&apos;s conclusion as an
             all-clear.
+          </p>
+        ) : explained ? (
+          <p className="mt-2 text-xs text-theme-text-secondary">
+            Radar captured evidence of an active problem. The agent explains its
+            interpretation in the note on{" "}
+            {joinTitles(evidenceConflictExplainedBy!)}; the evidence itself
+            stays in the list below, unchanged.
+            {coverageLimited
+              ? " Evidence coverage is also limited — review the limitations in Evidence."
+              : ""}
           </p>
         ) : coverageLimited ? (
           <p className="mt-2 text-xs text-theme-text-secondary">

@@ -24,7 +24,10 @@ import {
 import type { DiagnosisResourceRef } from "./diagnoseEvidenceTypes";
 import type { Diagnosis } from "../../api/diagnose";
 import { AssessmentSources, ResultCard } from "./parts";
-import { investigationEvidenceCoverageLimited } from "./investigationState";
+import {
+  investigationEvidenceConflictsWithHealthy,
+  investigationEvidenceCoverageLimited,
+} from "./investigationState";
 import { groupEvidenceCoverage } from "./investigationEvidencePresentation";
 import { metricsChangeMarkers } from "./investigationMetrics";
 
@@ -2702,6 +2705,33 @@ describe("cited broader cards and coverage rows", () => {
       "TargetDown firing",
     ]);
     expect(cited.hiddenBroader).toBe(1);
+
+    // A later turn's citations widen the selection; they never take one away.
+    // Replacing the assessment's resolution with a follow-up's used to push
+    // the assessment's own cited evidence back into the withheld count.
+    // A later turn's citation widens the selection; it never takes one away,
+    // and it carries the source that cited it so a broader card can actually
+    // be promoted rather than selected-but-withheld.
+    const withheld = projection.groups.find(
+      (group) => !cited.collectionByGroup.has(group.id),
+    );
+    expect(withheld).toBeDefined();
+    const widened = partitionInvestigationEvidence(
+      projection.groups,
+      resolution,
+      undefined,
+      [
+        {
+          groupId: withheld!.id,
+          source: withheld!.latest.source,
+        },
+      ],
+    );
+    for (const group of cited.main) {
+      expect(widened.main).toContain(group);
+    }
+    expect(widened.main).toContain(withheld);
+    expect(widened.hiddenBroader).toBe(cited.hiddenBroader - 1);
     const html = render(projection, false, undefined, resolution);
     expect(html).toContain("6/12 pods Unschedulable");
     expect(html).toContain(
@@ -3443,5 +3473,84 @@ describe("InvestigationEvidencePane scaled-by section", () => {
       ),
     );
     expect(html).not.toContain("Scaled by");
+  });
+});
+
+describe("supporting adverse cards are visibly marked", () => {
+  const ref = evidenceRef("a", "b");
+  const bundle = {
+    resource: {
+      apiVersion: "apps/v1",
+      kind: "Deployment",
+      metadata: { namespace: "shop", name: "api" },
+      status: { readyReplicas: 1, replicas: 1 },
+    },
+    pods: 1,
+    logsCurrent: [
+      {
+        pod: "api-abc",
+        container: "api",
+        logs: {
+          lines: ["ERROR failed to resolve backend service"],
+          totalLines: 1,
+          matchedLines: 1,
+          fallback: false,
+        },
+      },
+      {
+        pod: "api-abc",
+        container: "proxy",
+        logs: {
+          lines: ["proxy ready"],
+          totalLines: 1,
+          matchedLines: 0,
+          fallback: true,
+        },
+      },
+    ],
+  };
+
+  it("draws a thin warning rule on a supporting warning card and none on neutral or context cards", () => {
+    const projection = project(
+      tool("diag", "diagnose", bundle, { evidenceRef: ref }),
+    );
+    const logs = projection.groups.filter((group) => group.kind === "logs");
+    const [errorLogs, proxyLogs] = logs;
+    expect(errorLogs.latest.tier).toBe("supporting");
+    expect(errorLogs.latest.tone).toBe("warning");
+    expect(proxyLogs.latest.tier).toBe("context");
+    expect(proxyLogs.latest.tone).toBe("neutral");
+    const html = render(projection);
+    const card = (id: string) =>
+      html.slice(html.indexOf(`id="${id}"`), html.indexOf(`id="${id}"`) + 900);
+    expect(card(errorLogs.id)).toContain(
+      "border-l-2 border-l-semantic-warning",
+    );
+    expect(card(errorLogs.id)).not.toContain("border-l-[3px]");
+    expect(card(proxyLogs.id)).not.toContain("border-l-");
+    const resource = projection.groups.find(
+      (group) => group.kind === "resource",
+    )!;
+    expect(resource.latest.tier).toBe("context");
+    expect(card(resource.id)).not.toContain("border-l-");
+  });
+
+  it("marks every card that triggers the healthy-conflict banner", () => {
+    const projection = project(
+      tool("diag", "diagnose", bundle, { evidenceRef: ref }),
+    );
+    expect(investigationEvidenceConflictsWithHealthy(projection)).toBe(true);
+    const html = render(projection);
+    const triggering = projection.groups.filter((group) =>
+      investigationEvidenceConflictsWithHealthy({ groups: [group] }),
+    );
+    expect(triggering.length).toBeGreaterThan(0);
+    for (const group of triggering) {
+      const start = html.indexOf(`id="${group.id}"`);
+      expect(start).toBeGreaterThan(-1);
+      expect(html.slice(start, start + 900)).toMatch(
+        /border-l-(2 border-l-semantic-(warning|error)|\[3px\])/,
+      );
+    }
   });
 });

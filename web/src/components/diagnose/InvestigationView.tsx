@@ -30,6 +30,8 @@ import {
   investigationEvidenceInputsEqual,
   investigationEvidenceCoverageLimited,
   investigationEvidenceConflictsWithHealthy,
+  investigationHealthConflictExplainedBy,
+  investigationLiveCaseTurnIndex,
   investigationEndedBeforeConclusion,
   type InvestigationHistoryUnavailableState,
   investigationHistoryUnavailablePresentation,
@@ -89,6 +91,12 @@ import {
   projectInvestigationEvidence,
   resolveInvestigationRootCauseEvidence,
 } from "./investigationEvidence";
+import {
+  resolveInvestigationCase,
+  investigationCaseItemsStillRendered,
+  mergeInvestigationCases,
+  type InvestigationCaseResolution,
+} from "./investigationCase";
 import {
   InvestigationEvidencePane,
   partitionInvestigationEvidence,
@@ -976,15 +984,114 @@ export function InvestigationView({
         : undefined,
     [currentAssessment, currentAssessmentIdx, projection],
   );
+  // The agent's case binds for every assessment, healthy and inconclusive
+  // included, so it is resolved independently of the root cause.
+  const investigationCase = useMemo(
+    () =>
+      currentAssessment?.diagnosis
+        ? resolveInvestigationCase(
+            projection,
+            currentAssessment.diagnosis,
+            currentAssessmentIdx,
+          )
+        : undefined,
+    [currentAssessment, currentAssessmentIdx, projection],
+  );
+  // A follow-up answer that cites evidence takes over the pane's case; the
+  // assessment's own items are then listed read-only under it.
+  const liveCaseTurnIdx = investigationLiveCaseTurnIndex(
+    turns,
+    currentAssessmentIdx,
+  );
+  const liveCaseIsCurrentAssessment = liveCaseTurnIdx === currentAssessmentIdx;
+  // The qualification banner and the "Used for assessment" markers describe the
+  // assessment on screen, so they always read its own resolution. A later turn's
+  // citations only widen the selection (below): replacing the resolution would
+  // drop the assessment's qualification and push its cited evidence back into
+  // the withheld set.
+  const paneResolution = rootCauseEvidenceResolution;
+  // The live turn's own resolution stays available for the live turn's own
+  // receipt: its sources are its, not the assessment's.
+  const liveTurnResolution = useMemo(() => {
+    if (liveCaseIsCurrentAssessment) return rootCauseEvidenceResolution;
+    const diagnosis = turns[liveCaseTurnIdx]?.diagnosis;
+    return diagnosis?.rootCause
+      ? resolveInvestigationRootCauseEvidence(
+          projection,
+          diagnosis.rootCauseEvidence,
+          liveCaseTurnIdx,
+        )
+      : undefined;
+  }, [
+    liveCaseIsCurrentAssessment,
+    rootCauseEvidenceResolution,
+    turns,
+    liveCaseTurnIdx,
+    projection,
+  ]);
+  const followUpSelectedGroupIds = useMemo(() => {
+    if (liveCaseIsCurrentAssessment) return undefined;
+    if (liveTurnResolution?.status !== "linked") return undefined;
+    return liveTurnResolution.links.flatMap((link) =>
+      link.originalGroupId
+        ? [{ groupId: link.originalGroupId, source: link.source }]
+        : [],
+    );
+  }, [liveCaseIsCurrentAssessment, liveTurnResolution]);
+  // The live turn's own case, before anything is carried onto it. Its source
+  // receipt must list what IT cited, not what the merge brought along.
+  const liveTurnCase = useMemo(
+    () =>
+      liveCaseIsCurrentAssessment
+        ? investigationCase
+        : resolveInvestigationCase(
+            projection,
+            turns[liveCaseTurnIdx]?.diagnosis,
+            liveCaseTurnIdx,
+          ),
+    [
+      liveCaseIsCurrentAssessment,
+      investigationCase,
+      projection,
+      turns,
+      liveCaseTurnIdx,
+    ],
+  );
+  const paneCase = useMemo(() => {
+    const live = liveTurnCase;
+    const earlier: InvestigationCaseResolution[] = [];
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      const diagnosis = turns[i]?.diagnosis;
+      if (i === liveCaseTurnIdx || !diagnosis) continue;
+      // Reuse the assessment's own resolution rather than resolving it a
+      // second time: same projection, same result, and it keeps the items the
+      // conflict banner reasons about the ones the merge received.
+      earlier.push(
+        i === currentAssessmentIdx && investigationCase
+          ? investigationCase
+          : resolveInvestigationCase(projection, diagnosis, i),
+      );
+    }
+    return mergeInvestigationCases(live, earlier);
+  }, [
+    liveTurnCase,
+    investigationCase,
+    currentAssessmentIdx,
+    projection,
+    turns,
+    liveCaseTurnIdx,
+  ]);
   const visibleEvidenceGroupIds = useMemo(
     () =>
       new Set(
         partitionInvestigationEvidence(
           projection.groups,
-          rootCauseEvidenceResolution,
+          paneResolution,
+          paneCase,
+          followUpSelectedGroupIds,
         ).collectionByGroup.keys(),
       ),
-    [projection.groups, rootCauseEvidenceResolution],
+    [projection.groups, paneResolution, paneCase, followUpSelectedGroupIds],
   );
   const evidenceStepIdsByTurn = useMemo(
     () =>
@@ -1282,6 +1389,32 @@ export function InvestigationView({
   const currentAssessmentEvidenceConflict =
     currentAssessment?.diagnosis?.healthy === true &&
     investigationEvidenceConflictsWithHealthy(projection);
+  // The banner qualifies THIS assessment, so only this assessment's own case
+  // may reframe it. `paneCase` also carries a later answer's items and notes
+  // inherited from superseded assessments; neither of those spoke about this
+  // verdict, and letting them soften it would let an unrelated follow-up
+  // retire a warning the reader still needs.
+  const currentAssessmentEvidenceConflictExplainedBy = useMemo(() => {
+    if (!currentAssessmentEvidenceConflict) return undefined;
+    // Two conditions, and both are required. The note must belong to THIS
+    // assessment — a later answer or a superseded assessment did not speak
+    // about this verdict. And it must survive into the case the pane actually
+    // renders: the merge lets a later turn take over a group, and a banner
+    // that points at a note the reader cannot find is worse than no banner.
+    const qualifying = investigationCaseItemsStillRendered(
+      investigationCase?.items,
+      paneCase?.items,
+    );
+    return (
+      investigationHealthConflictExplainedBy(projection, qualifying) ??
+      undefined
+    );
+  }, [
+    currentAssessmentEvidenceConflict,
+    projection,
+    investigationCase,
+    paneCase,
+  ]);
   const hasEvidenceCollectedAfterAssessment =
     currentAssessmentIdx >= 0 &&
     projection.sources.some(
@@ -1714,6 +1847,41 @@ export function InvestigationView({
                               : undefined
                           }
                           hideConclusion={assessmentIndexes.includes(index)}
+                          assessmentSources={(() => {
+                            // Answer turns show what they cited; the live
+                            // one also drives Findings, earlier ones are
+                            // read-only.
+                            if (
+                              !turn.question ||
+                              turn.verify ||
+                              turn.apply ||
+                              turn.status !== "done" ||
+                              !turn.diagnosis
+                            )
+                              return undefined;
+                            const answerCase =
+                              index === liveCaseTurnIdx
+                                ? liveTurnCase
+                                : resolveInvestigationCase(
+                                    projection,
+                                    turn.diagnosis,
+                                    index,
+                                  );
+                            const answerResolution =
+                              index === liveCaseTurnIdx
+                                ? liveTurnResolution
+                                : undefined;
+                            return answerCase?.items.length ||
+                              answerResolution?.links.length ? (
+                              <AssessmentSources
+                                renderedGroupIds={visibleEvidenceGroupIds}
+                                resolution={answerResolution}
+                                investigationCase={answerCase}
+                                readOnly={index !== liveCaseTurnIdx}
+                                onViewSource={viewActivitySource}
+                              />
+                            ) : undefined;
+                          })()}
                         />
                         {showSplitWorkspace &&
                         index === currentAssessmentIdx &&
@@ -1952,9 +2120,13 @@ export function InvestigationView({
                         }
                         diagnosis={currentAssessment.diagnosis}
                         assessmentSources={
-                          rootCauseEvidenceResolution?.links.length ? (
+                          rootCauseEvidenceResolution?.links.length ||
+                          investigationCase?.items.length ? (
                             <AssessmentSources
+                              renderedGroupIds={visibleEvidenceGroupIds}
                               resolution={rootCauseEvidenceResolution}
+                              investigationCase={investigationCase}
+                              readOnly={!liveCaseIsCurrentAssessment}
                               onViewSource={viewActivitySource}
                             />
                           ) : undefined
@@ -1993,6 +2165,9 @@ export function InvestigationView({
                         showDisclaimer={false}
                         coverageLimited={currentAssessmentCoverageLimited}
                         evidenceConflict={currentAssessmentEvidenceConflict}
+                        evidenceConflictExplainedBy={
+                          currentAssessmentEvidenceConflictExplainedBy
+                        }
                       />
                     ) : (
                       <div className="mt-2 flex items-center gap-2 rounded-md bg-theme-surface/60 px-2.5 py-2 text-xs text-theme-text-tertiary">
@@ -2056,15 +2231,26 @@ export function InvestigationView({
                         diagnosis: turns[index].diagnosis!,
                         explanation: explanationFor(turns[index]),
                         sources: (() => {
+                          // Each earlier assessment owns its own items; they
+                          // render read-only here and never annotate cards.
                           const resolution =
                             resolveInvestigationRootCauseEvidence(
                               projection,
                               turns[index].diagnosis!.rootCauseEvidence,
                               index,
                             );
-                          return resolution.links.length ? (
+                          const earlierCase = resolveInvestigationCase(
+                            projection,
+                            turns[index].diagnosis,
+                            index,
+                          );
+                          return resolution.links.length ||
+                            earlierCase.items.length ? (
                             <AssessmentSources
+                              renderedGroupIds={visibleEvidenceGroupIds}
                               resolution={resolution}
+                              investigationCase={earlierCase}
+                              readOnly
                               onViewSource={viewActivitySource}
                             />
                           ) : undefined;
@@ -2074,7 +2260,9 @@ export function InvestigationView({
 
                   <InvestigationEvidencePane
                     projection={projection}
-                    rootCauseEvidence={rootCauseEvidenceResolution}
+                    rootCauseEvidence={paneResolution}
+                    alsoSelectedGroupIds={followUpSelectedGroupIds}
+                    investigationCase={paneCase}
                     collecting={
                       explanationRequest?.status !== "running" &&
                       (requestPending ||

@@ -1020,6 +1020,64 @@ describe("ResultCard conclusion states", () => {
     ]);
   });
 
+  it("reframes the conflict banner when the agent explained every adverse card", () => {
+    const html = renderToStaticMarkup(
+      <ResultCard
+        diagnosis={diagnosis({
+          healthy: true,
+          report: "The workload appears ready.",
+        })}
+        evidenceConflict
+        evidenceConflictExplainedBy={["CrashLoopBackOff", "Error logs"]}
+      />,
+    );
+
+    // An explanation reframes Radar's finding; it never replaces it with
+    // reassurance. The banner stays a warning, still says the evidence is
+    // there, and points at the notes.
+    expect(html).toContain(
+      "Agent reports no active problem; adverse evidence remains",
+    );
+    expect(html).toContain("Radar captured evidence of an active problem");
+    expect(html).toContain("the note on CrashLoopBackOff and Error logs");
+    expect(html).toContain("stays in the list below, unchanged");
+    expect(html).not.toContain("Assessment conflicts with captured evidence");
+    expect(html).toContain("border-amber-500/40");
+    expect(html).not.toContain("border-emerald-500/30");
+    expect(html).not.toContain("bg-accent/5");
+    // Never claims a severity tier it did not check.
+    expect(html).not.toContain("warning-level");
+
+    const unexplained = renderToStaticMarkup(
+      <ResultCard
+        diagnosis={diagnosis({
+          healthy: true,
+          report: "The workload appears ready.",
+        })}
+        evidenceConflict
+        evidenceConflictExplainedBy={[]}
+      />,
+    );
+    expect(unexplained).toContain(
+      "Assessment conflicts with captured evidence",
+    );
+
+    // Coverage is a separate fact from the conflict; an explanation of the
+    // conflict must not quietly retire it.
+    const limited = renderToStaticMarkup(
+      <ResultCard
+        diagnosis={diagnosis({
+          healthy: true,
+          report: "The workload appears ready.",
+        })}
+        evidenceConflict
+        evidenceConflictExplainedBy={["CrashLoopBackOff"]}
+        coverageLimited
+      />,
+    );
+    expect(limited).toContain("Evidence coverage is also limited");
+  });
+
   it("keeps a follow-up framed as an answer rather than a new conclusion", () => {
     const html = renderToStaticMarkup(
       <ResultCard
@@ -1468,5 +1526,45 @@ describe("assessment provenance disclosure", () => {
     expect(renderSources("initial-source")).not.toContain(
       'id="investigation-evidence-',
     );
+  });
+
+  it("shows a claim here when its card was withheld, instead of counting it as visible", () => {
+    // A card-placed note whose card the pane withheld renders nowhere unless
+    // this row falls back to it, while the count still claimed it was on a
+    // card — a receipt for something the reader cannot see.
+    const investigationCase = {
+      items: [
+        {
+          index: 0,
+          role: "context",
+          claim: "WITHHELD_CLAIM",
+          source: { id: "s1", tool: "issues", args: "{}" },
+          placement: "card",
+          groupId: "g-hidden",
+        },
+      ],
+    } as unknown as Parameters<
+      typeof AssessmentSources
+    >[0]["investigationCase"];
+
+    const hidden = renderToStaticMarkup(
+      <AssessmentSources
+        investigationCase={investigationCase}
+        renderedGroupIds={new Set<string>()}
+        onViewSource={noop}
+      />,
+    );
+    expect(hidden).toContain("WITHHELD_CLAIM");
+    expect(hidden).not.toContain("agent note on an evidence card");
+
+    const shown = renderToStaticMarkup(
+      <AssessmentSources
+        investigationCase={investigationCase}
+        renderedGroupIds={new Set(["g-hidden"])}
+        onViewSource={noop}
+      />,
+    );
+    expect(shown).not.toContain("WITHHELD_CLAIM");
+    expect(shown).toContain("1 agent note on an evidence card");
   });
 });

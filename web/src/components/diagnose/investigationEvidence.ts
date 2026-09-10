@@ -712,6 +712,16 @@ export function investigationEvidenceSourceDomId(sourceId: string): string {
 
 const investigationEvidenceRefRe = /^ev_[a-z2-7]{26,128}_[a-z2-7]{26,128}$/;
 
+export function isInvestigationEvidenceRef(value: string): boolean {
+  return investigationEvidenceRefRe.test(value);
+}
+
+export function investigationSourceArgs(
+  source: InvestigationEvidenceSource,
+): Record<string, unknown> | undefined {
+  return record(source.args ? parseJSON(source.args) : undefined);
+}
+
 export function resolveInvestigationRootCauseEvidence(
   projection: InvestigationEvidenceProjection,
   evidence: RootCauseEvidence | undefined,
