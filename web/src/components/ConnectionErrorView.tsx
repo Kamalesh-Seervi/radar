@@ -6,7 +6,7 @@ import { parseContextName } from '../utils/context-name'
 import { useOpenLocalTerminal, ClusterName } from '@skyhook-io/k8s-ui'
 import { useAuthMe, useContexts } from '../api/client'
 import { Tooltip } from './ui/Tooltip'
-import { allShellSafe } from '../utils/shell-safe'
+import { allShellSafe, awsProfileFlag } from '../utils/shell-safe'
 import { apiUrl } from '../api/config'
 import { useCapabilitiesContext } from '../contexts/CapabilitiesContext'
 
@@ -33,7 +33,7 @@ interface AuthHints {
   hideAuthButton?: boolean
 }
 
-function getAuthHints(context: string): AuthHints {
+function getAuthHints(context: string, awsProfile?: string): AuthHints {
   const parsed = parseContextName(context)
 
   switch (parsed.provider) {
@@ -54,18 +54,19 @@ function getAuthHints(context: string): AuthHints {
       return result
     }
     case 'EKS': {
+      const profileFlag = awsProfileFlag(awsProfile)
       const result: AuthHints = {
         title: 'EKS Authentication Failed',
         hints: [
           'Radar could not get AWS credentials for this context.',
           'For AWS SSO contexts, the SSO session may need login.',
         ],
-        authCommand: { label: 'If this context uses AWS SSO, refresh credentials:', command: 'aws sso login' },
+        authCommand: { label: 'If this context uses AWS SSO, refresh credentials:', command: `aws sso login${profileFlag}` },
       }
       if (parsed.region && allShellSafe(parsed.clusterName, parsed.region)) {
         result.fallbackCommand = {
           label: 'If that doesn\'t work, refresh cluster credentials:',
-          command: `aws eks update-kubeconfig --name ${parsed.clusterName} --region ${parsed.region}`,
+          command: `aws eks update-kubeconfig --name ${parsed.clusterName} --region ${parsed.region}${profileFlag}`,
         }
       }
       return result
@@ -88,26 +89,34 @@ function getAuthHints(context: string): AuthHints {
   }
 }
 
-export function getAuthRejectedHints(context: string): AuthHints {
+export function getAuthRejectedHints(context: string, awsProfile?: string): AuthHints {
   const parsed = parseContextName(context)
 
   switch (parsed.provider) {
     case 'EKS': {
+      const profileFlag = awsProfileFlag(awsProfile)
       const result: AuthHints = {
         title: 'EKS Could Not Authenticate This Request',
         hints: [
           'EKS returned HTTP 401, so Kubernetes could not authenticate this request.',
           'The AWS credential may be missing, stale, or revoked, or its IAM principal may not be mapped through an EKS access entry or the cluster\'s legacy aws-auth configuration.',
           'If the credential is current, ask a cluster admin to verify the mapping for the IAM principal used by this context.',
-          'The diagnostic uses the terminal\'s current AWS profile. If the kubeconfig exec block pins AWS_PROFILE or --role-arn, use that profile or role instead.',
+          profileFlag
+            ? 'The commands below use the AWS profile pinned by this context\'s kubeconfig exec block. If it also pins --role-arn, inspect that role instead.'
+            : 'The diagnostic uses the terminal\'s current AWS profile. If the kubeconfig exec block pins AWS_PROFILE or --role-arn, use that profile or role instead.',
           'API and API_AND_CONFIG_MAP modes use access entries; CONFIG_MAP mode uses the aws-auth ConfigMap.',
         ],
-        fallbackCommand: { label: 'If this context uses the current AWS SSO profile, re-login and retry:', command: 'aws sso login' },
+        fallbackCommand: {
+          label: profileFlag ? 'If this profile uses AWS SSO, re-login and retry:' : 'If this context uses the current AWS SSO profile, re-login and retry:',
+          command: `aws sso login${profileFlag}`,
+        },
       }
       if (parsed.region && allShellSafe(parsed.clusterName, parsed.region)) {
         result.authCommand = {
-          label: 'Inspect the caller and authentication mode for the current terminal AWS profile:',
-          command: `aws sts get-caller-identity && aws eks describe-cluster --name ${parsed.clusterName} --region ${parsed.region} --query cluster.accessConfig.authenticationMode --output text`,
+          label: profileFlag
+            ? 'Inspect the caller and authentication mode for the pinned AWS profile:'
+            : 'Inspect the caller and authentication mode for the current terminal AWS profile:',
+          command: `aws sts get-caller-identity${profileFlag} && aws eks describe-cluster --name ${parsed.clusterName} --region ${parsed.region}${profileFlag} --query cluster.accessConfig.authenticationMode --output text`,
         }
         // A diagnostic, not a re-auth — the "Authenticate in terminal" button
         // would misrepresent what running it does.
@@ -167,7 +176,7 @@ function getAuthPluginStuckHints(): AuthHints {
   }
 }
 
-function getTimeoutHints(context: string): AuthHints | null {
+function getTimeoutHints(context: string, awsProfile?: string): AuthHints | null {
   const parsed = parseContextName(context)
   const baseHints = [
     'The Kubernetes API did not respond before the deadline.',
@@ -192,15 +201,16 @@ function getTimeoutHints(context: string): AuthHints | null {
       return result
     }
     case 'EKS': {
+      const profileFlag = awsProfileFlag(awsProfile)
       const result: AuthHints = {
         title: 'Connection Timed Out',
         hints: [...baseHints, 'If the endpoint is reachable, AWS credentials or SSO may need refresh.'],
-        authCommand: { label: 'If this context uses AWS SSO and network access looks healthy, refresh credentials:', command: 'aws sso login' },
+        authCommand: { label: 'If this context uses AWS SSO and network access looks healthy, refresh credentials:', command: `aws sso login${profileFlag}` },
       }
       if (parsed.region && allShellSafe(parsed.clusterName, parsed.region)) {
         result.fallbackCommand = {
           label: 'If that does not work, refresh cluster credentials:',
-          command: `aws eks update-kubeconfig --name ${parsed.clusterName} --region ${parsed.region}`,
+          command: `aws eks update-kubeconfig --name ${parsed.clusterName} --region ${parsed.region}${profileFlag}`,
         }
       }
       return result
@@ -322,17 +332,17 @@ export function CopyableCommand({ command, onRunInTerminal }: { command: string;
   )
 }
 
-export function selectConnectionHints(errorType: string | undefined, context: string, originalContext?: string): AuthHints | null {
+export function selectConnectionHints(errorType: string | undefined, context: string, originalContext?: string, awsProfile?: string): AuthHints | null {
   const parsedContext = originalContext || context
   switch (errorType) {
     case 'auth':
-      return getAuthHints(parsedContext)
+      return getAuthHints(parsedContext, awsProfile)
     case 'auth-rejected':
-      return getAuthRejectedHints(parsedContext)
+      return getAuthRejectedHints(parsedContext, awsProfile)
     case 'auth-plugin-stuck':
       return getAuthPluginStuckHints()
     case 'timeout':
-      return getTimeoutHints(parsedContext)
+      return getTimeoutHints(parsedContext, awsProfile)
     default:
       return null
   }
@@ -344,9 +354,11 @@ export function ConnectionErrorView({ connection, onRetry, isRetrying }: Connect
   const isAuthRejected = connection.errorType === 'auth-rejected'
   const isAuthPluginStuck = connection.errorType === 'auth-plugin-stuck'
   const isAuthError = isAuth || isAuthRejected || isAuthPluginStuck
-  const { data: contexts } = useContexts()
-  const originalContext = contexts?.find((context) => context.name === connection.context)?.originalName
-  const commandInfo = selectConnectionHints(connection.errorType, connection.context || '', originalContext)
+  const { data: contexts, isLoading: contextsLoading } = useContexts()
+  const matchedContext = contexts?.find((context) => context.name === connection.context)
+  const originalContext = matchedContext?.originalName
+  const awsProfile = contextsLoading ? undefined : matchedContext?.awsProfile
+  const commandInfo = selectConnectionHints(connection.errorType, connection.context || '', originalContext, awsProfile)
   const errorInfo = commandInfo || errorHints[connection.errorType || 'unknown'] || errorHints.unknown
   const openLocalTerminal = useOpenLocalTerminal()
   const { data: authMe } = useAuthMe()
