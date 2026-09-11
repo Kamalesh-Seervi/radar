@@ -1223,11 +1223,11 @@ export function Timeline({
             ))}
             {radarServer
               ? mcpStatusIsFailure(radarServer.status)
-                ? ` at startup — ${agentLabel} had no Radar tools this turn, so it could not use Radar's cluster evidence.`
-                : ` at startup — Radar's tools may not have been available to ${agentLabel} this turn.`
+                ? ` at startup. ${agentLabel} had no Radar tools this turn, so it could not use Radar's cluster evidence.`
+                : ` at startup. Radar's tools may not have been available to ${agentLabel} this turn.`
               : allDefiniteFailures
-                ? ` at startup — ${agentLabel} ran this turn without those tools.`
-                : ` at startup — those tools may not have been available to ${agentLabel} this turn.`}
+                ? ` at startup. ${agentLabel} ran this turn without those tools.`
+                : ` at startup. Those tools may not have been available to ${agentLabel} this turn.`}
           </span>
         </div>
       )}
@@ -2085,12 +2085,26 @@ function joinTitles(titles: string[]): string {
 export function AssessmentSources({
   resolution,
   investigationCase,
+  unlinkedEvidence = 0,
+  evidenceMalformed = false,
   readOnly = false,
   renderedGroupIds,
   onViewSource,
 }: {
   resolution?: InvestigationRootCauseEvidenceResolution;
   investigationCase?: InvestigationCaseResolution;
+  /**
+   * Notes the agent wrote that could not be tied to a Radar result: a
+   * reference that named nothing, a role Radar does not know, a sentence over
+   * the length limit. Radar does not repair them, because repairing one means
+   * deciding what the agent meant, so it says how many were lost instead.
+   */
+  unlinkedEvidence?: number;
+  /**
+   * The agent's notes were not a list at all, so none of them could be read
+   * and no count describes how many were lost.
+   */
+  evidenceMalformed?: boolean;
   readOnly?: boolean;
   /**
    * Groups the Evidence pane actually rendered. A card-placed note whose card
@@ -2102,7 +2116,8 @@ export function AssessmentSources({
   onViewSource: (sourceId: string) => void;
 }) {
   const rows = assessmentSourceRows(resolution, investigationCase);
-  if (rows.length === 0) return null;
+  if (rows.length === 0 && unlinkedEvidence === 0 && !evidenceMalformed)
+    return null;
   return (
     <div className="mt-3 border-t border-theme-border/60 pt-2">
       <h4 className="text-[11px] font-semibold uppercase tracking-wide text-theme-text-tertiary">
@@ -2180,6 +2195,18 @@ export function AssessmentSources({
           );
         })}
       </ul>
+      {evidenceMalformed ? (
+        <p className="mt-2 text-[11px] text-theme-text-tertiary">
+          The agent&apos;s notes could not be read, so none are shown.
+        </p>
+      ) : null}
+      {unlinkedEvidence > 0 ? (
+        <p className="mt-2 text-[11px] text-theme-text-tertiary">
+          {unlinkedEvidence === 1
+            ? "1 agent note could not be linked to a Radar result and is not shown."
+            : `${unlinkedEvidence} agent notes could not be linked to Radar results and are not shown.`}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -2723,8 +2750,7 @@ function AllClearCard({
           <p className="mt-2 text-xs text-theme-text-secondary">
             Radar captured evidence of an active problem. The agent explains its
             interpretation in the note on{" "}
-            {joinTitles(evidenceConflictExplainedBy!)}; the evidence itself
-            stays in the list below, unchanged.
+            {joinTitles(evidenceConflictExplainedBy!)}.
             {coverageLimited
               ? " Evidence coverage is also limited — review the limitations in Evidence."
               : ""}

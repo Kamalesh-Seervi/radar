@@ -11,6 +11,14 @@ var (
 	jsonBlockRe     = regexp.MustCompile("(?s)```json\\s*(\\{.*?\\})\\s*```")
 	evidenceScopeRe = regexp.MustCompile(`^[a-z2-7]{26,128}$`)
 	evidenceRefRe   = regexp.MustCompile(`^ev_[a-z2-7]{26,128}_[a-z2-7]{26,128}$`)
+	// The ref reaches the model inside a marker wrapper, so a model that
+	// copies the whole marker instead of its payload is quoting Radar
+	// correctly. Unwrapping is transcription, not interpretation.
+	// Anchored, and one marker only: a field holding two markers, or a marker
+	// inside prose, is the agent meaning something this cannot read, and
+	// picking the first would be choosing an interpretation rather than
+	// removing a wrapper.
+	wrappedEvidenceRefRe = regexp.MustCompile(`^\[\[radar:evidence-ref=(ev_[a-z2-7]{26,128}_[a-z2-7]{26,128})\]\]$`)
 )
 
 const (
@@ -23,6 +31,11 @@ const (
 	maxDiagnosisHypothesisRune = 200
 )
 
+// evidenceRoles is one half of a Go↔TS contract: the DiagnosisEvidenceRole
+// union in web/src/api/diagnose.ts and EVIDENCE_ROLES in
+// web/src/components/diagnose/investigationCase.ts must list exactly these
+// roles. A role accepted here but absent there is parsed and then dropped by
+// the frontend; change both sides together.
 var evidenceRoles = map[EvidenceRole]struct{}{
 	EvidenceRoleCause:    {},
 	EvidenceRoleSymptom:  {},
@@ -127,8 +140,18 @@ func parseEvidenceReferenceRequest(raw json.RawMessage) evidenceReferenceRequest
 func parseCaseRequest(evidenceRaw, ruledOutRaw json.RawMessage) caseRequest {
 	var request caseRequest
 	var rawItems []json.RawMessage
+	if len(evidenceRaw) > 0 && string(evidenceRaw) != "null" &&
+		json.Unmarshal(evidenceRaw, &rawItems) != nil {
+		// The agent sent something for evidence that is not a list of items.
+		// There is no honest count of what it meant to say, so the loss is
+		// reported as a fact rather than a number.
+		request.malformed = true
+	}
 	if len(evidenceRaw) > 0 && json.Unmarshal(evidenceRaw, &rawItems) == nil {
 		if len(rawItems) > maxDiagnosisEvidenceItems {
+			// Items past the cap get no slot in Evidence at all, so their loss
+			// is only visible if counted here.
+			request.dropped = len(rawItems) - maxDiagnosisEvidenceItems
 			rawItems = rawItems[:maxDiagnosisEvidenceItems]
 		}
 		for _, raw := range rawItems {
@@ -172,7 +195,11 @@ func parseCaseItem(raw json.RawMessage) caseItemRequest {
 		Claim   string          `json:"claim"`
 		Subject json.RawMessage `json:"subject"`
 	}
-	if json.Unmarshal(raw, &parsed) != nil || !evidenceRefRe.MatchString(parsed.Ref) {
+	if json.Unmarshal(raw, &parsed) != nil {
+		return caseItemRequest{}
+	}
+	ref := unwrapEvidenceRef(parsed.Ref)
+	if !evidenceRefRe.MatchString(ref) {
 		return caseItemRequest{}
 	}
 	role := EvidenceRole(strings.ToLower(strings.TrimSpace(parsed.Role)))
@@ -180,10 +207,14 @@ func parseCaseItem(raw json.RawMessage) caseItemRequest {
 		return caseItemRequest{}
 	}
 	claim := strings.TrimSpace(parsed.Claim)
-	if utf8.RuneCountInString(claim) > maxDiagnosisClaimChars {
+	// An empty claim satisfies the frontend's "the agent explained this card"
+	// check while saying nothing, which would quietly soften a warning banner.
+	// An over-long one is dropped rather than truncated — cutting a sentence
+	// mid-clause invents a claim the agent did not make.
+	if claim == "" || utf8.RuneCountInString(claim) > maxDiagnosisClaimChars {
 		return caseItemRequest{}
 	}
-	item := caseItemRequest{valid: true, ref: parsed.Ref, role: role, claim: claim}
+	item := caseItemRequest{valid: true, ref: ref, role: role, claim: claim}
 	if len(parsed.Subject) == 0 || string(parsed.Subject) == "null" {
 		return item
 	}
@@ -209,4 +240,14 @@ func parseCaseItem(raw json.RawMessage) caseItemRequest {
 	}
 	item.subject = &subject
 	return item
+}
+
+// unwrapEvidenceRef returns the ref inside a marker wrapper the model pasted
+// whole, or the value unchanged when the field is not exactly one wrapper.
+func unwrapEvidenceRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if m := wrappedEvidenceRefRe.FindStringSubmatch(ref); m != nil {
+		return m[1]
+	}
+	return ref
 }

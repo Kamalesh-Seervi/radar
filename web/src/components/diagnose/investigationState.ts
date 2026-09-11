@@ -1,5 +1,6 @@
 // Pure presentation decisions over the durable transcript and evidence projection.
 // Keep React/DOM orchestration in InvestigationView; these rules have no UI runtime.
+import { evidenceKindIsAdverse } from "./investigationEvidenceKinds";
 import {
   DiagnoseError,
   type DiagnoseStreamEvent,
@@ -335,17 +336,6 @@ export function investigationEvidenceCoverageLimited(
   );
 }
 
-const HEALTH_CONFLICT_EVIDENCE_KINDS = new Set([
-  "issue",
-  "startup",
-  "crash",
-  "resource",
-  "logs",
-  "events",
-  "dns",
-  "network",
-]);
-
 /**
  * A model-authored all-clear must not overrule active adverse Radar evidence.
  * Context-only warnings (for example a Helm ownership advisory) and ordinary
@@ -363,6 +353,8 @@ interface HealthConflictGroup {
     tier: "key" | "supporting" | "context" | "checked";
     tone: string;
     title?: string;
+    /** Which turn captured this reading; a note cannot explain a later one. */
+    source?: { turnIndex: number };
   };
 }
 
@@ -374,8 +366,13 @@ export function investigationHealthConflictGroups<
       !group.historical &&
       group.latest.relevance !== "broader" &&
       (group.latest.tier === "key" || group.latest.tier === "supporting") &&
-      (group.latest.tone === "warning" || group.latest.tone === "error") &&
-      HEALTH_CONFLICT_EVIDENCE_KINDS.has(group.kind),
+      // Radar's adverse tones run warning → alert → error; "high" severity
+      // from the Go side lands on alert, so leaving it out silently excused
+      // every high-severity finding.
+      (group.latest.tone === "warning" ||
+        group.latest.tone === "alert" ||
+        group.latest.tone === "error") &&
+      evidenceKindIsAdverse(group.kind),
   );
 }
 
@@ -401,6 +398,7 @@ export function investigationHealthConflictExplainedBy(
         placement: "card" | "revision" | "source";
         claim: string;
         groupId?: string;
+        source?: { turnIndex: number };
       }[]
     | undefined,
 ): string[] | null {
@@ -450,7 +448,17 @@ export function investigationHealthConflictExplainedBy(
         // `rules_out` excludes some other hypothesis and `demoted` says the
         // card is peripheral — both true of a still-active problem — so
         // neither reconciles a healthy verdict with evidence contradicting it.
-        item.role === "benign",
+        item.role === "benign" &&
+        // An assessment cannot have addressed a reading taken after it. The
+        // twin lookup above deliberately crosses calls, because one log
+        // stream read twice lands in two groups; without this, it would also
+        // let a note about an earlier failure explain a different one that
+        // the same stream reported in a later turn.
+        !(
+          group.latest.source !== undefined &&
+          item.source !== undefined &&
+          group.latest.source.turnIndex > item.source.turnIndex
+        ),
     );
     if (!explained) return null;
     titles.push(group.latest.title ?? group.kind);

@@ -431,7 +431,13 @@ export type InvestigationEvidenceData =
       checked:
         "issues" | "events" | "changes" | "inventory" | "logs" | "alerts";
       scope: string;
-      message: string;
+      /**
+       * Only when there is something to add. The card already shows the title
+       * and the scope, so a line that restates either costs the reader a read
+       * and returns nothing; this carries the reason the answer is what it is,
+       * or the limit of what it proves.
+       */
+      message?: string;
     }
   | {
       type: "alerts";
@@ -1644,7 +1650,7 @@ function addNarrowHint(
       source,
       label,
       label +
-        " was narrowed to keep this investigation bounded. Additional matching evidence may exist.",
+        " returned part of the matching results to keep this investigation fast. More may exist.",
       "truncated",
     );
   }
@@ -1667,7 +1673,7 @@ function addResourceContextLimitations(
     builder.limit(
       source,
       omitted.field,
-      `Resource context omitted: ${omitted.reason.replaceAll("_", " ")}.`,
+      `Radar left out part of the resource context (${omitted.reason.replaceAll("_", " ")}).`,
       omitted.reason === "budget_exceeded" ? "truncated" : "unknown",
     );
   }
@@ -1676,7 +1682,7 @@ function addResourceContextLimitations(
     builder.limit(
       source,
       "Relationships",
-      `Referenced-by relationships were truncated (${shown} of ${context.referencedBy.total} returned).`,
+      `Radar returned ${shown} of ${context.referencedBy.total} referenced-by relationships.`,
       "truncated",
     );
   }
@@ -1684,7 +1690,7 @@ function addResourceContextLimitations(
     builder.limit(
       source,
       "Application references",
-      "Additional stale Secret environment reference groups were omitted.",
+      "Radar returned part of the stale Secret references.",
       "truncated",
     );
   }
@@ -1699,7 +1705,7 @@ function addIssueLimitations(
     builder.limit(
       source,
       `Radar Issue ${value.id}`,
-      "The affected-resource member list was truncated.",
+      "Radar returned part of the affected-resource list.",
       "truncated",
     );
   }
@@ -1917,9 +1923,8 @@ function addEvents(
   complete = true,
   emptyIsAuthoritative = false,
   relevance: InvestigationEvidenceRelevance = "broader",
-  emptyReceipt: { title: string; message: string } = {
-    title: "No matching warning events",
-    message: "The warning-event query completed and returned no groups.",
+  emptyReceipt: { title: string; message?: string } = {
+    title: "No warning events",
   },
 ): void {
   const scope = scopeFromArgs(source);
@@ -2017,13 +2022,12 @@ function addChanges(
       tier: evidenceTierForRelevance("checked", relevance),
       relevance,
       tone: "neutral",
-      title: "No tracked recent changes",
+      title: "No recorded changes in this window",
       summary: scope,
       data: {
         type: "receipt",
         checked: "changes",
         scope,
-        message: "The requested change window returned no tracked changes.",
       },
     });
     return;
@@ -2466,14 +2470,12 @@ function adaptDiagnose(
       tier: evidenceTierForRelevance("checked", bundleRelevance),
       relevance: bundleRelevance,
       tone: "neutral",
-      title: "No classified workload issues",
+      title: "Radar's diagnosis found no live issues",
       summary: scope,
       data: {
         type: "receipt",
         checked: "issues",
         scope,
-        message:
-          "Radar's workload diagnosis completed without a classified live issue for this resource.",
       },
     });
   }
@@ -2492,9 +2494,14 @@ function adaptDiagnose(
   if (Array.isArray(blockersRaw)) {
     for (const { blocker, pods, foldedInto } of blockerGroups) {
       if (foldedInto) continue;
+      // One blocker keeps one identity however many pods share it. Keying a
+      // merged card differently from a single-pod one made a re-diagnose that
+      // crossed one pod look like a new fact, so the same reason appeared
+      // twice; a Pod blocker is the same finding whether it holds one pod or
+      // nine.
       const grouped = blocker.kind === "Pod" && pods.length > 1;
       builder.observe(
-        grouped
+        blocker.kind === "Pod"
           ? `startup:Pod:${blocker.reason}:${fnv1a32(blocker.message).toString(36)}`
           : `startup:${blocker.kind}:${blocker.name}:${blocker.reason}`,
         "startup",
@@ -2513,7 +2520,11 @@ function adaptDiagnose(
           data: {
             type: "startup",
             blocker,
-            ...(grouped ? { pods } : {}),
+            // Always carry the pods, whether one or nine: they are what puts
+            // this workload's pods into the set a later Prometheus query is
+            // proved against, and a merged card that dropped them quietly
+            // weakened attribution elsewhere.
+            pods,
             subject: grouped
               ? undefined
               : (() => {
@@ -2587,7 +2598,7 @@ function adaptDiagnose(
     builder.limit(
       source,
       "Crash evidence",
-      "Additional crash-cause candidates were omitted.",
+      "Radar returned part of the crash-cause candidates.",
       "truncated",
     );
   }
@@ -2638,7 +2649,7 @@ function adaptDiagnose(
           tier: evidenceTierForRelevance("checked", logRelevance),
           relevance: logRelevance,
           tone: "neutral",
-          title: "No previous container instance expected",
+          title: "No previous logs expected",
           summary: `${item.pod} / ${item.container}`,
           data: {
             type: "receipt",
@@ -3073,14 +3084,12 @@ function adaptIssues(
       tier: evidenceTierForRelevance("checked", relevance),
       relevance,
       tone: "neutral",
-      title: "No matching live issues",
+      title: "No live issues matched this search",
       summary: scope,
       data: {
         type: "receipt",
         checked: "issues",
         scope,
-        message:
-          "Radar's live-issue query completed and returned no matching issues.",
       },
     });
   } else {
@@ -3290,7 +3299,7 @@ function adaptListResources(
     builder.limit(
       source,
       "Resource inventory",
-      `Radar found no matching resources for ${scope}, but access restrictions may have hidden some results.`,
+      `Radar found no matching resources for ${scope}. Anything you do not have permission to read was not searched.`,
       "unknown",
     );
     return;
@@ -3348,6 +3357,18 @@ function adaptEvents(
     );
     return;
   }
+  // A cluster-wide read the producer narrowed to the caller's namespaces
+  // answers for those alone, so neither its empty receipt nor its card may
+  // stand for the cluster.
+  const narrowedTo = narrowedEventScope(value);
+  if (narrowedTo && events.length > 0) {
+    builder.limit(
+      source,
+      "Events",
+      `This cluster-wide events read covered only the namespaces you can read (${narrowedTo}).`,
+      "unknown",
+    );
+  }
   addEvents(
     builder,
     source,
@@ -3356,12 +3377,33 @@ function adaptEvents(
     !nonEmptyString(value.narrowHint),
     true,
     sourceArgsRelevance(builder, source),
-    {
-      title: "No events matched",
-      message:
-        "The events query completed and returned nothing for this scope. Events outside its window or filters are not covered; a namespace you cannot read also returns nothing.",
-    },
+    narrowedTo
+      ? {
+          title: "No events in the namespaces you can read",
+          message: `Read ${narrowedTo}. Namespaces outside your permissions were not read, so this does not clear the cluster.`,
+        }
+      : {
+          title: "No events in this window",
+          message:
+            "Events outside this window or its filters are not covered, and a namespace you cannot read also returns nothing.",
+        },
   );
+}
+
+/**
+ * Names the namespaces a cluster-wide events read was actually narrowed to,
+ * or undefined when the read covered everything the query asked for.
+ */
+function narrowedEventScope(
+  value: Record<string, unknown>,
+): string | undefined {
+  if (value.partialScope !== true) return undefined;
+  const namespaces = (stringArray(value.scopeNamespaces) ?? []).filter(
+    nonEmptyString,
+  );
+  return namespaces.length > 0
+    ? namespaces.join(", ")
+    : "the namespaces you can read";
 }
 
 function adaptPodLogs(
@@ -3686,11 +3728,13 @@ function adaptWorkloadLogs(
       return;
     }
     if (!source.confirmedSuccess) return;
+    // The producer's own sentence when it gave one; otherwise nothing, because
+    // "no pods to read logs from" is already the whole answer.
     const message = nonEmptyString(value.emptyMessage)
       ? value.emptyMessage
       : nonEmptyString(value.logs)
         ? value.logs
-        : "The workload resolved no pods, so there were no log streams to read.";
+        : undefined;
     builder.observe(
       `workload-logs:${previous ? "previous" : "current"}:${scope}`,
       "receipt",
@@ -3707,7 +3751,7 @@ function adaptWorkloadLogs(
     return;
   }
   const logsRaw = value.logs;
-  const noStreams = `No log streams were returned for the ${value.pods} resolved pod${value.pods === 1 ? "" : "s"}, so Radar could not evaluate them.`;
+  const noStreams = `Radar found ${value.pods} pod${value.pods === 1 ? "" : "s"} but got no logs from ${value.pods === 1 ? "it" : "them"}, so the logs were not checked.`;
   if (!Array.isArray(logsRaw)) {
     if (logsRaw === undefined || logsRaw === null) {
       builder.limit(source, "Workload logs", noStreams, "unknown");
@@ -3786,12 +3830,11 @@ function producerEstablishedTargetPods(
         pods.add(data.pod);
       } else if (data.type === "crash" && data.namespace === namespace) {
         for (const pod of data.crash.pods) pods.add(pod);
-      } else if (
-        data.type === "startup" &&
-        data.subject?.kind === "Pod" &&
-        data.subject.namespace === namespace
-      ) {
-        pods.add(data.subject.name);
+      } else if (data.type === "startup" && data.blocker.kind === "Pod") {
+        // The blocker names the pods it holds whether the card merged them or
+        // not; the subject is only set when there is exactly one, so reading
+        // it alone lost the whole set the moment a second pod appeared.
+        for (const pod of data.pods ?? []) pods.add(pod);
       }
     }
   }
@@ -4102,7 +4145,7 @@ function adaptPrometheusRules(
       tier: "checked",
       relevance: "target",
       tone: "neutral",
-      title: `No ${stateFilter} alert rules name this ${displayKind(builder.target.kind)}`,
+      title: `No ${stateFilter} alerts matched this ${displayKind(builder.target.kind)}`,
       summary: identity,
       data: {
         type: "receipt",
@@ -4857,6 +4900,12 @@ function metricsWindowLabel(data: {
     : `${window} window`;
 }
 
+/**
+ * One half of a Go↔TS contract: `diagnoseMetricsCategories` in
+ * internal/mcp/tools_diagnose_metrics.go decides which categories the producer
+ * captures, and a series whose category is missing here is discarded. Change
+ * both together.
+ */
 const DIAGNOSE_METRICS_LABELS: Record<string, string> = {
   cpu: "CPU usage",
   memory: "Memory working set",
@@ -4974,6 +5023,23 @@ function addDiagnoseMetrics(
   }
 }
 
+// Radar's reading of a metric name, so an agent-written query gets a title a
+// reader can scan instead of the raw series name. Deliberately small and exact:
+// an unrecognised metric keeps its own name rather than being handed a meaning
+// Radar cannot derive from it.
+const METRIC_FAMILY_LABELS: Record<string, string> = {
+  container_cpu_usage_seconds_total: "CPU usage",
+  container_cpu_cfs_throttled_seconds_total: "CPU throttling",
+  container_memory_working_set_bytes: "Memory working set",
+  container_memory_usage_bytes: "Memory usage",
+  container_memory_rss: "Memory RSS",
+  kube_pod_container_status_restarts_total: "Restarts",
+  container_network_receive_bytes_total: "Network received",
+  container_network_transmit_bytes_total: "Network transmitted",
+  container_fs_usage_bytes: "Filesystem usage",
+  up: "Scrape target up",
+};
+
 function adaptQueryPrometheus(
   builder: ProjectionBuilder,
   source: InvestigationEvidenceSource,
@@ -5054,8 +5120,20 @@ function adaptQueryPrometheus(
       ),
     ),
   ];
-  const title =
-    metricNames.length === 1
+  // A recognised family names the card; the scope is added only when Radar
+  // already decided the query is about the target, so the title never widens
+  // or narrows what the relevance check concluded.
+  const family =
+    metricNames.length === 1 ? METRIC_FAMILY_LABELS[metricNames[0]] : undefined;
+  const scope =
+    relevance === "target"
+      ? `${displayKind(builder.target.kind)} ${builder.target.namespace ? `${builder.target.namespace}/` : ""}${builder.target.name}`
+      : undefined;
+  const title = family
+    ? scope
+      ? `${family} · ${scope}`
+      : family
+    : metricNames.length === 1
       ? metricNames[0]
       : mode === "range"
         ? "Prometheus metrics"
@@ -5094,7 +5172,13 @@ function adaptQueryPrometheus(
       tone: "neutral",
       title,
       summary: [
-        metricNames.length === 1 ? "Prometheus" : undefined,
+        // When a family named the card, the metric name moves here so it stays
+        // visible; otherwise it is already the title.
+        family
+          ? metricNames[0]
+          : metricNames.length === 1
+            ? "Prometheus"
+            : undefined,
         series.length === 0 ? "No series matched" : `${series.length} series`,
         windowLabel,
       ]

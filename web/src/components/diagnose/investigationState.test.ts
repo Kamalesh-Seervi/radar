@@ -358,6 +358,8 @@ describe("investigation evidence projection stability", () => {
         note("g2", "rules_out"),
       ]),
     ).toBe(null);
+    // A note on a superseded revision of the card is not an explanation of
+    // the card as it now stands.
     expect(
       investigationHealthConflictExplainedBy(projection, [
         note("g1", "benign"),
@@ -894,5 +896,122 @@ describe("investigationLiveCaseTurnIndex", () => {
     expect(
       investigationLiveCaseTurnIndex([assessment, cited, assessment], 2),
     ).toBe(2);
+  });
+});
+
+describe("adverse evidence and the healthy-conflict banner", () => {
+  const group = (kind: string, tone: string) => ({
+    id: `${kind}-1`,
+    kind,
+    historical: false,
+    latest: { tier: "supporting" as const, relevance: "target" as const, tone },
+  });
+
+  it("counts every kind Radar can capture a live problem in", () => {
+    // The round that added alerts and Helm cards forgot this rule, so a
+    // firing alert naming the workload sat under a green banner.
+    for (const kind of [
+      "issue",
+      "startup",
+      "crash",
+      "resource",
+      "logs",
+      "events",
+      "dns",
+      "network",
+      "alerts",
+      "helm",
+    ]) {
+      expect(
+        investigationEvidenceConflictsWithHealthy({
+          groups: [group(kind, "error")],
+        }),
+        kind,
+      ).toBe(true);
+    }
+    // A change, a receipt, a chart or a permission grant describe the world,
+    // not a problem in it.
+    for (const kind of [
+      "changes",
+      "receipt",
+      "metrics",
+      "permissions",
+      "relationships",
+      "topology",
+      "inventory",
+    ]) {
+      expect(
+        investigationEvidenceConflictsWithHealthy({
+          groups: [group(kind, "error")],
+        }),
+        kind,
+      ).toBe(false);
+    }
+  });
+
+  // `observe` splits one log stream read by two calls into two groups, so the
+  // explained check deliberately matches a note across groups sharing a kind
+  // and identity. That crossing must not reach forward in time: a later turn
+  // reading the same stream can report a different failure, and the
+  // assessment never saw it.
+  it("refuses a note as explaining a reading captured after the assessment", () => {
+    const logGroup = (id: string, turnIndex: number) => ({
+      id,
+      // Same stream, different calls: what the twin lookup exists for.
+      identity: "logs:current:api-7f6-a:api",
+      kind: "logs",
+      historical: false,
+      latest: {
+        tier: "supporting" as const,
+        relevance: "target" as const,
+        tone: "warning",
+        title: "Error logs",
+        source: { turnIndex },
+      },
+    });
+    const note = (groupId: string, turnIndex: number) => ({
+      role: "benign",
+      placement: "card" as const,
+      claim: "the warmup error clears once the cache fills",
+      groupId,
+      source: { turnIndex },
+    });
+
+    // Two calls in the assessment's own turn read the same stream. The note
+    // sits on one group and explains its twin as well.
+    expect(
+      investigationHealthConflictExplainedBy(
+        { groups: [logGroup("g-a", 0), logGroup("g-b", 0)] },
+        [note("g-a", 0)],
+      ),
+    ).toEqual(["Error logs", "Error logs"]);
+
+    // A later turn reads the same stream and reports a different failure.
+    // The turn-0 note was about something else and must not soften it.
+    expect(
+      investigationHealthConflictExplainedBy(
+        { groups: [logGroup("g-a", 0), logGroup("g-c", 1)] },
+        [note("g-a", 0)],
+      ),
+    ).toBe(null);
+  });
+
+  it("counts the intermediate alert tone, which carries every high severity", () => {
+    for (const tone of ["warning", "alert", "error"]) {
+      expect(
+        investigationEvidenceConflictsWithHealthy({
+          groups: [group("issue", tone)],
+        }),
+        tone,
+      ).toBe(true);
+    }
+    for (const tone of ["neutral", "info", "success"]) {
+      expect(
+        investigationEvidenceConflictsWithHealthy({
+          groups: [group("issue", tone)],
+        }),
+        tone,
+      ).toBe(false);
+    }
   });
 });

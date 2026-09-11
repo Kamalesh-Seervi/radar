@@ -1749,7 +1749,7 @@ describe("InvestigationEvidencePane honest result states", () => {
 
     const html = render(projection);
     expect(html).toContain("More evidence about this workload");
-    expect(html).toContain("No matching warning events");
+    expect(html).toContain("No warning events");
     expect(html).not.toContain("What Radar did not find");
     expect(html).not.toContain(`${receipt!.id}-body`);
   });
@@ -1845,7 +1845,7 @@ describe("InvestigationEvidencePane honest result states", () => {
     expect(projection.coverage.checked).toBe(0);
     expect(projection.groups).toHaveLength(0);
     expect(html).not.toContain('id="investigation-checked-heading"');
-    expect(html).not.toContain("No matching warning events");
+    expect(html).not.toContain("No warning events");
     expect(html).toContain("Evidence coverage is incomplete");
   });
 
@@ -2759,7 +2759,7 @@ describe("cited broader cards and coverage rows", () => {
       (group) => group.latest.data.type === "receipt",
     );
     expect(receipts.map((group) => group.latest.title)).toEqual([
-      "No events matched",
+      "No events in this window",
     ]);
     expect(receipts[0].latest.data).toMatchObject({
       type: "receipt",
@@ -2802,7 +2802,7 @@ describe("cited broader cards and coverage rows", () => {
     expect(projection.limitations[0].sources).toHaveLength(3);
     const html = render(projection);
     const message =
-      "Kubernetes events was narrowed to keep this investigation bounded. Additional matching evidence may exist.";
+      "Kubernetes events returned part of the matching results to keep this investigation fast. More may exist.";
     // Live region, strip summary, the group row's label and its text: never
     // a second identical detail row beneath it.
     expect(
@@ -2907,8 +2907,8 @@ describe("InvestigationEvidencePane metrics cards", () => {
     expect(partition.workload.map((group) => group.kind)).toEqual(["metrics"]);
     expect(partition.hiddenMetrics).toBe(0);
     const html = render(projection);
-    expect(html).toContain("container_memory_working_set_bytes");
-    expect(html).toContain("Prometheus · 1 series");
+    expect(html).toContain("Memory working set");
+    expect(html).toContain("container_memory_working_set_bytes · 1 series");
     expect(html).not.toContain("Prometheus metrics");
     expect(html).not.toContain("metric result");
   });
@@ -3060,9 +3060,7 @@ describe("InvestigationEvidencePane metrics cards", () => {
     expect(html).toContain(
       "1 series has a single sample in this window, listed with its time:",
     );
-    expect(html).toContain(
-      "1 series returned no finite values in this window: ",
-    );
+    expect(html).toContain("1 series had no usable samples in this window: ");
     expect(html).toContain("pod=api-7f6-abc, container=init");
     expect(html).not.toContain("2 series have a single sample");
   });
@@ -3152,6 +3150,62 @@ describe("InvestigationEvidencePane diagnose vitals", () => {
     ],
   };
 
+  it("says a window is clean only when changes were actually looked up", () => {
+    const withChanges = render(
+      project(
+        tool("diag", "diagnose", {
+          resource: {
+            apiVersion: "apps/v1",
+            kind: "Deployment",
+            metadata: { namespace: "shop", name: "api" },
+          },
+          pods: 1,
+          recentChanges: [],
+          metrics: vitals,
+        }),
+      ),
+    );
+    expect(withChanges).toContain(
+      "None of the changes Radar read fall in this window.",
+    );
+
+    // The same chart with no change lookup in the turn must stay silent: an
+    // empty marker list there means nobody looked, not that nothing happened.
+    const withoutChanges = render(
+      project(
+        tool("prom", "query_prometheus", {
+          query:
+            'sum(container_memory_working_set_bytes{namespace="shop",workload="api",workload_type="deployment"})',
+          type: "range",
+          ...window,
+          step: "60s",
+          series: [
+            {
+              labels: {},
+              dataPoints: [
+                { timestamp: Date.parse(window.start) / 1000, value: 1 },
+                { timestamp: Date.parse(window.end) / 1000, value: 2 },
+              ],
+            },
+          ],
+          selectors: [
+            {
+              metric: "container_memory_working_set_bytes",
+              matchers: [
+                { label: "namespace", op: "=", value: "shop" },
+                { label: "workload", op: "=", value: "api" },
+                { label: "workload_type", op: "=", value: "deployment" },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+    expect(withoutChanges).not.toContain(
+      "None of the changes Radar read fall in this window.",
+    );
+  });
+
   it("keeps an uncited diagnose chart in the workload collection and marks the same-turn change on it", () => {
     const projection = project(
       tool("diag", "diagnose", {
@@ -3200,7 +3254,7 @@ describe("InvestigationEvidencePane diagnose vitals", () => {
       partition.workload
         .filter((group) => group.kind === "receipt")
         .map((group) => group.latest.title),
-    ).toEqual(["No classified workload issues", "No matching warning events"]);
+    ).toEqual(["Radar's diagnosis found no live issues", "No warning events"]);
     const onOpenResource = vi.fn();
     const html = render(
       projection,

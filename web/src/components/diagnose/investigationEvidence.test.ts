@@ -859,10 +859,10 @@ describe("semantic diagnose evidence projection", () => {
     expect(limitationText).toContain("selected 2 of 5");
     expect(limitationText).toContain("includes 2 of 8 selected log lines");
     expect(limitationText).toContain("not the container's full log history");
-    expect(limitationText).toContain("Additional crash-cause");
+    expect(limitationText).toContain("part of the crash-cause candidates");
     expect(limitationText).toContain("received 1 of 3 event groups");
     expect(limitationText).toContain("rbac denied");
-    expect(limitationText).toContain("Referenced-by relationships");
+    expect(limitationText).toContain("referenced-by relationships");
     expect(limitationText).toContain("recent-change result limit");
     expect(result.coverage).toEqual({
       attempted: 1,
@@ -2849,10 +2849,10 @@ describe("honest zero and partial-result states", () => {
           group.latest.data.checked === "events",
       )?.latest,
     ).toMatchObject({
-      title: "No matching warning events",
-      data: {
-        message: "The warning-event query completed and returned no groups.",
-      },
+      // The title and the scope beside it are the whole answer here; a body
+      // would only restate them.
+      title: "No warning events",
+      data: { message: undefined },
     });
   });
 
@@ -3428,7 +3428,9 @@ describe("workload logs adapter", () => {
     expect(malformed.limitations[0].message).toContain(
       "couldn't summarize this investigation step",
     );
-    expect(malformed.limitations[2].message).toContain("3 resolved pods");
+    expect(malformed.limitations[2].message).toContain(
+      "Radar found 3 pods but got no logs from them",
+    );
   });
 });
 
@@ -3743,7 +3745,7 @@ describe("prometheus rules adapter", () => {
     expect(firing[0].latest).toMatchObject({
       tier: "checked",
       relevance: "target",
-      title: "No firing alert rules name this Deployment",
+      title: "No firing alerts matched this Deployment",
       summary: "Deployment shop/api",
       data: {
         type: "receipt",
@@ -4010,9 +4012,7 @@ describe("prometheus rules adapter", () => {
       ]),
     ).toHaveLength(0);
     expect(run([])).toHaveLength(1);
-    expect(run([])[0].latest.title).toBe(
-      "No firing alert rules name this Node",
-    );
+    expect(run([])[0].latest.title).toBe("No firing alerts matched this Node");
   });
 
   it("keeps recording rules off the card list and flags truncation and evaluation health", () => {
@@ -4998,220 +4998,6 @@ describe("card leads and deep-link subjects", () => {
   });
 });
 
-describe("live-run follow-ups", () => {
-  it("reads the producer's nil-slice null as an empty events or changes result", () => {
-    const projection = project([
-      tool(
-        "events-none",
-        "get_events",
-        { events: null },
-        {
-          summary: JSON.stringify({
-            kind: "Pod",
-            namespace: "shop",
-            name: "api",
-          }),
-        },
-      ),
-      tool(
-        "changes-none",
-        "get_changes",
-        { changes: null },
-        {
-          summary: JSON.stringify({
-            kind: "Deployment",
-            namespace: "shop",
-            name: "api",
-            since: "24h",
-          }),
-        },
-      ),
-    ]);
-    // A complete, successful events query that returned nothing is a checked
-    // receipt for its scope; the producer marks a denied namespace separately.
-    expect(
-      projection.groups.map((group) => [
-        group.latest.data.type,
-        group.latest.title,
-      ]),
-    ).toEqual([["receipt", "No events matched"]]);
-    expect(
-      projection.limitations.map((limitation) => [
-        limitation.source,
-        limitation.kind,
-      ]),
-    ).toEqual([["Recent changes", "unknown"]]);
-  });
-
-  it("merges identical startup blockers across pods into one card with the pod list", () => {
-    const blocker = (
-      name: string,
-      message = "1 node(s) no free host ports",
-    ) => ({
-      kind: "Pod",
-      name,
-      reason: "Unschedulable",
-      severity: "critical",
-      message,
-    });
-    const projection = project([
-      tool("diagnose", "diagnose", {
-        resource: {
-          apiVersion: "apps/v1",
-          kind: "DaemonSet",
-          metadata: { namespace: "opencost", name: "node-exporter" },
-        },
-        resourceContext: { tier: "basic" },
-        pods: 3,
-        startupBlockers: [
-          blocker("node-exporter-a"),
-          blocker("node-exporter-b"),
-          blocker("node-exporter-c", "0/10 nodes: insufficient memory"),
-        ],
-      }),
-    ]);
-    const startup = projection.groups.filter(
-      (group) => group.latest.data.type === "startup",
-    );
-    expect(
-      startup.map((group) => [
-        group.latest.summary,
-        group.latest.data.type === "startup" ? group.latest.data.pods : null,
-      ]),
-    ).toEqual([
-      [
-        "2 pods · 1 node(s) no free host ports",
-        ["node-exporter-a", "node-exporter-b"],
-      ],
-      ["0/10 nodes: insufficient memory", undefined],
-    ]);
-    // A single pod keeps the per-pod identity so saved runs still match.
-    expect(startup[1].id).not.toBe(startup[0].id);
-  });
-
-  it("folds pods' startup blocker into the classified issue that repeats it", () => {
-    const blocker = (name: string) => ({
-      kind: "Pod",
-      name,
-      reason: "Unschedulable",
-      severity: "critical",
-      message: "1 node(s) no free host ports",
-    });
-    const projection = project([
-      tool("diagnose", "diagnose", {
-        resource: {
-          apiVersion: "apps/v1",
-          kind: "DaemonSet",
-          metadata: { namespace: "opencost", name: "node-exporter" },
-        },
-        resourceContext: { tier: "basic" },
-        pods: 2,
-        relatedIssues: [
-          {
-            id: "issue-unsched",
-            severity: "critical",
-            source: "scheduling",
-            category: "unschedulable",
-            category_group: "startup",
-            grouping_scope: "workload",
-            kind: "DaemonSet",
-            namespace: "opencost",
-            name: "node-exporter",
-            reason: "Unschedulable",
-            message: "1 node(s) no free host ports",
-          },
-        ],
-        startupBlockers: [
-          blocker("node-exporter-a"),
-          blocker("node-exporter-b"),
-        ],
-      }),
-    ]);
-    expect(
-      projection.groups.filter((group) => group.latest.data.type === "startup"),
-    ).toHaveLength(0);
-    const [issue] = projection.groups.filter(
-      (group) => group.latest.data.type === "issue",
-    );
-    expect(
-      issue.latest.data.type === "issue" && issue.latest.data.pods,
-    ).toEqual(["node-exporter-a", "node-exporter-b"]);
-  });
-
-  it("files a denied events namespace as an access limitation, not a receipt", () => {
-    const projection = project([
-      tool(
-        "events-denied",
-        "get_events",
-        { events: [], accessDenied: true },
-        {
-          summary: JSON.stringify({ namespace: "locked", kind: "Pod" }),
-        },
-      ),
-    ]);
-    expect(projection.groups).toHaveLength(0);
-    expect(
-      projection.limitations.map((limitation) => [
-        limitation.source,
-        limitation.kind,
-      ]),
-    ).toEqual([["Events", "error"]]);
-    expect(projection.limitations[0].message).toContain(
-      "not readable with your permissions",
-    );
-  });
-
-  it("keeps repeated change reads of one resource on one card and names the window", () => {
-    const change = {
-      kind: "Deployment",
-      apiVersion: "apps/v1",
-      namespace: "shop",
-      name: "api",
-      changeType: "update",
-      timestamp: "2026-09-02T09:00:00Z",
-    };
-    const older = { ...change, timestamp: "2026-09-01T09:00:00Z" };
-    const read = (
-      id: string,
-      args: Record<string, unknown>,
-      changes: unknown[],
-    ) =>
-      tool(id, "get_changes", { changes }, { summary: JSON.stringify(args) });
-    const projection = project([
-      read(
-        "changes-24h",
-        { namespace: "shop", name: "api", since: "24h", kind: "Deployment" },
-        [change],
-      ),
-      read(
-        "changes-48h",
-        {
-          kind: "Deployment",
-          namespace: "shop",
-          name: "api",
-          since: "48h",
-          limit: 30,
-        },
-        [change, older],
-      ),
-      read("changes-ns", { namespace: "shop", since: "24h" }, [change]),
-    ]);
-    const changes = groupsOf(projection.groups, "changes");
-    expect(changes.map((group) => group.identity)).toEqual([
-      "changes:Deployment shop/api",
-      "changes:namespace shop",
-    ]);
-    expect(changes[0].observations).toHaveLength(2);
-    expect(changes[0].observations.map((o) => o.title)).toEqual([
-      "Recent changes · last 24h",
-      "Recent changes · last 48h",
-    ]);
-    expect(changes[0].latest.title).toBe("Recent changes · last 48h");
-    expect(changes[0].latest.summary).toBe("2 changes · Deployment shop/api");
-    expect(changes[1].latest.title).toBe("Recent changes · last 24h");
-  });
-});
-
 describe("query_prometheus evidence", () => {
   const rangeSeries = [
     {
@@ -5276,6 +5062,29 @@ describe("query_prometheus evidence", () => {
     };
   }
 
+  it("keeps an unrecognised metric's own name as the title", () => {
+    const projection = project([
+      tool(
+        "prom",
+        "query_prometheus",
+        promResult({
+          query: 'sum(acme_widget_queue_depth{namespace="shop"})',
+          selectors: [
+            {
+              metric: "acme_widget_queue_depth",
+              matchers: [{ label: "namespace", op: "=", value: "shop" }],
+            },
+          ],
+        }),
+      ),
+    ]);
+    const [group] = groupsOf(projection.groups, "metrics");
+    expect(group.latest.title).toBe("acme_widget_queue_depth");
+    // No family label means the summary keeps its generic lead-in rather than
+    // repeating the name already in the title.
+    expect(group.latest.summary).toContain("Prometheus · 1 series");
+  });
+
   it("keeps the generic title when the selectors name no metric", () => {
     const projection = project([
       tool(
@@ -5309,9 +5118,9 @@ describe("query_prometheus evidence", () => {
     expect(group.latest.relevance).toBe("target");
     expect(group.latest.tier).toBe("supporting");
     expect(group.latest.tone).toBe("neutral");
-    expect(group.latest.title).toBe("container_memory_working_set_bytes");
+    expect(group.latest.title).toBe("Memory working set · Deployment shop/api");
     expect(group.latest.summary).toBe(
-      "Prometheus · 1 series · 2h window · 25s step",
+      "container_memory_working_set_bytes · 1 series · 2h window · 25s step",
     );
     const data = group.latest.data;
     if (data.type !== "metrics") throw new Error("expected metrics");
@@ -5382,8 +5191,10 @@ describe("query_prometheus evidence", () => {
       ),
     ]);
     const [group] = groupsOf(projection.groups, "metrics");
-    expect(group.latest.title).toBe("container_memory_working_set_bytes");
-    expect(group.latest.summary).toBe("Prometheus · 1 series");
+    expect(group.latest.title).toBe("Memory working set");
+    expect(group.latest.summary).toBe(
+      "container_memory_working_set_bytes · 1 series",
+    );
     expect(group.latest.data.type === "metrics" && group.latest.data.mode).toBe(
       "instant",
     );
@@ -5424,7 +5235,7 @@ describe("query_prometheus evidence", () => {
     ]);
     const [group] = groupsOf(projection.groups, "metrics");
     expect(group.latest.summary).toBe(
-      "Prometheus · No series matched · 2h window · 25s step",
+      "container_memory_working_set_bytes · No series matched · 2h window · 25s step",
     );
   });
 
@@ -6487,5 +6298,320 @@ describe("diagnose metrics evidence", () => {
         (item) => item.source === "Workload metrics" && item.kind === "unknown",
       ),
     ).toBe(true);
+  });
+});
+
+describe("live-run follow-ups", () => {
+  it("reads the producer's nil-slice null as an empty events or changes result", () => {
+    const projection = project([
+      tool(
+        "events-none",
+        "get_events",
+        { events: null },
+        {
+          summary: JSON.stringify({
+            kind: "Pod",
+            namespace: "shop",
+            name: "api",
+          }),
+        },
+      ),
+      tool(
+        "changes-none",
+        "get_changes",
+        { changes: null },
+        {
+          summary: JSON.stringify({
+            kind: "Deployment",
+            namespace: "shop",
+            name: "api",
+            since: "24h",
+          }),
+        },
+      ),
+    ]);
+    // A complete, successful events query that returned nothing is a checked
+    // receipt for its scope; the producer marks a denied namespace separately.
+    expect(
+      projection.groups.map((group) => [
+        group.latest.data.type,
+        group.latest.title,
+      ]),
+    ).toEqual([["receipt", "No events in this window"]]);
+    expect(
+      projection.limitations.map((limitation) => [
+        limitation.source,
+        limitation.kind,
+      ]),
+    ).toEqual([["Recent changes", "unknown"]]);
+  });
+
+  it("keeps one identity for a blocker whether one pod holds it or several", () => {
+    const blocker = (name: string) => ({
+      kind: "Pod",
+      name,
+      reason: "Unschedulable",
+      severity: "critical",
+      message: "1 node(s) no free host ports",
+    });
+    const bundle = (pods: string[]) => ({
+      resource: {
+        apiVersion: "apps/v1",
+        kind: "DaemonSet",
+        metadata: { namespace: "opencost", name: "node-exporter" },
+      },
+      resourceContext: { tier: "basic" },
+      pods: pods.length,
+      startupBlockers: pods.map(blocker),
+    });
+    // Two pods recover to one between diagnoses. The blocker is the same
+    // finding, so it must update its card rather than open a second one
+    // beside it saying the same thing.
+    const projection = projectInvestigationEvidence(
+      [
+        {
+          status: "done",
+          timeline: [tool("first", "diagnose", bundle(["a", "b"]))],
+        },
+        {
+          status: "done",
+          verify: true,
+          timeline: [tool("second", "diagnose", bundle(["a"]))],
+        },
+      ],
+      {
+        kind: "DaemonSet",
+        group: "apps",
+        namespace: "opencost",
+        name: "node-exporter",
+      },
+    );
+    const startup = projection.groups.filter(
+      (group) => group.latest.data.type === "startup",
+    );
+    expect(startup).toHaveLength(1);
+    expect(startup[0].observations).toHaveLength(2);
+    expect(startup[0].latest.summary).toBe("1 node(s) no free host ports");
+  });
+
+  it("merges identical startup blockers across pods into one card with the pod list", () => {
+    const blocker = (
+      name: string,
+      message = "1 node(s) no free host ports",
+    ) => ({
+      kind: "Pod",
+      name,
+      reason: "Unschedulable",
+      severity: "critical",
+      message,
+    });
+    const projection = project([
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "DaemonSet",
+          metadata: { namespace: "opencost", name: "node-exporter" },
+        },
+        resourceContext: { tier: "basic" },
+        pods: 3,
+        startupBlockers: [
+          blocker("node-exporter-a"),
+          blocker("node-exporter-b"),
+          blocker("node-exporter-c", "0/10 nodes: insufficient memory"),
+        ],
+      }),
+    ]);
+    const startup = projection.groups.filter(
+      (group) => group.latest.data.type === "startup",
+    );
+    expect(
+      startup.map((group) => [
+        group.latest.summary,
+        group.latest.data.type === "startup" ? group.latest.data.pods : null,
+      ]),
+    ).toEqual([
+      [
+        "2 pods · 1 node(s) no free host ports",
+        ["node-exporter-a", "node-exporter-b"],
+      ],
+      // A blocker only one pod holds still carries that pod, so the pods a
+      // later Prometheus query is proved against do not depend on how many
+      // happened to share a reason.
+      ["0/10 nodes: insufficient memory", ["node-exporter-c"]],
+    ]);
+    expect(startup[1].id).not.toBe(startup[0].id);
+  });
+
+  it("folds pods' startup blocker into the classified issue that repeats it", () => {
+    const blocker = (name: string) => ({
+      kind: "Pod",
+      name,
+      reason: "Unschedulable",
+      severity: "critical",
+      message: "1 node(s) no free host ports",
+    });
+    const projection = project([
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "DaemonSet",
+          metadata: { namespace: "opencost", name: "node-exporter" },
+        },
+        resourceContext: { tier: "basic" },
+        pods: 2,
+        relatedIssues: [
+          {
+            id: "issue-unsched",
+            severity: "critical",
+            source: "scheduling",
+            category: "unschedulable",
+            category_group: "startup",
+            grouping_scope: "workload",
+            kind: "DaemonSet",
+            namespace: "opencost",
+            name: "node-exporter",
+            reason: "Unschedulable",
+            message: "1 node(s) no free host ports",
+          },
+        ],
+        startupBlockers: [
+          blocker("node-exporter-a"),
+          blocker("node-exporter-b"),
+        ],
+      }),
+    ]);
+    expect(
+      projection.groups.filter((group) => group.latest.data.type === "startup"),
+    ).toHaveLength(0);
+    const [issue] = projection.groups.filter(
+      (group) => group.latest.data.type === "issue",
+    );
+    expect(
+      issue.latest.data.type === "issue" && issue.latest.data.pods,
+    ).toEqual(["node-exporter-a", "node-exporter-b"]);
+  });
+
+  it("files a denied events namespace as an access limitation, not a receipt", () => {
+    const projection = project([
+      tool(
+        "events-denied",
+        "get_events",
+        { events: [], accessDenied: true },
+        {
+          summary: JSON.stringify({ namespace: "locked", kind: "Pod" }),
+        },
+      ),
+    ]);
+    expect(projection.groups).toHaveLength(0);
+    expect(
+      projection.limitations.map((limitation) => [
+        limitation.source,
+        limitation.kind,
+      ]),
+    ).toEqual([["Events", "error"]]);
+    expect(projection.limitations[0].message).toContain(
+      "not readable with your permissions",
+    );
+  });
+
+  it("keeps a cluster-wide events read that was narrowed to readable namespaces from reading as a clean cluster", () => {
+    const empty = project([
+      tool(
+        "events-partial-empty",
+        "get_events",
+        { events: [], partialScope: true, scopeNamespaces: ["alpha", "beta"] },
+        { summary: JSON.stringify({}) },
+      ),
+    ]);
+    const [receipt] = groupsOf(empty.groups, "receipt");
+    expect(receipt.latest.title).toBe(
+      "No events in the namespaces you can read",
+    );
+    const narrowedBody =
+      receipt.latest.data.type === "receipt" ? receipt.latest.data.message : "";
+    expect(narrowedBody).toContain("alpha, beta");
+    // The load-bearing half: an empty answer from the namespaces a reader can
+    // see must never read as an answer about the cluster.
+    expect(narrowedBody).toContain("does not clear the cluster");
+    expect(empty.limitations).toHaveLength(0);
+
+    const found = project([
+      tool(
+        "events-partial",
+        "get_events",
+        {
+          events: [
+            {
+              type: "Warning",
+              reason: "BackOff",
+              message: "back-off restarting",
+              count: 3,
+              lastTimestamp: "2026-09-02T09:00:00Z",
+              involvedObject: { kind: "Pod", namespace: "alpha", name: "api" },
+            },
+          ],
+          partialScope: true,
+          scopeNamespaces: ["alpha", "beta"],
+        },
+        { summary: JSON.stringify({}) },
+      ),
+    ]);
+    expect(
+      found.limitations.map((limitation) => [
+        limitation.source,
+        limitation.kind,
+      ]),
+    ).toEqual([["Events", "unknown"]]);
+    expect(found.limitations[0].message).toContain("alpha, beta");
+  });
+
+  it("keeps repeated change reads of one resource on one card and names the window", () => {
+    const change = {
+      kind: "Deployment",
+      apiVersion: "apps/v1",
+      namespace: "shop",
+      name: "api",
+      changeType: "update",
+      timestamp: "2026-09-02T09:00:00Z",
+    };
+    const older = { ...change, timestamp: "2026-09-01T09:00:00Z" };
+    const read = (
+      id: string,
+      args: Record<string, unknown>,
+      changes: unknown[],
+    ) =>
+      tool(id, "get_changes", { changes }, { summary: JSON.stringify(args) });
+    const projection = project([
+      read(
+        "changes-24h",
+        { namespace: "shop", name: "api", since: "24h", kind: "Deployment" },
+        [change],
+      ),
+      read(
+        "changes-48h",
+        {
+          kind: "Deployment",
+          namespace: "shop",
+          name: "api",
+          since: "48h",
+          limit: 30,
+        },
+        [change, older],
+      ),
+      read("changes-ns", { namespace: "shop", since: "24h" }, [change]),
+    ]);
+    const changes = groupsOf(projection.groups, "changes");
+    expect(changes.map((group) => group.identity)).toEqual([
+      "changes:Deployment shop/api",
+      "changes:namespace shop",
+    ]);
+    expect(changes[0].observations).toHaveLength(2);
+    expect(changes[0].observations.map((o) => o.title)).toEqual([
+      "Recent changes · last 24h",
+      "Recent changes · last 48h",
+    ]);
+    expect(changes[0].latest.title).toBe("Recent changes · last 48h");
+    expect(changes[0].latest.summary).toBe("2 changes · Deployment shop/api");
+    expect(changes[1].latest.title).toBe("Recent changes · last 24h");
   });
 });
