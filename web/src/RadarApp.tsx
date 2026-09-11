@@ -42,6 +42,7 @@ import type { TimelineSourceConfig } from "./api/timelineSource";
 import { DiagnoseCustomizationProvider } from "./context/DiagnoseCustomization";
 import type {
   RenderDiagnoseAction,
+  RenderInvestigationRunActions,
   DiagnoseConsentCopy,
 } from "./context/DiagnoseCustomization";
 import { defaultDiagnoseAction } from "./components/diagnose/LocalDiagnoseAction";
@@ -113,6 +114,8 @@ export interface RadarAppProps {
    * agent-free. See ./context/DiagnoseCustomization for the render-prop shape.
    */
   renderDiagnoseAction?: RenderDiagnoseAction;
+  /** Host-owned controls for the focused investigation; absent in standalone Radar. */
+  renderInvestigationRunActions?: RenderInvestigationRunActions;
   /**
    * Replaces the first-run consent card's trust copy. REQUIRED of any host whose
    * backend runs the agent somewhere other than the user's own machine — the
@@ -202,6 +205,7 @@ export function RadarApp({
   manageDocumentTitle = false,
   documentTitleSuffix,
   renderDiagnoseAction,
+  renderInvestigationRunActions,
   diagnoseConsent,
   initialPath,
   onClusterLoadStateChange,
@@ -234,6 +238,7 @@ export function RadarApp({
                 <DiagnoseCustomizationProvider
                   value={renderDiagnoseAction ?? defaultDiagnoseAction}
                   consentCopy={diagnoseConsent}
+                  renderRunActions={renderInvestigationRunActions}
                 >
                   <DiagnoseProvider
                     browserURLState={router !== "memory"}
