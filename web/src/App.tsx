@@ -53,6 +53,7 @@ import { DiagnosticsOverlay } from './components/ui/DiagnosticsOverlay'
 import { useEventSource } from './hooks/useEventSource'
 import { debugNamespaceLog, useNamespaces, useNamespaceScope, useSetActiveNamespace, useSwitchContext, useAuthMe, useAudit } from './api/client'
 import { buildAuditSeverityMap } from './utils/auditBadges'
+import { isInNamespaceScope, scopeNodesToNamespaces } from './utils/topology-namespace'
 import { routePath, apiUrl, getAuthHeaders, getCredentialsMode, stripBasename } from './api/config'
 import { KeyboardShortcutProvider, useRegisterShortcut, useRegisterShortcuts, useSuppressBaseShortcuts } from './hooks/useKeyboardShortcuts'
 import { useAnimatedUnmount } from './hooks/useAnimatedUnmount'
@@ -1604,8 +1605,7 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
     // Filter by namespace (client-side) and by visible kinds
     const nsSet = namespaces.length > 0 ? new Set(namespaces) : null
     const filteredNodes = displayedTopology.nodes.filter(node =>
-      effectiveKinds.has(node.kind) &&
-      (!nsSet || nsSet.has(node.data.namespace as string) || !(node.data.namespace as string))
+      effectiveKinds.has(node.kind) && isInNamespaceScope(node, nsSet)
     )
     const filteredNodeIds = new Set(filteredNodes.map(n => n.id))
 
@@ -1629,6 +1629,16 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
       edges: filteredEdges,
     }
   }, [displayedTopology, visibleKinds, namespaces, topologyMode])
+
+  // Namespace-scoped but NOT kind-filtered: the sidebar derives its kind list
+  // and visible/hidden footer counts from this prop, so handing it the
+  // kind-filtered graph nodes would drop every hidden kind from the list and
+  // "hidden" would always read zero. Reads displayedTopology so the counts
+  // freeze with the graph while paused.
+  const filterSidebarNodes = useMemo(() => {
+    if (!displayedTopology) return []
+    return scopeNodesToNamespaces(displayedTopology.nodes, namespaces)
+  }, [displayedTopology, namespaces])
 
   // Cluster Audit findings, joined onto topology nodes by the audit key the
   // backend stamps on each node (data.auditKey). Only badge-worthy findings
@@ -2182,14 +2192,14 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
               <>
                 {/* Filter sidebar */}
                 <TopologyFilterSidebar
-                  nodes={topology?.nodes || []}
+                  nodes={filterSidebarNodes}
                   visibleKinds={visibleKinds}
                   onToggleKind={handleToggleKind}
                   onShowAll={handleShowAllKinds}
                   onHideAll={handleHideAllKinds}
                   collapsed={filterSidebarCollapsed}
                   onToggleCollapse={() => setFilterSidebarCollapsed(prev => !prev)}
-                  hiddenKinds={topology?.hiddenKinds}
+                  hiddenKinds={displayedTopology?.hiddenKinds}
                   onEnableHiddenKind={(kind) => {
                     setVisibleKinds(prev => new Set(prev).add(kind as NodeKind))
                     console.log(`[topology] User requested to show hidden kind: ${kind}`)
