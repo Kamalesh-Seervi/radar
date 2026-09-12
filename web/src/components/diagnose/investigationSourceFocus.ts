@@ -29,6 +29,12 @@ export function evidenceSourceExcerpt(
         ? keys[0]
         : undefined;
     }
+    case "helm":
+      return data.release.healthIssue;
+    case "permissions":
+      return data.accessCheck?.reason;
+    case "metrics":
+      return data.query;
     default:
       return undefined;
   }

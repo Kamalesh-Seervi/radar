@@ -1,5 +1,6 @@
 // Pure presentation decisions over the durable transcript and evidence projection.
 // Keep React/DOM orchestration in InvestigationView; these rules have no UI runtime.
+import { evidenceKindIsAdverse } from "./investigationEvidenceKinds";
 import {
   DiagnoseError,
   type DiagnoseStreamEvent,
@@ -271,6 +272,35 @@ export function investigationEvidenceInputsEqual(
   return true;
 }
 
+/**
+ * The turn whose agent case annotates the Evidence pane. A follow-up answer
+ * that cites evidence ("chart this and cite it") must reach Findings, so the
+ * newest completed non-apply, non-explanation turn carrying a bound case or
+ * linked root-cause refs wins; earlier turns keep their case read-only.
+ */
+export function investigationLiveCaseTurnIndex(
+  turns: readonly Pick<
+    Turn,
+    "status" | "apply" | "explainAssessment" | "diagnosis"
+  >[],
+  currentAssessmentIdx: number,
+): number {
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (turn.status !== "done" || turn.apply || turn.explainAssessment)
+      continue;
+    const diagnosis = turn.diagnosis;
+    if (!diagnosis) continue;
+    if (
+      diagnosis.evidence?.some((item) => item.status === "linked") ||
+      (diagnosis.rootCause && diagnosis.rootCauseEvidence?.status === "linked")
+    ) {
+      return Math.max(index, currentAssessmentIdx);
+    }
+  }
+  return currentAssessmentIdx;
+}
+
 export function investigationEvidenceCoverageLimited(
   projection: Pick<
     InvestigationEvidenceProjection,
@@ -306,42 +336,134 @@ export function investigationEvidenceCoverageLimited(
   );
 }
 
-const HEALTH_CONFLICT_EVIDENCE_KINDS = new Set([
-  "issue",
-  "startup",
-  "crash",
-  "resource",
-  "logs",
-  "events",
-  "dns",
-  "network",
-]);
-
 /**
  * A model-authored all-clear must not overrule active adverse Radar evidence.
  * Context-only warnings (for example a Helm ownership advisory) and ordinary
  * recent changes are deliberately excluded: they are useful context, not proof
  * that the investigated resource is unhealthy.
  */
-export function investigationEvidenceConflictsWithHealthy(projection: {
-  groups: readonly {
-    historical: boolean;
-    kind: string;
-    latest: {
-      relevance: "target" | "producer-related" | "broader";
-      tier: "key" | "supporting" | "context" | "checked";
-      tone: string;
-    };
-  }[];
-}): boolean {
-  return projection.groups.some(
+interface HealthConflictGroup {
+  id?: string;
+  /** Display identity; logs partition into several groups sharing one. */
+  identity?: string;
+  historical: boolean;
+  kind: string;
+  latest: {
+    relevance: "target" | "producer-related" | "broader";
+    tier: "key" | "supporting" | "context" | "checked";
+    tone: string;
+    title?: string;
+    /** Which turn captured this reading; a note cannot explain a later one. */
+    source?: { turnIndex: number };
+  };
+}
+
+export function investigationHealthConflictGroups<
+  G extends HealthConflictGroup,
+>(projection: { groups: readonly G[] }): G[] {
+  return projection.groups.filter(
     (group) =>
       !group.historical &&
       group.latest.relevance !== "broader" &&
       (group.latest.tier === "key" || group.latest.tier === "supporting") &&
-      (group.latest.tone === "warning" || group.latest.tone === "error") &&
-      HEALTH_CONFLICT_EVIDENCE_KINDS.has(group.kind),
+      // Radar's adverse tones run warning → alert → error; "high" severity
+      // from the Go side lands on alert, so leaving it out silently excused
+      // every high-severity finding.
+      (group.latest.tone === "warning" ||
+        group.latest.tone === "alert" ||
+        group.latest.tone === "error") &&
+      evidenceKindIsAdverse(group.kind),
   );
+}
+
+export function investigationEvidenceConflictsWithHealthy(projection: {
+  groups: readonly HealthConflictGroup[];
+}): boolean {
+  return investigationHealthConflictGroups(projection).length > 0;
+}
+
+/**
+ * The banner over a healthy verdict points at adverse Radar evidence. When the
+ * agent placed a "not a problem" note on every such card, the evidence is
+ * still shown but the reader has the agent's reason next to it, so the banner
+ * can say that instead of accusing evidence the agent addressed.
+ * Returns the titles of the explained cards, or null when any conflict is
+ * unexplained (or there is no conflict).
+ */
+export function investigationHealthConflictExplainedBy(
+  projection: { groups: readonly HealthConflictGroup[] },
+  caseItems:
+    | readonly {
+        role: string;
+        placement: "card" | "revision" | "source";
+        claim: string;
+        groupId?: string;
+        source?: { turnIndex: number };
+      }[]
+    | undefined,
+): string[] | null {
+  const conflicting = investigationHealthConflictGroups(projection);
+  if (conflicting.length === 0 || !caseItems) return null;
+  // `observe` keeps a log stream read through two different calls in separate
+  // groups, so a same-named pod from another workload's call cannot inherit
+  // the target's relevance. That partition must not also decide whether the
+  // agent addressed the stream: it explained one card, and the conflict is
+  // recorded on its twin. Group ids that share an identity are the same
+  // underlying observation for this question.
+  const twins = new Map<string, Set<string>>();
+  for (const group of projection.groups) {
+    if (!group.id || !group.identity) continue;
+    const key = `${group.kind}\u0000${group.identity}`;
+    const ids = twins.get(key) ?? new Set<string>();
+    ids.add(group.id);
+    twins.set(key, ids);
+  }
+  const titles: string[] = [];
+  for (const group of conflicting) {
+    const sameStream =
+      (group.identity && twins.get(`${group.kind}\u0000${group.identity}`)) ||
+      new Set<string>([group.id ?? ""]);
+    const onGroup = caseItems.filter(
+      (item) => item.groupId && sameStream.has(item.groupId),
+    );
+    // The agent contradicting itself is not an explanation. If it also called
+    // this card a cause or a symptom, it is asserting the problem, and the
+    // reader must see the unqualified warning.
+    if (
+      onGroup.some((item) => item.role === "cause" || item.role === "symptom")
+    )
+      return null;
+    const explained = onGroup.some(
+      (item) =>
+        // Only a note the reader can actually see on the card in front of
+        // them addresses it. A `source` item renders away from the card and a
+        // `revision` item addressed a superseded read of it, so neither
+        // speaks to the state the banner is qualifying; an empty claim shows
+        // nothing at all, and the banner would be citing a note that is not
+        // there. None of this judges whether the agent is right — that is why
+        // the banner stays a warning either way.
+        item.placement === "card" &&
+        item.claim.trim() !== "" &&
+        // Only `benign` says this evidence does not indicate a live problem.
+        // `rules_out` excludes some other hypothesis and `demoted` says the
+        // card is peripheral — both true of a still-active problem — so
+        // neither reconciles a healthy verdict with evidence contradicting it.
+        item.role === "benign" &&
+        // An assessment cannot have addressed a reading taken after it. The
+        // twin lookup above deliberately crosses calls, because one log
+        // stream read twice lands in two groups; without this, it would also
+        // let a note about an earlier failure explain a different one that
+        // the same stream reported in a later turn.
+        !(
+          group.latest.source !== undefined &&
+          item.source !== undefined &&
+          group.latest.source.turnIndex > item.source.turnIndex
+        ),
+    );
+    if (!explained) return null;
+    titles.push(group.latest.title ?? group.kind);
+  }
+  return titles;
 }
 
 export function investigationEndedBeforeConclusion(

@@ -24,7 +24,12 @@ import {
 import type { DiagnosisResourceRef } from "./diagnoseEvidenceTypes";
 import type { Diagnosis } from "../../api/diagnose";
 import { AssessmentSources, ResultCard } from "./parts";
-import { investigationEvidenceCoverageLimited } from "./investigationState";
+import {
+  investigationEvidenceConflictsWithHealthy,
+  investigationEvidenceCoverageLimited,
+} from "./investigationState";
+import { groupEvidenceCoverage } from "./investigationEvidencePresentation";
+import { metricsChangeMarkers } from "./investigationMetrics";
 
 const onViewSource = vi.fn();
 const target = {
@@ -763,7 +768,7 @@ describe("InvestigationEvidencePane hierarchy and provenance", () => {
     const projection = project(
       tool(
         "metrics-cited",
-        "query_prometheus",
+        "discover_metrics",
         { result: [1] },
         { evidenceRef: ref },
       ),
@@ -778,7 +783,7 @@ describe("InvestigationEvidencePane hierarchy and provenance", () => {
     const sources = renderToStaticMarkup(
       <AssessmentSources resolution={resolution} onViewSource={onViewSource} />,
     );
-    expect(sources).toContain("Query Prometheus");
+    expect(sources).toContain("Discover Metrics");
     expect(sources).toContain("Sources used for this assessment");
     expect(html).not.toContain("Cited sources in Activity");
     expect(html).not.toContain("Agent-selected check");
@@ -1744,7 +1749,7 @@ describe("InvestigationEvidencePane honest result states", () => {
 
     const html = render(projection);
     expect(html).toContain("More evidence about this workload");
-    expect(html).toContain("No matching warning events");
+    expect(html).toContain("No warning events");
     expect(html).not.toContain("What Radar did not find");
     expect(html).not.toContain(`${receipt!.id}-body`);
   });
@@ -1840,7 +1845,7 @@ describe("InvestigationEvidencePane honest result states", () => {
     expect(projection.coverage.checked).toBe(0);
     expect(projection.groups).toHaveLength(0);
     expect(html).not.toContain('id="investigation-checked-heading"');
-    expect(html).not.toContain("No matching warning events");
+    expect(html).not.toContain("No warning events");
     expect(html).toContain("Evidence coverage is incomplete");
   });
 
@@ -2166,5 +2171,1441 @@ describe("InvestigationEvidencePane honest result states", () => {
     expect(html).toContain("Previous observations");
     expect(html).toContain("Earlier does not mean resolved.");
     expect(html).toContain("CrashLoopBackOff");
+  });
+});
+
+describe("Track A evidence bodies and deep links", () => {
+  const changeArgs = JSON.stringify({
+    kind: "Deployment",
+    namespace: "shop",
+    name: "api",
+  });
+  const change = {
+    kind: "Deployment",
+    apiVersion: "apps/v1",
+    namespace: "shop",
+    name: "api",
+    changeType: "update",
+    timestamp: "2026-09-02T09:00:00Z",
+  };
+
+  function renderWithNav(
+    projection: InvestigationEvidenceProjection,
+    nav: {
+      onOpenResource?: (ref: DiagnosisResourceRef) => void;
+      onOpenTimeline?: (scope: { namespace?: string; name: string }) => void;
+    },
+  ): string {
+    return renderToStaticMarkup(
+      <InvestigationEvidencePane
+        projection={projection}
+        collecting={false}
+        animateGroupIds={new Set()}
+        onViewSource={onViewSource}
+        onViewActivity={() => {}}
+        onOpenResource={nav.onOpenResource}
+        onOpenTimeline={nav.onOpenTimeline}
+      />,
+    );
+  }
+
+  it("renders each workload-logs stream as its own card from one source", () => {
+    const projection = project(
+      tool(
+        "wl",
+        "get_workload_logs",
+        {
+          workload: "deployments/shop/api",
+          pods: 1,
+          logs: [
+            {
+              pod: "api-68c7b766dc-fmphn",
+              container: "api",
+              logs: {
+                lines: [
+                  "2026-09-07T08:00:21Z MongoServerError: Authentication failed.",
+                ],
+                totalLines: 50,
+                matchedLines: 1,
+                fallback: false,
+              },
+            },
+            {
+              pod: "api-68c7b766dc-fmphn",
+              container: "istio-proxy",
+              logs: {
+                lines: ["2026-09-07T08:00:19Z info Envoy proxy is ready"],
+                totalLines: 12,
+                matchedLines: 0,
+                fallback: true,
+              },
+            },
+          ],
+        },
+        {
+          summary: JSON.stringify({
+            namespace: "shop",
+            name: "api",
+            kind: "deployment",
+          }),
+        },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.main.map((group) => group.latest.title)).toEqual([
+      "Current logs · api-68c7b766dc-fmphn / api",
+    ]);
+    expect(partition.workload.map((group) => group.latest.title)).toEqual([
+      "Current logs · api-68c7b766dc-fmphn / istio-proxy",
+    ]);
+    const html = render(projection, false, undefined, undefined, () => {});
+    expect(html).toContain("MongoServerError: Authentication failed.");
+    expect(html).toContain("Unfiltered log tail");
+    expect(html).toContain(
+      "Open current Pod shop/api-68c7b766dc-fmphn in Radar",
+    );
+    expect(
+      html.match(
+        new RegExp(investigationEvidenceSourceDomId("turn-0-step-wl"), "g"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("renders a firing alert rule with its target instance first and the rule text", () => {
+    const projection = project(
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        resourceContext: { tier: "basic" },
+        logsCurrent: [
+          {
+            pod: "api-68c7b766dc-fmphn",
+            container: "api",
+            logs: {
+              lines: ["ready"],
+              totalLines: 1,
+              matchedLines: 0,
+              fallback: true,
+            },
+          },
+        ],
+      }),
+      tool(
+        "rules",
+        "get_prometheus_rules",
+        {
+          count: 1,
+          rules: [
+            {
+              group: "kubernetes-apps",
+              type: "alerting",
+              name: "KubePodCrashLooping",
+              query:
+                'max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}[5m]) >= 1',
+              state: "firing",
+              health: "ok",
+              labels: { severity: "warning" },
+              annotations: {
+                summary: "Pod is crash looping.",
+                description:
+                  "Pod {{ $labels.namespace }}/{{ $labels.pod }} is in waiting state (reason: CrashLoopBackOff).",
+              },
+              alerts: [
+                {
+                  state: "firing",
+                  activeAt: "2026-09-07T07:58:00Z",
+                  value: "1e+00",
+                  labels: { namespace: "monitoring", pod: "other-abc" },
+                },
+                {
+                  state: "firing",
+                  activeAt: "2026-09-07T07:58:00Z",
+                  value: "1e+00",
+                  labels: {
+                    namespace: "shop",
+                    pod: "api-68c7b766dc-fmphn",
+                    container: "api",
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        { summary: JSON.stringify({ state: "firing" }) },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(
+      partition.main
+        .map((group) => group.latest.title)
+        .filter((title) => title.startsWith("KubePodCrashLooping")),
+    ).toEqual(["KubePodCrashLooping firing"]);
+    const html = render(projection);
+    expect(html).toContain("2 active instances, 1 naming Deployment shop/api");
+    expect(html).toContain("names this resource");
+    expect(html.indexOf("api-68c7b766dc-fmphn")).toBeLessThan(
+      html.indexOf("other-abc"),
+    );
+    expect(html).toContain("Pod is crash looping.");
+    expect(html).toContain("Rule expression");
+    expect(html).toContain("kube_pod_container_status_waiting_reason");
+    expect(html).toContain("a firing rule alone does not establish the cause");
+    expect(html).not.toContain("Open current");
+  });
+
+  it("renders a Helm release with its operation, health issue, and managed resources", () => {
+    const onOpenResource = vi.fn();
+    const projection = project(
+      tool(
+        "helm",
+        "get_helm_release",
+        {
+          name: "shop",
+          namespace: "shop",
+          chart: "shop",
+          chartVersion: "1.4.2",
+          appVersion: "2.0.0",
+          status: "pending-upgrade",
+          revision: 8,
+          updated: "2026-09-07T07:00:00Z",
+          description: "Preparing upgrade",
+          healthIssue: "Deployment shop/api has 0/1 ready replicas",
+          lastOperation: {
+            kind: "pending",
+            status: "stuck_pending",
+            source: "helm_status",
+            confidence: "high",
+            message: "Revision 8 has been pending-upgrade for 42m",
+          },
+          resources: [
+            {
+              kind: "Deployment",
+              apiVersion: "apps/v1",
+              name: "api",
+              namespace: "shop",
+              status: "Running",
+              ready: "0/1",
+              issue: "0/1 ready",
+            },
+            {
+              kind: "Job",
+              apiVersion: "batch/v1",
+              name: "shop-migrate",
+              namespace: "shop",
+              status: "Complete",
+              summary: "1/1 succeeded",
+            },
+          ],
+        },
+        { summary: JSON.stringify({ namespace: "shop", name: "shop" }) },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.main.map((group) => group.latest.title)).toEqual([
+      "Helm release shop/shop",
+    ]);
+    const html = render(
+      projection,
+      false,
+      undefined,
+      undefined,
+      onOpenResource,
+    );
+    expect(html).toContain("pending-upgrade");
+    expect(html).toContain("shop 1.4.2");
+    expect(html).toContain("revision 8");
+    expect(html).toContain("Last operation");
+    expect(html).toContain("stuck pending");
+    expect(html).toContain("Revision 8 has been pending-upgrade for 42m");
+    expect(html).toContain("Deployment shop/api has 0/1 ready replicas");
+    expect(html).toContain("0/1 ready");
+    expect(html).toContain("1/1 succeeded");
+    expect(html).toContain("Open current HelmRelease shop/shop in Radar");
+  });
+
+  it("renders an access check verdict and a subject's bindings", () => {
+    const projection = project(
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+          spec: { template: { spec: { serviceAccountName: "api-sa" } } },
+        },
+        resourceContext: { tier: "basic" },
+      }),
+      tool(
+        "check",
+        "get_subject_permissions",
+        {
+          subject: {
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+          },
+          accessCheck: {
+            verb: "get",
+            resource: "secrets",
+            namespace: "shop",
+            resourceName: "db-credentials",
+            allowed: false,
+            reason: "",
+          },
+        },
+        {
+          summary: JSON.stringify({
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+            verb: "get",
+            resource: "secrets",
+          }),
+        },
+      ),
+      tool(
+        "subject",
+        "get_subject_permissions",
+        {
+          subject: {
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+          },
+          bindings: [
+            {
+              bindingKind: "RoleBinding",
+              bindingNamespace: "shop",
+              bindingName: "api-reader",
+              roleKind: "Role",
+              roleNamespace: "shop",
+              roleName: "reader",
+              rulesCount: 3,
+            },
+            {
+              bindingKind: "ClusterRoleBinding",
+              bindingName: "system:basic-user",
+              roleKind: "ClusterRole",
+              roleName: "system:basic-user",
+              rulesCount: 1,
+              inheritedFromGroup: "system:authenticated",
+            },
+          ],
+          flatRules: [{ verbs: ["get"], resources: ["pods"] }],
+          usedByPods: ["shop/api-68c7b766dc-fmphn"],
+        },
+        {
+          summary: JSON.stringify({
+            kind: "ServiceAccount",
+            namespace: "shop",
+            name: "api-sa",
+          }),
+        },
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(
+      partition.main
+        .map((group) => group.latest.title)
+        .filter((title) => title.includes("api-sa")),
+    ).toEqual(["Service Account shop/api-sa cannot get secrets"]);
+    expect(
+      partition.workload
+        .map((group) => group.latest.title)
+        .filter((title) => title.includes("api-sa")),
+    ).toEqual(["Permissions of Service Account shop/api-sa"]);
+    const html = render(projection, false, undefined, undefined, () => {});
+    expect(html).toContain("not allowed");
+    expect(html).toContain("db-credentials");
+    expect(html).toContain("No RBAC rule allows it · namespace shop");
+    expect(html).toContain("api-reader");
+    expect(html).toContain("system:basic-user");
+    expect(html).toContain("via system:authenticated");
+    expect(html).toContain("3 rules");
+    expect(html).toContain("1 effective rules");
+    expect(html).toContain("shop/api-68c7b766dc-fmphn");
+    expect(html).toContain("Open current Service Account shop/api-sa in Radar");
+    expect(html).toContain("not what the workload has exercised");
+  });
+
+  it("offers a Timeline link only for changes cards whose producer named a resource", () => {
+    const onOpenTimeline = vi.fn();
+    const projection = project(
+      tool(
+        "changes",
+        "get_changes",
+        { changes: [change] },
+        { summary: changeArgs },
+      ),
+      tool(
+        "changes-ns",
+        "get_changes",
+        { changes: [change] },
+        { summary: JSON.stringify({ namespace: "shop" }) },
+      ),
+    );
+    const withLink = renderWithNav(projection, { onOpenTimeline });
+    expect(withLink.match(/Open the Timeline for shop\/api/g)).toHaveLength(1);
+    expect(withLink).not.toContain("Open the Timeline for shop<");
+    const withoutLink = renderWithNav(projection, {});
+    expect(withoutLink).not.toContain("Open the Timeline");
+  });
+
+  it("opens the relationship root's resource page from a relationships card", () => {
+    const projection = project(
+      tool(
+        "neighborhood",
+        "get_neighborhood",
+        {
+          root: {
+            kind: "Deployment",
+            group: "apps",
+            namespace: "shop",
+            name: "api",
+          },
+          subgraph: {
+            nodes: [
+              { id: "deployment/shop/api", kind: "Deployment", name: "api" },
+            ],
+            edges: [],
+          },
+          truncated: false,
+        },
+        {
+          summary: JSON.stringify({
+            kind: "Deployment",
+            namespace: "shop",
+            name: "api",
+          }),
+        },
+      ),
+    );
+    const html = render(projection, false, undefined, undefined, () => {});
+    expect(html).toContain("Relationships around Deployment api");
+    expect(html).toContain("Open current Deployment shop/api in Radar");
+  });
+
+  it("leads collapsed event cards with the event, keeping counts secondary", () => {
+    const projection = project(
+      tool(
+        "events",
+        "get_events",
+        {
+          events: [
+            {
+              reason: "BackOff",
+              message: "Back-off restarting failed container",
+              type: "Warning",
+              count: 4,
+              lastTimestamp: "2026-09-02T10:00:00Z",
+            },
+          ],
+        },
+        { summary: changeArgs },
+      ),
+    );
+    const html = render(projection);
+    const title = html.indexOf("Kubernetes events");
+    const lead = html.indexOf("BackOff: Back-off restarting failed container");
+    expect(lead).toBeGreaterThan(title);
+    expect(html).not.toContain("1 event group");
+    expect(html).toMatch(/BackOff<span[^>]*>×4<\/span>/);
+  });
+});
+
+describe("cited broader cards and coverage rows", () => {
+  const helmPayload = {
+    name: "prometheus",
+    namespace: "opencost",
+    chart: "prometheus",
+    chartVersion: "25.8.0",
+    status: "failed",
+    revision: 1,
+    updated: "2026-09-07T07:00:00Z",
+    healthIssue: "6/12 pods Unschedulable",
+    resources: [],
+  };
+  const permissionsPayload = {
+    subject: { kind: "ServiceAccount", namespace: "other", name: "worker" },
+    accessCheck: {
+      verb: "get",
+      resource: "secrets",
+      namespace: "other",
+      allowed: true,
+      reason: 'RBAC: allowed by ClusterRoleBinding "worker"',
+    },
+  };
+  const rulesPayload = {
+    count: 1,
+    rules: [
+      {
+        group: "general",
+        type: "alerting",
+        name: "TargetDown",
+        query: "up == 0",
+        state: "firing",
+        health: "ok",
+        labels: { severity: "warning" },
+        alerts: [
+          {
+            state: "firing",
+            labels: { namespace: "monitoring", job: "node-exporter" },
+          },
+        ],
+      },
+    ],
+  };
+
+  it("admits a cited helm, permissions or alerts card and counts the rest as withheld", () => {
+    const helmRef = evidenceRef("a", "b");
+    const permRef = evidenceRef("a", "c");
+    const rulesRef = evidenceRef("a", "d");
+    const projection = project(
+      tool("helm", "get_helm_release", helmPayload, {
+        summary: JSON.stringify({ namespace: "opencost", name: "prometheus" }),
+        evidenceRef: helmRef,
+      }),
+      tool("perm", "get_subject_permissions", permissionsPayload, {
+        summary: JSON.stringify({
+          kind: "ServiceAccount",
+          namespace: "other",
+          name: "worker",
+        }),
+        evidenceRef: permRef,
+      }),
+      tool("rules", "get_prometheus_rules", rulesPayload, {
+        summary: JSON.stringify({}),
+        evidenceRef: rulesRef,
+      }),
+      tool("cm", "get_resource", {
+        apiVersion: "v1",
+        kind: "ConfigMap",
+        metadata: { namespace: "shop", name: "vars" },
+      }),
+    );
+    const uncited = partitionInvestigationEvidence(projection.groups);
+    expect(uncited.main).toHaveLength(0);
+    expect(uncited.workload).toHaveLength(0);
+    expect(uncited.hiddenBroader).toBe(4);
+    expect(render(projection)).toContain(
+      "4 results about other resources are not shown; they appear here when the assessment cites them.",
+    );
+
+    const resolution = resolveInvestigationRootCauseEvidence(
+      projection,
+      { status: "linked", refs: [helmRef, permRef, rulesRef] },
+      0,
+    );
+    const cited = partitionInvestigationEvidence(projection.groups, resolution);
+    expect(cited.main.map((group) => group.latest.title).sort()).toEqual([
+      "Helm release opencost/prometheus",
+      "Service Account other/worker can get secrets",
+      "TargetDown firing",
+    ]);
+    expect(cited.hiddenBroader).toBe(1);
+
+    // A later turn's citations widen the selection; they never take one away.
+    // Replacing the assessment's resolution with a follow-up's used to push
+    // the assessment's own cited evidence back into the withheld count.
+    // A later turn's citation widens the selection; it never takes one away,
+    // and it carries the source that cited it so a broader card can actually
+    // be promoted rather than selected-but-withheld.
+    const withheld = projection.groups.find(
+      (group) => !cited.collectionByGroup.has(group.id),
+    );
+    expect(withheld).toBeDefined();
+    const widened = partitionInvestigationEvidence(
+      projection.groups,
+      resolution,
+      undefined,
+      [
+        {
+          groupId: withheld!.id,
+          source: withheld!.latest.source,
+        },
+      ],
+    );
+    for (const group of cited.main) {
+      expect(widened.main).toContain(group);
+    }
+    expect(widened.main).toContain(withheld);
+    expect(widened.hiddenBroader).toBe(cited.hiddenBroader - 1);
+    const html = render(projection, false, undefined, resolution);
+    expect(html).toContain("6/12 pods Unschedulable");
+    expect(html).toContain(
+      "1 result about another resource is not shown; it appears here when the assessment cites it.",
+    );
+  });
+
+  it("files a complete, empty events query as a checked receipt, not a coverage gap", () => {
+    const projection = project(
+      tool(
+        "events-empty",
+        "get_events",
+        { events: null },
+        {
+          summary: JSON.stringify({
+            kind: "Pod",
+            namespace: "shop",
+            name: "api-a",
+          }),
+        },
+      ),
+    );
+    expect(projection.limitations).toHaveLength(0);
+    const receipts = projection.groups.filter(
+      (group) => group.latest.data.type === "receipt",
+    );
+    expect(receipts.map((group) => group.latest.title)).toEqual([
+      "No events in this window",
+    ]);
+    expect(receipts[0].latest.data).toMatchObject({
+      type: "receipt",
+      checked: "events",
+    });
+    const html = render(projection);
+    expect(html).not.toContain("Evidence coverage is incomplete");
+    expect(html).not.toContain("does not establish that no events occurred");
+  });
+
+  it("renders a single-limitation coverage group once, with its source link", () => {
+    const narrowed = {
+      events: null,
+      narrowHint: "Pass a name to narrow the query.",
+    };
+    const projection = project(
+      tool("events-a", "get_events", narrowed, {
+        summary: JSON.stringify({
+          kind: "Pod",
+          namespace: "shop",
+          name: "api-a",
+        }),
+      }),
+      tool("events-b", "get_events", narrowed, {
+        summary: JSON.stringify({
+          kind: "Pod",
+          namespace: "shop",
+          name: "api-b",
+        }),
+      }),
+      tool("events-c", "get_events", narrowed, {
+        summary: JSON.stringify({
+          kind: "Pod",
+          namespace: "shop",
+          name: "api-c",
+        }),
+      }),
+    );
+    expect(projection.limitations).toHaveLength(1);
+    expect(projection.limitations[0].sources).toHaveLength(3);
+    const html = render(projection);
+    const message =
+      "Kubernetes events returned part of the matching results to keep this investigation fast. More may exist.";
+    // Live region, strip summary, the group row's label and its text: never
+    // a second identical detail row beneath it.
+    expect(
+      html.match(
+        new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
+      ),
+    ).toHaveLength(4);
+    expect(html).toContain("View latest in Activity");
+    expect(html).not.toContain('aria-controls=":r');
+
+    const twoRows = project(
+      tool(
+        "changes-err",
+        "get_changes",
+        { changes: [], sourcesErrored: ["timeline: permission denied"] },
+        { summary: JSON.stringify({ namespace: "shop" }) },
+      ),
+      tool(
+        "changes-hint",
+        "get_changes",
+        { changes: [], narrowHint: "narrow with since=" },
+        { summary: JSON.stringify({ namespace: "shop" }) },
+      ),
+    );
+    const grouped = groupEvidenceCoverage(twoRows.limitations);
+    expect(
+      grouped.find((group) => group.label === "Recent changes")?.limitations
+        .length,
+    ).toBeGreaterThan(1);
+    expect(render(twoRows)).toContain('aria-expanded="false"');
+  });
+});
+
+describe("grouped startup cards", () => {
+  it("opens to the pod names when several pods share one blocker", () => {
+    const blocker = (name: string) => ({
+      kind: "Pod",
+      name,
+      reason: "Unschedulable",
+      severity: "critical",
+      message: "1 node(s) no free host ports",
+    });
+    const projection = project(
+      tool("diagnose", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        resourceContext: { tier: "basic" },
+        pods: 2,
+        startupBlockers: [blocker("api-abc"), blocker("api-def")],
+      }),
+    );
+    const html = render(projection);
+    expect(html).toContain("2 pods · 1 node(s) no free host ports");
+    expect(html).toContain(">api-abc<");
+    expect(html).toContain(">api-def<");
+    expect(html).toContain('aria-expanded="false"');
+  });
+});
+
+describe("InvestigationEvidencePane metrics cards", () => {
+  const window = { start: "2026-09-06T07:00:00Z", end: "2026-09-06T09:00:00Z" };
+  const targetSelectors = [
+    {
+      metric: "container_memory_working_set_bytes",
+      matchers: [
+        { label: "namespace", op: "=", value: "shop" },
+        { label: "workload", op: "=", value: "api" },
+        { label: "workload_type", op: "=", value: "deployment" },
+      ],
+    },
+  ];
+  function rangeResult(selectors: unknown[], query?: string) {
+    return {
+      query:
+        query ??
+        'sum(container_memory_working_set_bytes{namespace="shop",workload="api",workload_type="deployment"})',
+      type: "range",
+      ...window,
+      step: "60s",
+      series: [
+        {
+          labels: {},
+          dataPoints: [
+            { timestamp: Date.parse(window.start) / 1000, value: 1 },
+            { timestamp: Date.parse(window.end) / 1000, value: 2 },
+          ],
+        },
+      ],
+      selectors,
+    };
+  }
+
+  it("keeps an uncited target-scoped chart in the workload collection", () => {
+    const projection = project(
+      tool("prom", "query_prometheus", rangeResult(targetSelectors)),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.main).toHaveLength(0);
+    expect(partition.workload.map((group) => group.kind)).toEqual(["metrics"]);
+    expect(partition.hiddenMetrics).toBe(0);
+    const html = render(projection);
+    expect(html).toContain("Memory working set");
+    expect(html).toContain("container_memory_working_set_bytes · 1 series");
+    expect(html).not.toContain("Prometheus metrics");
+    expect(html).not.toContain("metric result");
+  });
+
+  it("counts a withheld chart once, not in both lines", () => {
+    // The pane heads two separate lines with these counts — "results about
+    // other resources" and "broader metric results" — so a chart counted in
+    // both announces one withheld result as two, and the numbers stop summing.
+    const projection = project(
+      tool("prom", "query_prometheus", rangeResult([])),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.hiddenMetrics).toBe(1);
+    expect(partition.hiddenBroader).toBe(0);
+  });
+
+  it("withholds an uncited broader chart and says so", () => {
+    const projection = project(
+      tool("prom", "query_prometheus", rangeResult([])),
+      tool(
+        "prom-2",
+        "query_prometheus",
+        rangeResult([], "sum(machine_memory_bytes)"),
+      ),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.collectionByGroup.size).toBe(0);
+    expect(partition.hiddenMetrics).toBe(2);
+    const html = render(projection);
+    expect(html).toContain(
+      "2 broader metric results are not shown; they appear here when the assessment cites them.",
+    );
+    expect(html).not.toContain("Prometheus metrics");
+    expect(html).not.toContain("container_memory_working_set_bytes");
+  });
+
+  it("promotes a cited broader chart into main with its expression as the axis label", () => {
+    const ref = evidenceRef("a", "b");
+    const query =
+      "sum(rate(container_cpu_usage_seconds_total[5m])) by (namespace)";
+    const projection = project(
+      tool("prom", "query_prometheus", rangeResult([], query), {
+        evidenceRef: ref,
+      }),
+    );
+    const resolution = resolveInvestigationRootCauseEvidence(
+      projection,
+      { status: "linked", refs: [ref] },
+      0,
+    );
+    expect(resolution.status).toBe("linked");
+    const partition = partitionInvestigationEvidence(
+      projection.groups,
+      resolution,
+    );
+    expect(partition.main.map((group) => group.kind)).toEqual(["metrics"]);
+    expect(partition.hiddenMetrics).toBe(0);
+    const html = render(projection, false, undefined, resolution);
+    expect(html).toContain("Prometheus metrics");
+    expect(html).toContain("1 series · 2h window · 60s step");
+    expect(html).not.toContain("metric result");
+  });
+
+  it("lists single-sample series with their time instead of an empty chart, and names aggregated series", () => {
+    const start = Date.parse(window.start) / 1000;
+    const projection = project(
+      tool("prom", "query_prometheus", {
+        ...rangeResult(
+          targetSelectors,
+          "sum by (container) (rate(container_cpu_usage_seconds_total[5m]))",
+        ),
+        series: [
+          {
+            labels: { container: "api" },
+            dataPoints: [
+              { timestamp: start, value: 0.2 },
+              { timestamp: start + 60, value: 0.4 },
+            ],
+          },
+          {
+            labels: { container: "envoy" },
+            dataPoints: [
+              { timestamp: start, value: 0.1 },
+              { timestamp: start + 60, value: 0.1 },
+            ],
+          },
+          {
+            labels: { container: "init" },
+            dataPoints: [{ timestamp: start + 120, value: 0.05 }],
+          },
+        ],
+      }),
+      tool("sparse", "query_prometheus", {
+        ...rangeResult(targetSelectors, "up"),
+        series: [
+          {
+            labels: { pod: "api-7f6-abc" },
+            dataPoints: [{ timestamp: start + 30, value: 1 }],
+          },
+        ],
+      }),
+    );
+    const html = render(projection);
+    expect(html).toContain("container=api");
+    expect(html).toContain("container=envoy");
+    expect(html).not.toContain("series-0");
+    expect(html).toContain(
+      "1 series has a single sample in this window, listed with its time:",
+    );
+    expect(html).toContain("container=init");
+    expect(
+      html.match(/data-testid="investigation-metrics-sparse-series"/g),
+    ).toHaveLength(2);
+    expect(html).toContain("api-7f6-abc");
+  });
+
+  it("keeps series that differ only by a hidden label distinguishable across chart and table, and names null-only series honestly", () => {
+    const start = Date.parse(window.start) / 1000;
+    const projection = project(
+      tool("prom", "query_prometheus", {
+        ...rangeResult(
+          targetSelectors,
+          'rate(container_cpu_usage_seconds_total{namespace="shop",workload="api"}[5m])',
+        ),
+        series: [
+          {
+            labels: { pod: "api-7f6-abc", container: "api" },
+            dataPoints: [
+              { timestamp: start, value: 0.2 },
+              { timestamp: start + 60, value: 0.4 },
+            ],
+          },
+          {
+            labels: { pod: "api-7f6-abc", container: "envoy" },
+            dataPoints: [{ timestamp: start + 120, value: 0.05 }],
+          },
+          {
+            labels: { pod: "api-7f6-abc", container: "init" },
+            dataPoints: [
+              { timestamp: start, value: null },
+              { timestamp: start + 60, value: null },
+            ],
+          },
+        ],
+      }),
+    );
+    const html = render(projection);
+    expect(html).toContain("pod=api-7f6-abc, container=envoy");
+    expect(html).toContain(
+      "1 series has a single sample in this window, listed with its time:",
+    );
+    expect(html).toContain("1 series had no usable samples in this window: ");
+    expect(html).toContain("pod=api-7f6-abc, container=init");
+    expect(html).not.toContain("2 series have a single sample");
+  });
+
+  it("draws same-turn changes to the subject on the chart and links the subject", () => {
+    const projection = project(
+      tool("diag", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        resourceContext: {
+          tier: "diagnostic",
+          uses: {
+            configMaps: [
+              { kind: "ConfigMap", namespace: "shop", name: "api-config" },
+            ],
+          },
+        },
+        recentChanges: [
+          {
+            kind: "ConfigMap",
+            apiVersion: "v1",
+            namespace: "shop",
+            name: "api-config",
+            changeType: "update",
+            timestamp: "2026-09-06T07:30:00Z",
+          },
+          {
+            kind: "Deployment",
+            apiVersion: "apps/v1",
+            namespace: "shop",
+            name: "worker",
+            changeType: "update",
+            timestamp: "2026-09-06T08:00:00Z",
+          },
+        ],
+        pods: 1,
+      }),
+      tool("prom", "query_prometheus", rangeResult(targetSelectors)),
+    );
+    const onOpenResource = vi.fn();
+    const html = render(
+      projection,
+      false,
+      undefined,
+      undefined,
+      onOpenResource,
+    );
+    expect(html).toContain('data-chart-annotation="change"');
+    expect(html.match(/data-chart-annotation="change"/g)).toHaveLength(1);
+    expect(html).toContain("ConfigMap api-config");
+    expect(html).not.toContain("Deployment worker");
+    expect(html).toContain(
+      "1 change recorded in this window is marked on the chart.",
+    );
+    expect(html).toContain("Open current Deployment shop/api in Radar");
+  });
+});
+
+describe("InvestigationEvidencePane diagnose vitals", () => {
+  const window = {
+    start: "2026-09-06T07:00:00Z",
+    end: "2026-09-06T08:00:00Z",
+    step: "1m2s",
+  };
+  const vitals = {
+    window,
+    pods: 1,
+    series: [
+      {
+        category: "cpu",
+        unit: "cores",
+        query:
+          "sum(rate(container_cpu_usage_seconds_total{container!='',namespace='shop',pod=~'^(api-abc)$'}[5m]))",
+        series: [
+          {
+            labels: {},
+            dataPoints: [
+              { timestamp: Date.parse(window.start) / 1000, value: 0.12 },
+              { timestamp: Date.parse(window.end) / 1000, value: 0.25 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  it("says a window is clean only when changes were actually looked up", () => {
+    const withChanges = render(
+      project(
+        tool("diag", "diagnose", {
+          resource: {
+            apiVersion: "apps/v1",
+            kind: "Deployment",
+            metadata: { namespace: "shop", name: "api" },
+          },
+          pods: 1,
+          recentChanges: [],
+          metrics: vitals,
+        }),
+      ),
+    );
+    expect(withChanges).toContain(
+      "None of the changes Radar read fall in this window.",
+    );
+
+    // The same chart with no change lookup in the turn must stay silent: an
+    // empty marker list there means nobody looked, not that nothing happened.
+    const withoutChanges = render(
+      project(
+        tool("prom", "query_prometheus", {
+          query:
+            'sum(container_memory_working_set_bytes{namespace="shop",workload="api",workload_type="deployment"})',
+          type: "range",
+          ...window,
+          step: "60s",
+          series: [
+            {
+              labels: {},
+              dataPoints: [
+                { timestamp: Date.parse(window.start) / 1000, value: 1 },
+                { timestamp: Date.parse(window.end) / 1000, value: 2 },
+              ],
+            },
+          ],
+          selectors: [
+            {
+              metric: "container_memory_working_set_bytes",
+              matchers: [
+                { label: "namespace", op: "=", value: "shop" },
+                { label: "workload", op: "=", value: "api" },
+                { label: "workload_type", op: "=", value: "deployment" },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+    expect(withoutChanges).not.toContain(
+      "None of the changes Radar read fall in this window.",
+    );
+  });
+
+  it("keeps an uncited diagnose chart in the workload collection and marks the same-turn change on it", () => {
+    const projection = project(
+      tool("diag", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        pods: 1,
+        recentChanges: [
+          {
+            kind: "Deployment",
+            apiVersion: "apps/v1",
+            namespace: "shop",
+            name: "api",
+            changeType: "update",
+            timestamp: "2026-09-06T07:30:00Z",
+          },
+          {
+            kind: "Deployment",
+            apiVersion: "apps/v1",
+            namespace: "shop",
+            name: "worker",
+            changeType: "update",
+            timestamp: "2026-09-06T07:40:00Z",
+          },
+        ],
+        metrics: vitals,
+      }),
+    );
+    const partition = partitionInvestigationEvidence(projection.groups);
+    expect(partition.main.map((group) => group.kind)).not.toContain("metrics");
+    expect(partition.workload.map((group) => group.kind)).toContain("metrics");
+    expect(partition.hiddenMetrics).toBe(0);
+    // The vitals lead the collection; the absence receipts follow in their
+    // own order, so a healthy workload does not open on four empty tiles.
+    const kinds = partition.workload.map((group) => group.kind);
+    const firstReceipt = kinds.indexOf("receipt");
+    expect(firstReceipt).toBeGreaterThan(0);
+    expect(kinds.slice(firstReceipt).every((kind) => kind === "receipt")).toBe(
+      true,
+    );
+    expect(kinds.indexOf("metrics")).toBeLessThan(firstReceipt);
+    expect(kinds.indexOf("resource")).toBeLessThan(kinds.indexOf("metrics"));
+    expect(
+      partition.workload
+        .filter((group) => group.kind === "receipt")
+        .map((group) => group.latest.title),
+    ).toEqual(["Radar's diagnosis found no live issues", "No warning events"]);
+    const onOpenResource = vi.fn();
+    const html = render(
+      projection,
+      false,
+      undefined,
+      undefined,
+      onOpenResource,
+    );
+    expect(html).toContain("CPU usage · shop/api");
+    expect(html).toContain("1 current pod · 60m window · 1m2s step");
+    expect(html).toContain("(cores)");
+    expect(html.match(/data-chart-annotation="change"/g)).toHaveLength(1);
+    expect(html).toContain("Deployment api");
+    expect(html).not.toContain("Deployment worker");
+    expect(html).toContain(
+      "1 change recorded in this window is marked on the chart.",
+    );
+    expect(html).toContain("Open current Deployment shop/api in Radar");
+  });
+
+  it("never marks the target's changes on a neighbour's chart", () => {
+    const projection = project(
+      tool("diag", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        pods: 1,
+        logsCurrent: [
+          {
+            pod: "api-abc",
+            container: "api",
+            logs: {
+              lines: ["ERROR boom"],
+              totalLines: 1,
+              matchedLines: 1,
+              fallback: false,
+            },
+          },
+        ],
+        recentChanges: [
+          {
+            kind: "Pod",
+            apiVersion: "v1",
+            namespace: "shop",
+            name: "api-abc",
+            changeType: "update",
+            timestamp: "2026-09-06T07:30:00Z",
+          },
+        ],
+      }),
+      tool(
+        "diag-worker",
+        "diagnose",
+        {
+          resource: {
+            apiVersion: "apps/v1",
+            kind: "Deployment",
+            metadata: { namespace: "shop", name: "worker" },
+          },
+          pods: 1,
+          metrics: vitals,
+        },
+        { summary: JSON.stringify({ namespace: "shop", name: "worker" }) },
+      ),
+    );
+    const chart = projection.groups.find(
+      (group) =>
+        group.kind === "metrics" && group.latest.relevance === "broader",
+    );
+    expect(chart).toBeDefined();
+    expect(metricsChangeMarkers(projection.groups, chart!.latest)).toEqual([]);
+    const targetChart = project(
+      tool("diag", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        pods: 1,
+        recentChanges: [
+          {
+            kind: "Deployment",
+            apiVersion: "apps/v1",
+            namespace: "shop",
+            name: "api",
+            changeType: "update",
+            timestamp: "2026-09-06T07:30:00Z",
+          },
+        ],
+        metrics: vitals,
+      }),
+    );
+    const target = targetChart.groups.find((group) => group.kind === "metrics");
+    expect(
+      metricsChangeMarkers(targetChart.groups, target!.latest),
+    ).toHaveLength(1);
+  });
+
+  it("shows a workload metrics limitation for a reported producer error", () => {
+    const projection = project(
+      tool("diag", "diagnose", {
+        resource: {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { namespace: "shop", name: "api" },
+        },
+        pods: 1,
+        metrics: {
+          window,
+          pods: 1,
+          series: [],
+          error:
+            "metrics omitted: 3s budget exceeded before all queries answered",
+        },
+      }),
+    );
+    const html = render(projection);
+    expect(html).toContain("Workload metrics");
+    expect(html).toContain(
+      "metrics omitted: 3s budget exceeded before all queries answered",
+    );
+    expect(html).not.toContain("CPU usage");
+  });
+});
+
+describe("InvestigationEvidencePane scaled-by section", () => {
+  const scaledDeployment = (scaledBy: unknown) =>
+    tool("workload", "diagnose", {
+      resource: {
+        apiVersion: "apps/v1",
+        kind: "Deployment",
+        metadata: { namespace: "shop", name: "api" },
+      },
+      resourceContext: {
+        tier: "basic",
+        workloadSummary: { replicas: { desired: 5, ready: 5 } },
+        scaledBy,
+      },
+    });
+
+  it("shows the HPA's own diagnosis on the workload card", () => {
+    const html = render(
+      project(
+        scaledDeployment([
+          {
+            kind: "HorizontalPodAutoscaler",
+            namespace: "shop",
+            name: "api-hpa",
+            hpaSummary: {
+              state: "limited_max",
+              summary: "Wants 8 replicas but is capped at maxReplicas=5",
+              target: { kind: "Deployment", group: "apps", name: "api" },
+              bounds: { min: 1, max: 5, current: 5, desired: 5 },
+              reasons: [
+                {
+                  id: "limited_max",
+                  message: "HPA is capped at maxReplicas=5",
+                  detail:
+                    "the desired replica count is more than the maximum replica count",
+                  conditionType: "ScalingLimited",
+                  conditionReason: "TooManyReplicas",
+                },
+                {
+                  id: "missing_current_metric",
+                  message: "HPA is missing current metric values",
+                  detail: "cpu",
+                },
+              ],
+            },
+          },
+        ]),
+      ),
+    );
+    expect(html).toContain("Scaled by");
+    expect(html).toContain("api-hpa");
+    expect(html).toContain("Maxed");
+    expect(html).toContain("Wants 8 replicas but is capped at maxReplicas=5");
+    expect(html).toContain("5/5 replicas · bounds 1-5");
+    expect(html).not.toContain("HPA is capped at maxReplicas=5");
+    expect(html).toContain(
+      "Kubernetes ScalingLimited · TooManyReplicas: “the desired replica count is more than the maximum replica count”",
+    );
+    expect(html).toContain("HPA is missing current metric values");
+    expect(html).toContain("· cpu");
+  });
+
+  it("names the KEDA ScaledObject that owns the HPA and links it only when listed", () => {
+    const kedaHPA = (listed: boolean) =>
+      scaledDeployment([
+        {
+          kind: "HorizontalPodAutoscaler",
+          namespace: "shop",
+          name: "keda-hpa-api",
+          managedBy: {
+            kind: "ScaledObject",
+            group: "keda.sh",
+            namespace: "shop",
+            name: "api",
+          },
+          hpaSummary: {
+            state: "limited_min",
+            summary: "HPA is holding at minReplicas=2",
+            bounds: { min: 2, max: 10, current: 2, desired: 2 },
+            reasons: [
+              {
+                id: "limited_min",
+                message: "HPA is held at minReplicas=2",
+                detail:
+                  "the desired replica count is less than the minimum replica count",
+                conditionType: "ScalingLimited",
+                conditionReason: "TooFewReplicas",
+              },
+            ],
+          },
+        },
+        ...(listed
+          ? [
+              {
+                kind: "ScaledObject",
+                group: "keda.sh",
+                namespace: "shop",
+                name: "api",
+              },
+            ]
+          : []),
+      ]);
+    const open = () => {};
+    const linked = render(
+      project(kedaHPA(true)),
+      false,
+      undefined,
+      undefined,
+      open,
+    );
+    expect(linked).toContain("managed by KEDA ScaledObject");
+    expect(linked).toContain("HPA is holding at minReplicas=2");
+    expect(linked).not.toContain("HPA is held at minReplicas=2");
+    expect(linked).toContain(
+      "Kubernetes ScalingLimited · TooFewReplicas: “the desired replica count is less than the minimum replica count”",
+    );
+    expect(linked).toMatch(/<button[^>]*>api<\/button>/);
+    const unlisted = render(
+      project(kedaHPA(false)),
+      false,
+      undefined,
+      undefined,
+      open,
+    );
+    expect(unlisted).toContain("managed by KEDA ScaledObject");
+    expect(unlisted).not.toMatch(/<button[^>]*>api<\/button>/);
+  });
+
+  it("stays quiet for scalers Radar did not diagnose", () => {
+    const html = render(
+      project(
+        scaledDeployment([
+          {
+            kind: "ScaledObject",
+            group: "keda.sh",
+            namespace: "shop",
+            name: "api-scaler",
+          },
+          {
+            kind: "HorizontalPodAutoscaler",
+            namespace: "shop",
+            name: "api-hpa",
+          },
+        ]),
+      ),
+    );
+    expect(html).not.toContain("Scaled by");
+  });
+});
+
+describe("supporting adverse cards are visibly marked", () => {
+  const ref = evidenceRef("a", "b");
+  const bundle = {
+    resource: {
+      apiVersion: "apps/v1",
+      kind: "Deployment",
+      metadata: { namespace: "shop", name: "api" },
+      status: { readyReplicas: 1, replicas: 1 },
+    },
+    pods: 1,
+    logsCurrent: [
+      {
+        pod: "api-abc",
+        container: "api",
+        logs: {
+          lines: ["ERROR failed to resolve backend service"],
+          totalLines: 1,
+          matchedLines: 1,
+          fallback: false,
+        },
+      },
+      {
+        pod: "api-abc",
+        container: "proxy",
+        logs: {
+          lines: ["proxy ready"],
+          totalLines: 1,
+          matchedLines: 0,
+          fallback: true,
+        },
+      },
+    ],
+  };
+
+  it("draws a thin warning rule on a supporting warning card and none on neutral or context cards", () => {
+    const projection = project(
+      tool("diag", "diagnose", bundle, { evidenceRef: ref }),
+    );
+    const logs = projection.groups.filter((group) => group.kind === "logs");
+    const [errorLogs, proxyLogs] = logs;
+    expect(errorLogs.latest.tier).toBe("supporting");
+    expect(errorLogs.latest.tone).toBe("warning");
+    expect(proxyLogs.latest.tier).toBe("context");
+    expect(proxyLogs.latest.tone).toBe("neutral");
+    const html = render(projection);
+    const card = (id: string) =>
+      html.slice(html.indexOf(`id="${id}"`), html.indexOf(`id="${id}"`) + 900);
+    expect(card(errorLogs.id)).toContain(
+      "border-l-2 border-l-semantic-warning",
+    );
+    expect(card(errorLogs.id)).not.toContain("border-l-[3px]");
+    expect(card(proxyLogs.id)).not.toContain("border-l-");
+    const resource = projection.groups.find(
+      (group) => group.kind === "resource",
+    )!;
+    expect(resource.latest.tier).toBe("context");
+    expect(card(resource.id)).not.toContain("border-l-");
+  });
+
+  it("marks every card that triggers the healthy-conflict banner", () => {
+    const projection = project(
+      tool("diag", "diagnose", bundle, { evidenceRef: ref }),
+    );
+    expect(investigationEvidenceConflictsWithHealthy(projection)).toBe(true);
+    const html = render(projection);
+    const triggering = projection.groups.filter((group) =>
+      investigationEvidenceConflictsWithHealthy({ groups: [group] }),
+    );
+    expect(triggering.length).toBeGreaterThan(0);
+    for (const group of triggering) {
+      const start = html.indexOf(`id="${group.id}"`);
+      expect(start).toBeGreaterThan(-1);
+      expect(html.slice(start, start + 900)).toMatch(
+        /border-l-(2 border-l-semantic-(warning|error)|\[3px\])/,
+      );
+    }
   });
 });

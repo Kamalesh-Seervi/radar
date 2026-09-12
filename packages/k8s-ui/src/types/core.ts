@@ -516,6 +516,9 @@ export interface ContextInfo {
   /** Source kubeconfig label (e.g. "kube-cluster-paris"). Set by the backend
    *  for contexts loaded through the isolated source registry. */
   source?: string
+  /** AWS profile extracted from the exec plugin's --profile arg or AWS_PROFILE
+   *  env var. Present only for EKS contexts that pin a profile. */
+  awsProfile?: string
 }
 
 // Namespace
@@ -683,24 +686,34 @@ export type HPADiagnosisState =
   | 'stabilized'
   | 'unknown'
 
-export interface HPADiagnosis {
+export interface HPABounds {
+  min: number
+  max: number
+  current: number
+  desired: number
+  observedGeneration?: number
+  generation?: number
+}
+
+// The subset of an HPA diagnosis that HPADiagnosisSummary presents. Producers
+// that carry a richer or looser envelope (Radar's own HPADiagnosis, the
+// investigation evidence projection) extend this so the presentation rules —
+// state severity, state label, reason redundancy — cannot drift per surface.
+export interface HPADiagnosisView {
   state: HPADiagnosisState
   summary: string
+  bounds?: HPABounds
+  reasons?: HPAReasonSummary[]
+}
+
+export interface HPADiagnosis extends HPADiagnosisView {
   target: {
     apiVersion?: string
     kind?: string
     name?: string
   }
-  bounds: {
-    min: number
-    max: number
-    current: number
-    desired: number
-    observedGeneration?: number
-    generation?: number
-  }
+  bounds: HPABounds
   metrics?: HPAMetricSummary[]
-  reasons?: HPAReasonSummary[]
 }
 
 export interface HPAReasonSummary {

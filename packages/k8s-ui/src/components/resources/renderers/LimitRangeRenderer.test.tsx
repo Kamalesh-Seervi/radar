@@ -84,7 +84,8 @@ describe('NamespaceLimitRangesSection', () => {
   it('tells an empty namespace apart from one still loading', () => {
     const empty = renderToString(<NamespaceLimitRangesSection limitRanges={[]} namespace="dev" />)
     expect(empty).toContain('Limit Ranges (0)')
-    expect(empty).not.toContain('No LimitRanges found')
+    expect(empty).toContain('No LimitRanges found')
+    expect(empty).toContain('Other admission policies may still apply')
 
     const loading = renderToString(<NamespaceLimitRangesSection loading namespace="dev" />)
     expect(loading).toContain('Loading limit ranges')

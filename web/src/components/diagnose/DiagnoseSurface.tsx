@@ -20,15 +20,10 @@ import {
   TerminalSquare,
   Copy,
   Check,
-  Plus,
+  RotateCcw,
   PanelLeftOpen,
-  Link,
-  Lock,
-  Users,
 } from "lucide-react";
 import { Tooltip } from "../ui/Tooltip";
-import { ConfirmDialog } from "../ui/ConfirmDialog";
-import { Badge } from "@skyhook-io/k8s-ui/components/ui/Badge";
 import { useAnimatedUnmount } from "../../hooks/useAnimatedUnmount";
 import { TRANSITION_BACKDROP, TRANSITION_DRAWER } from "../../utils/animation";
 import {
@@ -39,13 +34,19 @@ import {
   type DiagnoseView,
 } from "./DiagnoseContext";
 import { useDiagnoseCustomization } from "../../context/DiagnoseCustomization";
+import { useNavCustomization } from "../../context/NavCustomization";
 import { InvestigationView } from "./InvestigationView";
-import { RecentList, absoluteTime, statusWord } from "./Home";
+import type { InvestigationTimelineScope } from "./InvestigationEvidencePane";
+import {
+  InvestigationHome,
+  RecentList,
+  absoluteTime,
+  statusWord,
+} from "./Home";
 import { AgentSetupNotice } from "./AgentSetupNotice";
 import { ConsentCard } from "./parts";
 import { buildLaunchCommand, launchAgentLabel, openInTerminal } from "./launch";
 import {
-  updateRunVisibility,
   type RunSummary,
   type ExecutionProfile,
 } from "../../api/diagnose";
@@ -183,163 +184,14 @@ function InvestigationMenu({ run }: { run: RunSummary }) {
   );
 }
 
-export function canCopyRunLink(
-  run: RunSummary | null | undefined,
-): run is RunSummary & { radarUrl: string } {
-  return typeof run?.radarUrl === "string" && run.radarUrl.length > 0;
-}
-
-function CopyRunLink({
-  radarUrl,
-  visibility,
-}: {
-  radarUrl: string;
-  visibility: RunSummary["visibility"];
-}) {
-  const label =
-    visibility === "private"
-      ? "Copy private link (only you can open it)"
-      : "Copy investigation link";
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">(
-    "idle",
-  );
-  const copy = async () => {
-    try {
-      if (!navigator.clipboard) throw new Error("clipboard unavailable");
-      await navigator.clipboard.writeText(
-        new URL(radarUrl, window.location.origin).href,
-      );
-      setCopyState("copied");
-    } catch {
-      setCopyState("error");
-    }
-    setTimeout(() => setCopyState("idle"), 1500);
-  };
-  return (
-    <Tooltip
-      content={
-        copyState === "copied"
-          ? "Link copied"
-          : copyState === "error"
-            ? "Couldn’t copy link"
-            : label
-      }
-      position="bottom"
-    >
-      <button
-        onClick={copy}
-        className="rounded-md p-1 text-theme-text-tertiary hover:bg-theme-hover hover:text-theme-text-primary"
-        aria-label={label}
-      >
-        {copyState === "copied" ? (
-          <Check className="h-4 w-4 text-emerald-500" />
-        ) : (
-          <Link className="h-4 w-4" />
-        )}
-      </button>
-    </Tooltip>
-  );
-}
-
-function VisibilityControl({
-  run,
-  onChanged,
-}: {
-  run: RunSummary;
-  onChanged: (run: RunSummary) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(false);
-  const [confirmShare, setConfirmShare] = useState(false);
-  if (!run.canManageVisibility) {
-    return run.visibility === "organization" ? (
-      <Tooltip content="Shared with your organization" position="bottom">
-        <Badge severity="neutral" size="sm" className="shrink-0">
-          <Users className="h-3 w-3" />
-          Organization
-        </Badge>
-      </Tooltip>
-    ) : run.visibility === "private" ? (
-      <Tooltip
-        content="Only you can view this investigation. Other organization members don’t have access."
-        position="bottom"
-      >
-        <Badge severity="neutral" size="sm" className="shrink-0">
-          <Lock className="h-3 w-3" />
-          Private
-        </Badge>
-      </Tooltip>
-    ) : null;
-  }
-  const shared = run.visibility === "organization";
-  const update = () => {
-    if (busy) return;
-    setBusy(true);
-    setError(false);
-    updateRunVisibility(run.id, shared ? "private" : "organization")
-      .then((updated) => {
-        onChanged(updated);
-        setConfirmShare(false);
-      })
-      .catch(() => setError(true))
-      .finally(() => setBusy(false));
-  };
-  const label = shared ? "Organization" : "Private";
-  return (
-    <>
-      <Tooltip
-        content={
-          error
-            ? "Couldn't change sharing"
-            : shared
-              ? "Shared with your organization — make private"
-              : "Private — click to let organization members access this investigation"
-        }
-        position="bottom"
-      >
-        <button
-          onClick={() => (shared ? update() : setConfirmShare(true))}
-          disabled={busy}
-          className="flex items-center gap-1 rounded-md border border-theme-border/70 px-1.5 py-1 text-[11px] font-medium text-theme-text-secondary hover:bg-theme-hover hover:text-theme-text-primary disabled:opacity-50"
-          aria-label={
-            shared
-              ? "Shared with your organization — make private"
-              : "Private — click to let organization members access this investigation"
-          }
-        >
-          {shared ? (
-            <Users className="h-3.5 w-3.5" />
-          ) : (
-            <Lock className="h-3.5 w-3.5" />
-          )}
-          {label}
-        </button>
-      </Tooltip>
-      <ConfirmDialog
-        open={confirmShare}
-        onClose={() => !busy && setConfirmShare(false)}
-        onConfirm={update}
-        title="Share this investigation?"
-        message="Everyone in your organization can read this entire investigation—including your questions and the logs and manifests Radar read—and can continue or stop it."
-        confirmLabel="Share with organization"
-        showWarning={false}
-        variant="warning"
-        isLoading={busy}
-      />
-    </>
-  );
-}
-
 // The panel is an ABSOLUTE slot inside the app's body frame (the column under the
 // header, right of the nav rail) — App renders it there and passes topInset (the
 // header height; 0 in chromeless embeds). It shares that frame with the resource/
 // Helm drawers, so it no longer floats viewport-fixed or DOM-measures the chrome.
-// Whether the header offers a new investigation on the focused run's resource.
+// Whether the header offers a fresh re-run of the focused investigation.
 // Every clause is a failure this button actually had:
 //
-//   view          goHome() leaves activeRunId set, so the header keeps rendering
-//                 the last focused run. Without this the button dispatches an
-//                 agent — real tokens — from a screen showing an unrelated list.
+//   view          Home is the fresh-entry surface, never a re-run action.
 //   run           nothing to take a resource from.
 //   running/stopping human starts reuse the live run. Automatic investigations
 //                 are immutable, so they retain a separate fresh human start.
@@ -347,7 +199,7 @@ function VisibilityControl({
 //                 the resource may not exist in the active context. Do not
 //                 silently start a different-cluster investigation from here.
 //   needsConsent  the consent card owns the surface until it's answered.
-export function canStartNewInvestigation(
+export function canRerunInvestigation(
   view: DiagnoseView,
   run: RunSummary | null,
   needsConsent: boolean,
@@ -355,6 +207,8 @@ export function canStartNewInvestigation(
   return (
     view === "investigation" &&
     !!run &&
+    !!run.kind &&
+    !!run.name &&
     ((run.status !== "running" && run.status !== "stopping") ||
       run.trigger === "background") &&
     run.status !== "stale" &&
@@ -366,12 +220,6 @@ export function canStartNewInvestigation(
 // Keep these Tailwind literals aligned with the measured rail threshold.
 // Detail uses one stable history toggle; below this width it opens an overlay.
 export const INVESTIGATION_HISTORY_MIN_WIDTH = 1750;
-export const MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS =
-  "@min-[1750px]/diagnose-surface:hidden";
-export const MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS =
-  "hidden @min-[1750px]/diagnose-surface:flex";
-export const MAXIMIZED_HOME_RUN_HEADER_VISIBILITY_CLASS =
-  "hidden @min-[1750px]/diagnose-surface:block";
 export const MAXIMIZED_RUN_META_VISIBILITY_CLASS =
   "hidden @min-[1750px]/diagnose-surface:flex";
 // The panel is a bounded absolute frame whose descendants own scrolling. If
@@ -381,6 +229,24 @@ export const MAXIMIZED_RUN_META_VISIBILITY_CLASS =
 // docked and maximized modes; their intended scroll roots are inside the frame.
 export const DIAGNOSE_SURFACE_FRAME_CLASS =
   "@container/diagnose-surface absolute z-40 flex min-h-0 flex-col overflow-hidden border-l border-theme-border bg-theme-surface shadow-drawer";
+
+export function unavailableInvestigationMessage(embedded: boolean): string {
+  return embedded
+    ? "This investigation is unavailable. It may be private, your access may have changed, or its history may have been cleared. Check your account and organization, or ask the creator for access."
+    : "This investigation is unavailable. It may have been removed, or its saved history may have been cleared.";
+}
+
+export function investigationHistoryIsPersistent(input: {
+  maximized: boolean;
+  view: DiagnoseView;
+  surfaceWidth: number;
+}): boolean {
+  return (
+    input.maximized &&
+    (input.view === "home" ||
+      input.surfaceWidth >= INVESTIGATION_HISTORY_MIN_WIDTH)
+  );
+}
 
 export function investigationHeaderPresentation(input: {
   view: DiagnoseView;
@@ -398,17 +264,10 @@ export function investigationHeaderPresentation(input: {
       runActionsClass: input.hasVisibleRunDetail ? "" : null,
     };
   }
-  const hasWideRetainedDetail = input.maximized && input.hasVisibleRunDetail;
   return {
-    genericIdentityClass: hasWideRetainedDetail
-      ? MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS
-      : "",
-    detailIdentityClass: hasWideRetainedDetail
-      ? MAXIMIZED_HOME_RUN_HEADER_VISIBILITY_CLASS
-      : null,
-    runActionsClass: hasWideRetainedDetail
-      ? MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS
-      : null,
+    genericIdentityClass: "",
+    detailIdentityClass: null,
+    runActionsClass: null,
   };
 }
 
@@ -431,69 +290,93 @@ function DiagnoseHeaderIdentity({
   onOpenSettings: (() => void) | null;
 }) {
   return (
-    <div className={`min-w-0 ${className}`}>
-      <div className="flex min-w-0 items-center gap-2">
-        <div className="min-w-0 flex-1 truncate text-sm font-medium text-theme-text-primary">
+    <div className={`flex min-w-0 items-center gap-3 ${className}`}>
+      <div className="min-w-0 flex-1">
+        <div className="min-w-0 truncate text-sm font-medium text-theme-text-primary">
           {title}
         </div>
-        {runMeta ? (
-          <div
-            className={`${MAXIMIZED_RUN_META_VISIBILITY_CLASS} shrink-0 items-center gap-1 text-[11px] tabular-nums text-theme-text-tertiary`}
-          >
-            <span className={`font-medium ${runMeta.labelClass}`}>
-              {runMeta.label}
-            </span>
-            <span aria-hidden>·</span>
-            <time dateTime={runMeta.dateTime}>{runMeta.time}</time>
-          </div>
-        ) : null}
+        <div className="flex items-center gap-1 text-xs text-theme-text-tertiary">
+          <span className="truncate">{configLine}</span>
+          {onOpenSettings && (
+            <Tooltip content="AI settings" position="bottom">
+              <button
+                onClick={onOpenSettings}
+                className="shrink-0 rounded p-0.5 text-theme-text-tertiary hover:text-theme-text-primary"
+                aria-label="AI settings"
+              >
+                <Settings2 className="h-3 w-3" />
+              </button>
+            </Tooltip>
+          )}
+        </div>
       </div>
-      <div className="flex items-center gap-1 text-xs text-theme-text-tertiary">
-        <span className="truncate">{configLine}</span>
-        {onOpenSettings && (
-          <Tooltip content="AI settings" position="bottom">
-            <button
-              onClick={onOpenSettings}
-              className="shrink-0 rounded p-0.5 text-theme-text-tertiary hover:text-theme-text-primary"
-              aria-label="AI settings"
-            >
-              <Settings2 className="h-3 w-3" />
-            </button>
-          </Tooltip>
-        )}
-      </div>
+      {runMeta ? (
+        <div
+          className={`${MAXIMIZED_RUN_META_VISIBILITY_CLASS} shrink-0 items-center gap-1 whitespace-nowrap text-[11px] tabular-nums text-theme-text-tertiary`}
+        >
+          <span className={`font-medium ${runMeta.labelClass}`}>
+            {runMeta.label}
+          </span>
+          <span aria-hidden>·</span>
+          <time dateTime={runMeta.dateTime}>{runMeta.time}</time>
+        </div>
+      ) : null}
     </div>
   );
 }
 
 export function openInvestigationEvidenceResource(
   ref: DiagnosisResourceRef,
-  onOpenResource: (ref: DiagnosisResourceRef) => void,
+  onOpenResource: (ref: DiagnosisResourceRef, runID?: string | null) => void,
   setMaximized: (maximized: boolean) => void,
-  closeDiagnose: () => void,
+  dismissDiagnose: () => void,
+  dockedPanelWouldOverlay: boolean,
+  activeRunID?: string,
+) {
+  revealInvestigationDestination(
+    setMaximized,
+    dismissDiagnose,
+    dockedPanelWouldOverlay,
+  );
+  if (dockedPanelWouldOverlay) onOpenResource(ref, null);
+  else if (activeRunID) onOpenResource(ref, activeRunID);
+  else onOpenResource(ref);
+}
+
+// A destination must be visible after the handoff. On a wide canvas, restoring
+// the docked panel leaves Radar and the investigation side by side. At tighter
+// widths that same panel overlays the host content, so close it before
+// navigating instead of making the click appear to do nothing.
+function revealInvestigationDestination(
+  setMaximized: (maximized: boolean) => void,
+  dismissDiagnose: () => void,
   dockedPanelWouldOverlay: boolean,
 ) {
-  // A resource destination must be visible after the handoff. On a wide canvas,
-  // restoring the docked panel leaves Radar and the investigation side by side.
-  // At tighter widths that same panel overlays the host content, so close it
-  // before navigating instead of making the click appear to do nothing.
   if (dockedPanelWouldOverlay) {
     // Closing already exposes the destination; retain the user's maximized
     // preference for the next time they open investigations.
-    closeDiagnose();
+    dismissDiagnose();
   } else {
     setMaximized(false);
   }
-  onOpenResource(ref);
 }
 
 export function DiagnoseSurface({
   topInset = 0,
   onOpenResource,
+  onOpenTimeline,
+  onOpenWorkspace,
+  onBrowseIssues,
 }: {
   topInset?: number;
   /** Resolves an evidence subject into the embedding Radar surface. */
-  onOpenResource?: (ref: DiagnosisResourceRef) => void;
+  onOpenResource?: (ref: DiagnosisResourceRef, runID?: string | null) => void;
+  /** Opens the embedding Radar Timeline for one resource's change history. */
+  onOpenTimeline?: (scope: InvestigationTimelineScope) => void;
+  /** Lets a host whose drawer lives outside Radar's route tree cross into it. */
+  onOpenWorkspace?: () => void;
+  /** Opens the canonical Issues surface for a first focused investigation. */
+  onBrowseIssues?: () => void;
 }) {
   const d = useDiagnose();
   const { data: contexts } = useContexts();
@@ -516,8 +399,9 @@ export function DiagnoseSurface({
   }, []);
   // Injected settings action: undefined = Radar's own Settings dialog;
   // null = hide the gear + links.
-  const { consentCopy, onOpenSettings: hostOpenSettings } =
+  const { consentCopy, onOpenSettings: hostOpenSettings, renderRunActions } =
     useDiagnoseCustomization();
+  const { embedded } = useNavCustomization();
   const openSettings =
     hostOpenSettings === undefined ? openDiagnoseSettings : hostOpenSettings;
   const {
@@ -529,10 +413,16 @@ export function DiagnoseSurface({
     panelBounds: { min: minW, max: maxW },
     panelWidthKey: widthKey,
   } = useDiagnoseLayout();
-  const wideHistory =
-    maximized && surfaceWidth >= INVESTIGATION_HISTORY_MIN_WIDTH;
+  // Home has no detail pane competing for width, so its history is always part
+  // of the workspace. Only a focused run collapses history into a drawer when
+  // the two-pane layout would become cramped.
+  const persistentHistory = investigationHistoryIsPersistent({
+    maximized,
+    view: d.view,
+    surfaceWidth,
+  });
   const historyOverlay =
-    !wideHistory && historyOverlayOpen && d.view !== "home";
+    !persistentHistory && historyOverlayOpen;
   const { shouldRender: historyOverlayPresent, isOpen: historySlideOpen } =
     useAnimatedUnmount(historyOverlay);
   const dismissHistory = useCallback(() => {
@@ -541,7 +431,7 @@ export function DiagnoseSurface({
   }, []);
   useEffect(() => {
     setHistoryOverlayOpen(false);
-  }, [wideHistory, maximized, d.view]);
+  }, [persistentHistory, maximized, d.view]);
   useEffect(() => {
     if (historyOverlay) {
       const target =
@@ -558,11 +448,30 @@ export function DiagnoseSurface({
         ref,
         onOpenResource,
         setMaximized,
-        d.close,
+        d.dismissForNavigation,
         narrow,
+        d.activeRunId ?? undefined,
       );
     },
-    [d.close, narrow, onOpenResource, setMaximized],
+    [
+      d.activeRunId,
+      d.dismissForNavigation,
+      narrow,
+      onOpenResource,
+      setMaximized,
+    ],
+  );
+  const openEvidenceTimeline = useCallback(
+    (scope: InvestigationTimelineScope) => {
+      if (!onOpenTimeline) return;
+      revealInvestigationDestination(
+        setMaximized,
+        d.dismissForNavigation,
+        narrow,
+      );
+      onOpenTimeline(scope);
+    },
+    [d.dismissForNavigation, narrow, onOpenTimeline, setMaximized],
   );
 
   const startResize = (e: React.MouseEvent) => {
@@ -660,6 +569,7 @@ export function DiagnoseSurface({
       agentLabel={activeAgentLabel}
       maximized={maximized}
       onOpenResource={onOpenResource ? openEvidenceResource : undefined}
+      onOpenTimeline={onOpenTimeline ? openEvidenceTimeline : undefined}
     />
   ) : d.activeRunId && !d.runsLoaded ? (
     // Deep-linked to a run before the list has ever loaded: show the load
@@ -676,9 +586,7 @@ export function DiagnoseSurface({
     // investigation" placeholder would read as a broken link.
     <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
       <p className="text-sm text-theme-text-secondary">
-        This investigation is unavailable. It may be private, your access may
-        have changed, or its history may have been cleared. Check your account
-        and organization, or ask the creator for access.
+        {unavailableInvestigationMessage(embedded === true)}
       </p>
       <button
         onClick={d.goHome}
@@ -706,25 +614,38 @@ export function DiagnoseSurface({
       Select an investigation, or open a resource and click Investigate.
     </div>
   );
-  const compactHistory = (
-    <>
-      {setupPending && <AgentSetupNotice setupState={d.setupState} />}
-      {(!setupPending || d.runs.length > 0) && (
-        <RecentList
-          currentContext={currentContext}
-          agentLabel={d.agentLabel}
-          runs={d.runs}
-          onSelect={d.openRun}
-          historyDegraded={d.historyDegraded}
-        />
-      )}
-    </>
+  const home = d.needsConsent ? (
+    <div className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
+      <ConsentCard
+        agentName={d.agentLabel}
+        agent={d.selectedAgent}
+        profile={d.profile}
+        copy={consentCopy}
+        onOpenSettings={openSettings ?? undefined}
+        error={d.consentError}
+        onApprove={d.approveConsent}
+        onCancel={d.cancelConsent}
+      />
+    </div>
+  ) : setupPending ? (
+    <div className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
+      <AgentSetupNotice setupState={d.setupState} />
+    </div>
+  ) : (
+    <InvestigationHome
+      agentLabel={d.agentLabel}
+      onBrowseIssues={
+        d.runsLoaded && d.runs.length === 0 ? onBrowseIssues : undefined
+      }
+    />
   );
 
   const showHistory = !setupPending || d.runs.length > 0;
   const historyVisible =
     showHistory &&
-    (wideHistory ? !historyCollapsed || d.view === "home" : historyOverlay);
+    (persistentHistory
+      ? d.view === "home" || !historyCollapsed
+      : historyOverlay);
 
   useLayoutEffect(() => {
     if (
@@ -764,9 +685,9 @@ export function DiagnoseSurface({
       )}
 
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-theme-border px-4 py-2.5">
+      <div className="relative z-30 flex items-center justify-between gap-3 border-b border-theme-border bg-theme-surface px-4 py-2.5">
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          {d.view !== "home" && showHistory ? (
+          {showHistory && (d.view !== "home" || !persistentHistory) ? (
             <Tooltip
               content={
                 historyVisible
@@ -783,7 +704,7 @@ export function DiagnoseSurface({
                 aria-expanded={historyVisible}
                 aria-controls="investigation-history"
                 onClick={() =>
-                  wideHistory
+                  persistentHistory
                     ? setHistoryCollapsed((value) => !value)
                     : historyOverlay
                       ? dismissHistory()
@@ -819,11 +740,11 @@ export function DiagnoseSurface({
             )}
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-1">
           {activeRun &&
-            canStartNewInvestigation(d.view, activeRun, d.needsConsent) && (
+            canRerunInvestigation(d.view, activeRun, d.needsConsent) && (
               <Tooltip
-                content="Start fresh — ignore earlier findings"
+                content="Re-run this investigation from scratch"
                 position="bottom"
               >
                 <button
@@ -838,9 +759,9 @@ export function DiagnoseSurface({
                     })
                   }
                   className="rounded-md p-1 text-theme-text-tertiary hover:bg-theme-hover hover:text-theme-text-primary"
-                  aria-label="Start fresh — ignore earlier findings"
+                  aria-label="Re-run this investigation from scratch"
                 >
-                  <Plus className="h-4 w-4" />
+                  <RotateCcw className="h-4 w-4" />
                 </button>
               </Tooltip>
             )}
@@ -848,33 +769,33 @@ export function DiagnoseSurface({
             <div
               className={`items-center gap-1 ${headerPresentation.runActionsClass || "flex"}`}
             >
-              <VisibilityControl
-                key={visibleRunDetail.id}
-                run={visibleRunDetail}
-                onChanged={d.updateRunSummary}
-              />
-              {canCopyRunLink(visibleRunDetail) && (
-                <CopyRunLink
-                  radarUrl={visibleRunDetail.radarUrl}
-                  visibility={visibleRunDetail.visibility}
-                />
-              )}
+              {renderRunActions?.({ run: visibleRunDetail, onRunUpdated: d.updateRunSummary })}
               <InvestigationMenu run={visibleRunDetail} />
             </div>
           )}
-          <Tooltip content={maximized ? "Restore" : "Expand"} position="bottom">
-            <button
-              onClick={() => setMaximized((v) => !v)}
-              className="rounded-md p-1 text-theme-text-tertiary hover:bg-theme-hover hover:text-theme-text-primary"
-              aria-label={maximized ? "Restore" : "Expand"}
+          {(!maximized || d.canRestoreWorkspace) && (
+            <Tooltip
+              content={maximized ? "Restore" : "Expand"}
+              position="bottom"
             >
-              {maximized ? (
-                <Minimize2 className="h-4 w-4" />
-              ) : (
-                <Maximize2 className="h-4 w-4" />
-              )}
-            </button>
-          </Tooltip>
+              <button
+                onClick={
+                  maximized
+                    ? d.restoreWorkspace
+                    : (onOpenWorkspace ??
+                      (() => d.openWorkspace(d.activeRunId)))
+                }
+                className="rounded-md p-1 text-theme-text-tertiary hover:bg-theme-hover hover:text-theme-text-primary"
+                aria-label={maximized ? "Restore" : "Expand"}
+              >
+                {maximized ? (
+                  <Minimize2 className="h-4 w-4" />
+                ) : (
+                  <Maximize2 className="h-4 w-4" />
+                )}
+              </button>
+            </Tooltip>
+          )}
           <Tooltip content="Close" position="bottom">
             <button
               onClick={d.close}
@@ -893,7 +814,7 @@ export function DiagnoseSurface({
           only appears when expanded; keys keep the detail node identity-stable
           as it comes and goes. */}
       <div className="relative flex min-h-0 flex-1">
-        {!wideHistory && historyOverlayPresent && (
+        {!persistentHistory && historyOverlayPresent && (
           <div
             aria-hidden="true"
             onClick={dismissHistory}
@@ -909,7 +830,7 @@ export function DiagnoseSurface({
             aria-hidden={!historyVisible}
             inert={!historyVisible}
             id="investigation-history"
-            className={`${historyVisible || (!wideHistory && historyOverlayPresent) ? "block" : "hidden"} ${wideHistory ? "" : `absolute inset-y-0 left-0 z-20 max-w-[calc(100%-2rem)] shadow-drawer ${TRANSITION_DRAWER} motion-reduce:transition-none ${historySlideOpen ? "translate-x-0 opacity-100" : "-translate-x-full opacity-0"}`} w-72 shrink-0 overflow-y-auto border-r border-theme-border bg-theme-surface px-3 py-3 outline-none`}
+            className={`${historyVisible || (!persistentHistory && historyOverlayPresent) ? "block" : "hidden"} ${persistentHistory ? "" : `absolute inset-y-0 left-0 z-20 max-w-[calc(100%-2rem)] ${TRANSITION_DRAWER} motion-reduce:transition-none ${historySlideOpen ? "translate-x-0 opacity-100" : "-translate-x-full opacity-0"}`} w-72 shrink-0 overflow-y-auto border-r border-theme-border bg-theme-surface px-3 py-3 outline-none`}
           >
             <RecentList
               currentContext={currentContext}
@@ -925,22 +846,13 @@ export function DiagnoseSurface({
           </aside>
         )}
         {d.view === "home" ? (
-          <>
-            <div
-              key="history"
-              className={`flex-1 overflow-y-auto overflow-x-hidden px-4 py-3 ${maximized ? MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS : ""}`}
-            >
-              {compactHistory}
-            </div>
-            {maximized && (
-              <div
-                key="main"
-                className={`${MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS} min-h-0 min-w-0 flex-1 flex-col`}
-              >
-                {detail}
-              </div>
-            )}
-          </>
+          <div
+            key="home"
+            inert={historyOverlay}
+            className="flex-1 overflow-y-auto overflow-x-hidden"
+          >
+            {home}
+          </div>
         ) : (
           <div
             key="main"

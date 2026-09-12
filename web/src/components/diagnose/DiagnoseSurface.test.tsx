@@ -1,15 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   DIAGNOSE_SURFACE_FRAME_CLASS,
-  MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS,
-  MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS,
-  MAXIMIZED_HOME_RUN_HEADER_VISIBILITY_CLASS,
   INVESTIGATION_HISTORY_MIN_WIDTH,
   MAXIMIZED_RUN_META_VISIBILITY_CLASS,
-  canStartNewInvestigation,
-  canCopyRunLink,
+  canRerunInvestigation,
+  investigationHistoryIsPersistent,
   investigationHeaderPresentation,
   openInvestigationEvidenceResource,
+  unavailableInvestigationMessage,
 } from "./DiagnoseSurface";
 import {
   canContinueInvestigation,
@@ -18,7 +16,7 @@ import {
 } from "./investigationState";
 import type { RunSummary } from "../../api/diagnose";
 
-// The "new investigation" button dispatches an agent and spends the user's own
+// The re-run button dispatches an agent and spends the user's own
 // tokens, so every one of these clauses is load-bearing rather than cosmetic.
 // Each case below is a way it misfired before the gate existed.
 function run(status: RunSummary["status"]): RunSummary {
@@ -35,41 +33,40 @@ function run(status: RunSummary["status"]): RunSummary {
   };
 }
 
-describe("canStartNewInvestigation", () => {
+describe("canRerunInvestigation", () => {
   it("offers a new investigation on a finished run", () => {
-    expect(canStartNewInvestigation("investigation", run("done"), false)).toBe(
+    expect(canRerunInvestigation("investigation", run("done"), false)).toBe(
       true,
     );
   });
 
   it("stays hidden on the investigations list", () => {
-    // goHome() leaves activeRunId set, so the header still has a run to read.
-    // Without the view check the click starts an agent on a resource the user
-    // navigated away from, over a list of unrelated investigations.
-    expect(canStartNewInvestigation("home", run("done"), false)).toBe(false);
+    // Home is a fresh-entry surface and must never expose a token-spending
+    // re-run action, even if a stale caller hands the header a run.
+    expect(canRerunInvestigation("home", run("done"), false)).toBe(false);
   });
 
   it("stays hidden while a turn is in flight", () => {
     // A start would be handed back the live run, so the button does nothing.
     expect(
-      canStartNewInvestigation("investigation", run("running"), false),
+      canRerunInvestigation("investigation", run("running"), false),
     ).toBe(false);
   });
 
   it("stays hidden on a stale run", () => {
     // A closed session must not start a new investigation against a resource
     // that may not exist in the active cluster.
-    expect(canStartNewInvestigation("investigation", run("stale"), false)).toBe(
+    expect(canRerunInvestigation("investigation", run("stale"), false)).toBe(
       false,
     );
   });
 
   it("blocks fresh starts while a human turn stops, but allows a separate human run from an automatic one", () => {
     expect(
-      canStartNewInvestigation("investigation", run("stopping"), false),
+      canRerunInvestigation("investigation", run("stopping"), false),
     ).toBe(false);
     expect(
-      canStartNewInvestigation(
+      canRerunInvestigation(
         "investigation",
         { ...run("running"), trigger: "background" },
         false,
@@ -78,27 +75,39 @@ describe("canStartNewInvestigation", () => {
   });
 
   it("stays hidden while consent is pending", () => {
-    expect(canStartNewInvestigation("investigation", run("done"), true)).toBe(
+    expect(canRerunInvestigation("investigation", run("done"), true)).toBe(
       false,
     );
   });
 
   it("stays hidden with no focused run", () => {
-    expect(canStartNewInvestigation("investigation", null, false)).toBe(false);
+    expect(canRerunInvestigation("investigation", null, false)).toBe(false);
   });
 
   it("offers one on an errored or stopped run", () => {
     // Those are the runs a person most wants to start over from.
-    expect(canStartNewInvestigation("investigation", run("error"), false)).toBe(
+    expect(canRerunInvestigation("investigation", run("error"), false)).toBe(
       true,
     );
     expect(
-      canStartNewInvestigation("investigation", run("stopped"), false),
+      canRerunInvestigation("investigation", run("stopped"), false),
     ).toBe(true);
   });
 });
 
 describe("investigation history navigation", () => {
+  it("keeps hosted recovery language out of standalone Radar", () => {
+    expect(unavailableInvestigationMessage(false)).toBe(
+      "This investigation is unavailable. It may have been removed, or its saved history may have been cleared.",
+    );
+    expect(unavailableInvestigationMessage(false)).not.toMatch(
+      /account|organization|creator|access/,
+    );
+    expect(unavailableInvestigationMessage(true)).toMatch(
+      /account and organization/,
+    );
+  });
+
   it("restores the docked surface before opening an evidence resource", () => {
     const events: string[] = [];
     const onOpenResource = vi.fn(() => events.push("open"));
@@ -117,12 +126,13 @@ describe("investigation history navigation", () => {
       setMaximized,
       closeDiagnose,
       false,
+      "run-1",
     );
 
     expect(events).toEqual(["dock", "open"]);
     expect(setMaximized).toHaveBeenCalledWith(false);
     expect(closeDiagnose).not.toHaveBeenCalled();
-    expect(onOpenResource).toHaveBeenCalledWith(ref);
+    expect(onOpenResource).toHaveBeenCalledWith(ref, "run-1");
   });
 
   it("closes an overlay before opening an evidence resource", () => {
@@ -147,7 +157,7 @@ describe("investigation history navigation", () => {
     expect(events).toEqual(["close", "open"]);
     expect(setMaximized).not.toHaveBeenCalled();
     expect(closeDiagnose).toHaveBeenCalledOnce();
-    expect(onOpenResource).toHaveBeenCalledWith(ref);
+    expect(onOpenResource).toHaveBeenCalledWith(ref, null);
   });
 
   it("keeps document overflow out of the bounded Diagnose frame", () => {
@@ -159,18 +169,26 @@ describe("investigation history navigation", () => {
 
   it("reserves the history rail for wider investigation surfaces", () => {
     expect(INVESTIGATION_HISTORY_MIN_WIDTH).toBe(1750);
-    expect(MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS).toBe(
-      "@min-[1750px]/diagnose-surface:hidden",
-    );
-    expect(MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS).toBe(
-      "hidden @min-[1750px]/diagnose-surface:flex",
-    );
-    expect(MAXIMIZED_HOME_RUN_HEADER_VISIBILITY_CLASS).toBe(
-      "hidden @min-[1750px]/diagnose-surface:block",
-    );
     expect(MAXIMIZED_RUN_META_VISIBILITY_CLASS).toBe(
       "hidden @min-[1750px]/diagnose-surface:flex",
     );
+  });
+
+  it("keeps history visible on Home even when the workspace is compact", () => {
+    expect(
+      investigationHistoryIsPersistent({
+        maximized: true,
+        view: "home",
+        surfaceWidth: 700,
+      }),
+    ).toBe(true);
+    expect(
+      investigationHistoryIsPersistent({
+        maximized: true,
+        view: "investigation",
+        surfaceWidth: 700,
+      }),
+    ).toBe(false);
   });
 
   it("keeps docked Home generic and removes actions for its retained run", () => {
@@ -187,7 +205,7 @@ describe("investigation history navigation", () => {
     });
   });
 
-  it("swaps generic Home identity for the labeled retained detail at the wide breakpoint", () => {
+  it("keeps Home generic even if a stale caller supplies retained detail", () => {
     expect(
       investigationHeaderPresentation({
         view: "home",
@@ -195,9 +213,9 @@ describe("investigation history navigation", () => {
         hasVisibleRunDetail: true,
       }),
     ).toEqual({
-      genericIdentityClass: MAXIMIZED_COMPACT_HISTORY_VISIBILITY_CLASS,
-      detailIdentityClass: MAXIMIZED_HOME_RUN_HEADER_VISIBILITY_CLASS,
-      runActionsClass: MAXIMIZED_HOME_DETAIL_VISIBILITY_CLASS,
+      genericIdentityClass: "",
+      detailIdentityClass: null,
+      runActionsClass: null,
     });
   });
 
@@ -315,25 +333,6 @@ describe("canContinueInvestigation", () => {
         true,
       ),
     ).toBe(false);
-  });
-});
-
-describe("canCopyRunLink", () => {
-  it("does not expose collaboration UI for an OSS run", () => {
-    expect(canCopyRunLink(run("done"))).toBe(false);
-  });
-
-  it("exposes the copy action only for a canonical hosted URL", () => {
-    expect(
-      canCopyRunLink({
-        ...run("done"),
-        radarUrl: "/c/cluster-1?org=org-1&ai-run=r1",
-      }),
-    ).toBe(true);
-  });
-
-  it("treats an empty hosted URL as unavailable", () => {
-    expect(canCopyRunLink({ ...run("done"), radarUrl: "" })).toBe(false);
   });
 });
 

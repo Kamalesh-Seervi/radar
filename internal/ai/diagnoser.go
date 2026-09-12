@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,6 +92,71 @@ type Request struct {
 	// across the run's turns). Backends that need filesystem-scoped session state
 	// use it (Cursor's --resume is workspace-scoped); others ignore it.
 	WorkDir string
+	// Metrics is the RunManager's probe of the metrics backend for this turn.
+	// Only a confirmed connection reaches the prompt; the zero value says nothing.
+	Metrics MetricsAvailability
+}
+
+// MetricsAvailability is what the investigation prompt needs to know about
+// Prometheus: whether a probe just succeeded and, if so, where. It carries no
+// failure detail because the agent is never told about an unreachable backend.
+type MetricsAvailability struct {
+	Connected bool
+	Address   string
+}
+
+// metricsNudge tells the agent Prometheus is reachable so it queries instead
+// of guessing. The sentence names one bounded query shape and asks for a
+// citation so the result lands in Findings as evidence.
+func metricsNudge(m MetricsAvailability) string {
+	if !m.Connected {
+		return ""
+	}
+	return fmt.Sprintf("Prometheus is connected at %s; for resource, restart, throttling or latency questions run one `query_prometheus` range query over the failure window and cite it. Scope pod-level series to the workload's own pods with the diagnose bundle's `podNames` as pod=~\"^(a|b)$\", or with the workload identity labels on kube-state-metrics series; never a name prefix like pod=~\"api-.*\", which also matches sibling workloads.", promptSafeAddress(m.Address))
+}
+
+// promptSafeAddress reduces a configured URL to where the backend is: scheme,
+// host and path. The prompt is model-visible and leaves the machine, and a
+// Prometheus behind an auth proxy is commonly configured with the credential
+// in the query string (`?token=…`) rather than in userinfo, so stripping
+// userinfo alone still discloses it. The fragment goes for the same reason.
+func promptSafeAddress(address string) string {
+	u, err := url.Parse(address)
+	if err != nil {
+		return address
+	}
+	if u.User == nil && u.RawQuery == "" && u.Fragment == "" {
+		return address
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
+}
+
+// turnPrompt selects the prompt for a turn. Apply and explanation turns are
+// exact scripts; read-only investigation turns (initial and follow-up) may
+// additionally learn that metrics are available.
+func turnPrompt(req Request) string {
+	if req.Apply {
+		return applyPrompt(req) // explicit, user-confirmed remediation turn
+	}
+	if req.Explanation != nil {
+		return explanationPrompt(*req.Explanation)
+	}
+	prompt := taskPrompt(req)
+	if strings.TrimSpace(req.Question) != "" {
+		// Restate the structured/citation contract on every read-only turn. Some
+		// agent hosts compress resumed context, and verification must never silently
+		// lose the exact evidence links established on the opening turn.
+		prompt = req.Question + "\n\n" + diagnosisJSONInstruction
+	}
+	if nudge := metricsNudge(req.Metrics); nudge != "" {
+		prompt += "\n\n" + nudge
+	}
+	return prompt
 }
 
 // ResourceHealthSignal is the compact server-side health frame captured when a
@@ -124,6 +190,9 @@ const (
 	EvidenceLinked  EvidenceLinkStatus = "linked"
 	EvidenceMissing EvidenceLinkStatus = "missing"
 	EvidenceInvalid EvidenceLinkStatus = "invalid"
+	// EvidenceUnlinked marks one evidence item the binder dropped; the rest of
+	// the case stands.
+	EvidenceUnlinked EvidenceLinkStatus = "unlinked"
 )
 
 // RootCauseEvidence is server-authored provenance for an agent's root cause.
@@ -140,6 +209,85 @@ type evidenceReferenceRequest struct {
 	refs    []string
 }
 
+// EvidenceRole is how the agent frames one cited Radar result. Roles order
+// the Findings list and label cards; they can never hide, collapse, or recolor
+// a card.
+type EvidenceRole string
+
+const (
+	EvidenceRoleCause    EvidenceRole = "cause"
+	EvidenceRoleSymptom  EvidenceRole = "symptom"
+	EvidenceRoleContext  EvidenceRole = "context"
+	EvidenceRoleDemoted  EvidenceRole = "demoted"
+	EvidenceRoleRulesOut EvidenceRole = "rules_out"
+	// EvidenceRoleBenign is the only role that says an adverse-looking result
+	// does not indicate an active problem. "Excludes a hypothesis" and "is less
+	// relevant here" are different statements, and neither reconciles a healthy
+	// verdict with evidence that contradicts it.
+	EvidenceRoleBenign EvidenceRole = "benign"
+)
+
+// DiagnosisEvidenceSubject names which observation inside one tool result a
+// claim is about. One diagnose call fans out into many cards, so the ref alone
+// cannot place a claim. Every field is agent text copied verbatim; the frontend
+// resolves it against the captured evidence and never trusts it as a fact.
+type DiagnosisEvidenceSubject struct {
+	// Group and Namespace are pointers because an explicit empty string is a
+	// statement (core group, cluster scope) that must reach the frontend
+	// distinct from the agent saying nothing.
+	Group     *string `json:"group,omitempty"`
+	Kind      string  `json:"kind"`
+	Namespace *string `json:"namespace,omitempty"`
+	Name      string  `json:"name"`
+	Container string  `json:"container,omitempty"`
+	// Stream is "current" or "previous" for a container log excerpt.
+	Stream string `json:"stream,omitempty"`
+	// Observation is the evidence kind (resource, logs, events, changes,
+	// metrics, …) when one resource yields several observations in one result.
+	Observation string `json:"observation,omitempty"`
+}
+
+// DiagnosisEvidenceItem is one server-bound entry of the agent's case. Only a
+// linked item carries a ref, and the ref was validated against the turn ledger
+// exactly like RootCauseEvidence. An unlinked item keeps its position so
+// RuledOut indexes stay meaningful, but is never rendered.
+type DiagnosisEvidenceItem struct {
+	Status  EvidenceLinkStatus        `json:"status"`
+	Ref     string                    `json:"ref,omitempty"`
+	Role    EvidenceRole              `json:"role,omitempty"`
+	Claim   string                    `json:"claim,omitempty"`
+	Subject *DiagnosisEvidenceSubject `json:"subject,omitempty"`
+}
+
+// DiagnosisRuledOut is a hypothesis the agent dropped, pointing at the
+// evidence item that contradicted it.
+type DiagnosisRuledOut struct {
+	Hypothesis    string `json:"hypothesis"`
+	EvidenceIndex int    `json:"evidenceIndex"`
+}
+
+type caseItemRequest struct {
+	valid   bool
+	ref     string
+	role    EvidenceRole
+	claim   string
+	subject *DiagnosisEvidenceSubject
+}
+
+// caseRequest is the untrusted evidence/ruled_out part of the agent's JSON. It
+// never crosses the API boundary; Run.finishTurn binds it into Evidence and
+// RuledOut.
+type caseRequest struct {
+	items    []caseItemRequest
+	ruledOut []DiagnosisRuledOut
+	// dropped counts entries cut by the per-case cap. Those get no slot in
+	// items, so nothing downstream could otherwise see them go.
+	dropped int
+	// malformed is set when the agent sent an evidence field that is not a
+	// list, so the whole case was unreadable and no count describes it.
+	malformed bool
+}
+
 // Diagnosis is the engine's final result.
 type Diagnosis struct {
 	Healthy bool `json:"healthy,omitempty"`
@@ -151,10 +299,25 @@ type Diagnosis struct {
 	RootCause         string             `json:"rootCause"`
 	Report            string             `json:"report"`
 	RootCauseEvidence *RootCauseEvidence `json:"rootCauseEvidence,omitempty"`
-	Remediation       []string           `json:"remediation"`
-	Confidence        *float64           `json:"confidence"`
-	CostUSD           *float64           `json:"costUsd"`
-	Turns             int                `json:"turns"`
+	// Evidence is the agent's case over Radar's facts: role + one-sentence claim
+	// per cited result, bound server-side for every assessment including
+	// healthy and inconclusive ones. RootCauseEvidence is unchanged by it.
+	Evidence []DiagnosisEvidenceItem `json:"evidence,omitempty"`
+	// UnlinkedEvidence rolls up every agent evidence entry that did not reach
+	// the UI: items the parser rejected or the binder could not link (each an
+	// EvidenceUnlinked slot in Evidence) plus entries cut by the per-case cap,
+	// which get no slot at all. A consumer states the loss instead of showing
+	// a case that silently shrank.
+	UnlinkedEvidence int `json:"unlinkedEvidence,omitempty"`
+	// EvidenceMalformed reports an evidence field that was not a list of
+	// items at all. Nothing in it could be read, and no count would describe
+	// how much was lost.
+	EvidenceMalformed bool                `json:"evidenceMalformed,omitempty"`
+	RuledOut          []DiagnosisRuledOut `json:"ruledOut,omitempty"`
+	Remediation       []string            `json:"remediation"`
+	Confidence        *float64            `json:"confidence"`
+	CostUSD           *float64            `json:"costUsd"`
+	Turns             int                 `json:"turns"`
 	// RecommendedIndex is the 1-based index into Remediation of the single step the
 	// agent recommends applying (what an Apply action performs). 0/nil = no safe
 	// automatic fix. Pointing into the list (vs restating the fix) keeps the UI
@@ -173,6 +336,7 @@ type Diagnosis struct {
 	// evidenceRequest is untrusted model output. It never crosses the API
 	// boundary; Run.finishTurn replaces it with server-authored provenance.
 	evidenceRequest evidenceReferenceRequest
+	caseRequest     caseRequest
 	evidenceScope   string
 	// issuedEvidence is a private snapshot from Radar's transport for this exact
 	// turn. It is intentionally unexported and never serialized or model-authored.
@@ -183,8 +347,13 @@ type Diagnosis struct {
 // "turn" marks the start of a new turn (carries Question/Apply) so a connecting
 // or reconnecting client can reconstruct turn boundaries from the event log.
 type StreamEvent struct {
-	Type              string               `json:"type"` // "turn"|"phase"|"step"|"thinking"|"done"|"error"|"closed"
-	Phase             string               `json:"phase,omitempty"`
+	Type  string `json:"type"`            // "turn"|"phase"|"step"|"thinking"|"done"|"error"|"closed"
+	Phase string `json:"phase,omitempty"` // "investigating"|"connected"|"ready"
+	// Startup facts reported by the agent CLI on the "ready" phase: the model it
+	// resolved, how many Radar tools it registered, and each MCP server's status.
+	Model             string               `json:"model,omitempty"`
+	ToolCount         *int                 `json:"toolCount,omitempty"`
+	MCPServers        []MCPServerStatus    `json:"mcpServers,omitempty"`
 	Step              *StepInfo            `json:"step,omitempty"`
 	Token             string               `json:"token,omitempty"`
 	Diag              *Diagnosis           `json:"diagnosis,omitempty"`
@@ -210,6 +379,13 @@ const (
 	ApplyMutationFailed    ApplyMutationOutcome = "failed"
 	ApplyMutationUnknown   ApplyMutationOutcome = "unknown"
 )
+
+// MCPServerStatus is one MCP server's connection state as the agent CLI
+// reported it at startup. Only "connected" means the server's tools are usable.
+type MCPServerStatus struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
 
 // StepInfo describes one tool invocation (running → done).
 type StepInfo struct {
@@ -511,17 +687,7 @@ func (d *Diagnoser) DiagnoseStream(ctx context.Context, req Request, onEvent fun
 		sessionID = ""
 	}
 
-	prompt := taskPrompt(req)
-	if req.Apply {
-		prompt = applyPrompt(req) // explicit, user-confirmed remediation turn
-	} else if req.Explanation != nil {
-		prompt = explanationPrompt(*req.Explanation)
-	} else if strings.TrimSpace(req.Question) != "" {
-		// Restate the structured/citation contract on every read-only turn. Some
-		// agent hosts compress resumed context, and verification must never silently
-		// lose the exact evidence links established on the opening turn.
-		prompt = req.Question + "\n\n" + diagnosisJSONInstruction
-	}
+	prompt := turnPrompt(req)
 	sys := ""
 	if sessionID == "" {
 		sys = systemPrompt // a fresh session establishes the SRE + security framing
@@ -553,19 +719,54 @@ func (d *Diagnoser) DiagnoseStream(ctx context.Context, req Request, onEvent fun
 		return Diagnosis{}, fmt.Errorf("ai: start %s: %w", agent.Name(), err)
 	}
 
-	onEvent(StreamEvent{Type: "phase", Phase: "investigating"})
+	// The handshake watcher and the stream parser both report to the caller;
+	// serialize them so callback consumers never see interleaved events.
+	var emitMu sync.Mutex
+	emit := func(event StreamEvent) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		onEvent(event)
+	}
+	emit(StreamEvent{Type: "phase", Phase: "investigating"})
 	validator := investigationEvidenceValidator{
 		registry: d.evidenceRefs,
 		scope:    evidenceScope,
 		claimed:  make(map[string]struct{}),
 	}
 	streamEvent := func(event StreamEvent) {
-		onEvent(validator.validate(event))
+		emit(validator.validate(event))
+	}
+	streamDone := make(chan struct{})
+	var handshake sync.WaitGroup
+	if evidenceLease != nil {
+		// The private mount marks the scope connected on the agent's MCP
+		// handshake, which happens before its first message. Report it once.
+		handshake.Add(1)
+		go func() {
+			defer handshake.Done()
+			connected := evidenceLease.Connected()
+			select {
+			case <-connected:
+			case <-streamDone:
+				// Both may be ready when a short turn ends right after its
+				// handshake; select picks arbitrarily, so re-check before giving up.
+				select {
+				case <-connected:
+				default:
+					return
+				}
+			}
+			emit(StreamEvent{Type: "phase", Phase: "connected"})
+		}()
 	}
 	diag := agent.parseStream(stdout, streamEvent)
 	diag.evidenceScope = evidenceScope
 
 	waitErr := cmd.Wait()
+	// The watcher outlives stdout so a handshake that lands between EOF and
+	// process exit is still reported, and always before this method returns.
+	close(streamDone)
+	handshake.Wait()
 	if evidenceLease != nil {
 		// Closing before the diagnosis leaves this method prevents any late private
 		// MCP call from minting evidence for a completed turn. The deferred close
@@ -616,10 +817,11 @@ func taskPrompt(req Request) string {
 }
 
 const diagnosisJSONInstruction = "Finish your reply with a fenced ```json block: " +
-	`{"healthy": boolean, "inconclusive": boolean, "root_cause": string, "root_cause_evidence_refs": [string], "remediation": [string], "recommended_index": number, "recommended_reason": string, "confidence": number 0..1}. ` +
+	`{"healthy": boolean, "inconclusive": boolean, "root_cause": string, "root_cause_evidence_refs": [string], "evidence": [{"ref": string, "role": "cause"|"symptom"|"context"|"benign"|"demoted"|"rules_out", "claim": string, "subject": {"group": string, "kind": string, "namespace": string, "name": string, "container": string, "stream": "current"|"previous", "observation": string}}], "ruled_out": [{"hypothesis": string, "evidence_index": number}], "remediation": [string], "recommended_index": number, "recommended_reason": string, "confidence": number 0..1}. ` +
 	"Set healthy=true ONLY when your checks actively verified the resource is fine; then leave root_cause and remediation empty and recommended_index 0. " +
 	"Set inconclusive=true when you investigated but could NOT determine the cause (RBAC-denied reads, missing data, ambiguous evidence); then, in your PROSE before the JSON block, say what you checked and what blocked you, leave root_cause and remediation empty, and set recommended_index 0. healthy and inconclusive are mutually exclusive; do not set healthy=true merely because you found nothing. " +
 	"In root_cause_evidence_refs, include at most 3 specific successful Radar checks from THIS TURN, most decisive first. Copy each ref EXACTLY from that result's [[radar:evidence-ref=ev_...]] marker; never invent, alter, or reuse a ref from an earlier turn. For a root cause, cite the discriminating check that establishes WHY, not only a generic symptom. Use an empty array when root_cause is empty. If no successful relevant check supports the root cause, use an empty root_cause_evidence_refs array and lower confidence or set inconclusive=true rather than fabricating support. " +
+	"In evidence, make your case over the Radar checks from THIS TURN: at most 8 items, each citing one ref copied EXACTLY from a [[radar:evidence-ref=ev_...]] marker (refs may repeat with different subjects), a role, and a claim of ONE sentence (200 characters max) saying what that result shows. Roles: cause (establishes why), symptom (what the problem looks like), context (related, checked, worth seeing), benign (this result looks adverse but is NOT an active problem, and the claim says why it is expected or already resolved), demoted (directly related but less relevant, and the claim says why), rules_out (the cited result itself contradicts a hypothesis; never use rules_out for absence of evidence). Use benign, not demoted or rules_out, when you are calling a workload healthy despite adverse evidence Radar captured: only benign states that the evidence does not indicate a live problem. Roles order the Findings list; they never hide a card. When a cited result covers more than one resource, pod, container, or log stream, set subject to name the exact one the claim is about (kind and name required; add group, namespace, container, stream, and observation — the evidence kind such as logs, events, changes, metrics, resource; a diagnose bundle's vitals charts are named metrics:cpu, metrics:memory, or metrics:restarts — as needed); omit subject when the result is about one thing. In ruled_out, list at most 5 hypotheses you dropped, each with evidence_index pointing (0-based) at the evidence item whose result contradicted it. Healthy and inconclusive assessments should still cite context items for what you checked and found fine. When you set healthy=true, Radar compares your verdict against what it captured and warns the operator if any active-problem evidence stands unaddressed, so you MUST cite each such result and mark it benign with the reason it is not a live problem: a failing probe or readiness condition, a restart or crash, an unready or unavailable workload, an error or panic in a log stream, a Warning event, a failed DNS or network check. Citing only the results that look fine leaves that warning in place, which is the correct outcome when you have not explained the adverse ones. Use empty arrays when you have nothing to add. " +
 	"recommended_index is the 1-based index into the remediation array of the SINGLE step you " +
 	"most recommend applying — the safest, most targeted, deterministic one (exactly what an " +
 	"'Apply' action will perform). Use 0 when no step is a safe automatic fix (e.g. the change " +
@@ -888,6 +1090,26 @@ type cliEvent struct {
 	TotalCostUSD *float64 `json:"total_cost_usd"`
 	NumTurns     int      `json:"num_turns"`
 	SessionID    string   `json:"session_id"`
+	// system/init only.
+	Model      string            `json:"model"`
+	Tools      []string          `json:"tools"`
+	MCPServers []MCPServerStatus `json:"mcp_servers"`
+}
+
+// agentReadyEvent reports the CLI's init message as a startup phase. Radar
+// tools are counted by their MCP prefix so the count reflects what the model can
+// actually call, not what Radar offered.
+func agentReadyEvent(model string, tools []string, servers []MCPServerStatus) StreamEvent {
+	count := 0
+	for _, tool := range tools {
+		if strings.HasPrefix(tool, "mcp__radar__") {
+			count++
+		}
+	}
+	return StreamEvent{
+		Type: "phase", Phase: "ready",
+		Model: model, ToolCount: &count, MCPServers: servers,
+	}
 }
 
 func parseStream(r io.Reader, onEvent func(StreamEvent)) Diagnosis {
@@ -926,6 +1148,10 @@ func parseStream(r io.Reader, onEvent func(StreamEvent)) Diagnosis {
 			continue
 		}
 		switch ev.Type {
+		case "system":
+			if ev.Subtype == "init" {
+				onEvent(agentReadyEvent(ev.Model, ev.Tools, ev.MCPServers))
+			}
 		case "assistant":
 			if ev.Message == nil {
 				continue

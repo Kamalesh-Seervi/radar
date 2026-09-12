@@ -1,6 +1,13 @@
 // Server-side runs keep background and running investigations visible in both
 // the docked Home view and the maximized workspace's master pane.
-import { CircleAlert, Loader2, Server, Sparkles, Square } from "lucide-react";
+import {
+  ArrowRight,
+  CircleAlert,
+  Loader2,
+  Server,
+  Sparkles,
+  Square,
+} from "lucide-react";
 import { type RunSummary } from "../../api/diagnose";
 import {
   groupQualifiesLaneId,
@@ -107,6 +114,46 @@ export function statusWord(status: RunSummary["status"]): {
     case "stale":
       return { text: "Read-only", cls: "text-theme-text-tertiary" };
   }
+}
+
+export function InvestigationHome({
+  agentLabel,
+  onBrowseIssues,
+}: {
+  agentLabel: string;
+  onBrowseIssues?: () => void;
+}) {
+  return (
+    <div className="flex min-h-full w-full items-center justify-center px-4 py-8 sm:px-6">
+      <section className="mx-auto max-w-2xl text-center">
+        <span className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl bg-accent-muted text-accent">
+          <Sparkles className="h-5 w-5" />
+        </span>
+        <h1 className="mt-4 text-xl font-semibold text-theme-text-primary">
+          Choose an investigation
+        </h1>
+        <p className="mx-auto mt-1 max-w-md text-sm text-theme-text-tertiary">
+          {onBrowseIssues
+            ? "Pick a problem from Issues, then choose "
+            : "Select one from your history, or open a resource and choose "}
+          <span className="font-medium text-theme-text-secondary">
+            Investigate
+          </span>{" "}
+          to start a focused investigation with {agentLabel}.
+        </p>
+        {onBrowseIssues && (
+          <button
+            type="button"
+            onClick={onBrowseIssues}
+            className="btn-brand mt-4 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium"
+          >
+            Browse issues
+            <ArrowRight className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </section>
+    </div>
+  );
 }
 
 export function RecentList({
@@ -246,8 +293,7 @@ export function RecentList({
                       ? `${parsed.account} · ${parsed.region}`
                       : r.context;
                 const readableKind = pluralToKind(r.kind);
-                const kind =
-                  groupsByKind.get(readableKind)!.size > 1
+                const kind = groupsByKind.get(readableKind)!.size > 1
                     ? `${readableKind} · ${r.group || "core"}`
                     : readableKind;
                 const initialIssue = r.health?.topReason?.trim();

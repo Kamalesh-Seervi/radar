@@ -8,6 +8,12 @@ import {
   Timeline,
   TurnView,
   appendThinking,
+  remediationCommands,
+  mergeStartupSignal,
+  middleTruncate,
+  runningElapsedLabel,
+  toolDurationLabel,
+  toolErrorReason,
   upsertTool,
   type TimelineItem,
   type Turn,
@@ -16,6 +22,7 @@ import type {
   AgentInfo,
   Diagnosis,
   DiagnoseStep,
+  DiagnoseStreamEvent,
   ExecutionProfile,
 } from "../../api/diagnose";
 import { investigationEvidenceSourceId } from "./investigationEvidence";
@@ -40,13 +47,57 @@ it("keeps earlier remediation copyable without suggesting it is executable", () 
     />,
   );
   expect(html).toContain("Restore the required Secret");
-  expect(html).toContain("Copy remediation step 1");
+  // Prose has nothing worth copying; only a command gets a copy button.
+  expect(html).not.toContain("Copy remediation step");
+  expect(html).not.toContain("Copy command");
   expect(html).toContain("Reassess before applying");
   expect(html).not.toContain("Apply…");
   expect(html).not.toContain("ask the agent to continue");
   expect(html.indexOf("Reassess before applying")).toBeLessThan(
     html.indexOf("Restore the required Secret"),
   );
+});
+
+describe("remediation commands", () => {
+  it("extracts shell commands from inline code and fenced blocks, not identifiers", () => {
+    expect(
+      remediationCommands(
+        "Run `kubectl rollout undo deployment/api -n dev --to-revision=7` to revert; the `MONGO_PASSWORD` key in `Secret/api` stays.",
+      ),
+    ).toEqual(["kubectl rollout undo deployment/api -n dev --to-revision=7"]);
+    expect(
+      remediationCommands(
+        "Then:\n```bash\nhelm rollback prometheus 1 -n opencost\nkubectl -n opencost get pods\n```\nand check `mongosh --host nonprod-boxer.ax6bh.mongodb.net`.",
+      ),
+    ).toEqual([
+      "helm rollback prometheus 1 -n opencost\nkubectl -n opencost get pods",
+      "mongosh --host nonprod-boxer.ax6bh.mongodb.net",
+    ]);
+    expect(
+      remediationCommands("Pin the image to a digest instead of `latest`."),
+    ).toEqual([]);
+  });
+
+  it("offers one copy button per command in a step", () => {
+    const html = renderToStaticMarkup(
+      <ResultCard
+        diagnosis={
+          {
+            rootCause: "Stale credential",
+            report: "Assessment",
+            remediation: [
+              "Roll back with `kubectl rollout undo deployment/api -n dev` and then verify with `kubectl -n dev get pods`.",
+            ],
+          } as Diagnosis
+        }
+        section="actions"
+        compactActions
+      />,
+    );
+    expect(html).toContain("Copy command 1 of step 1");
+    expect(html).toContain("Copy command 2 of step 1");
+    expect(html).not.toContain("Copy remediation step");
+  });
 });
 
 describe("explanation placement", () => {
@@ -332,6 +383,385 @@ describe("Timeline reasoning density", () => {
   });
 });
 
+describe("Timeline startup signals", () => {
+  const readyEvent: Pick<
+    DiagnoseStreamEvent,
+    "phase" | "model" | "toolCount" | "mcpServers"
+  > = {
+    phase: "ready",
+    model: "claude-opus-5",
+    toolCount: 24,
+    mcpServers: [{ name: "radar", status: "connected" }],
+  };
+
+  it("reports each startup phase in place of the generic pending label", () => {
+    const before = renderToStaticMarkup(
+      <Timeline items={[]} running agentLabel="Claude Code" />,
+    );
+    expect(before).toContain("Starting investigation…");
+
+    const starting = mergeStartupSignal(undefined, { phase: "investigating" });
+    expect(
+      renderToStaticMarkup(
+        <Timeline
+          items={[]}
+          running
+          agentLabel="Claude Code"
+          startup={starting}
+        />,
+      ),
+    ).toContain("Claude Code starting…");
+
+    const connected = mergeStartupSignal(starting, { phase: "connected" });
+    expect(
+      renderToStaticMarkup(
+        <Timeline
+          items={[]}
+          running
+          agentLabel="Claude Code"
+          startup={connected}
+        />,
+      ),
+    ).toContain("Connected to Radar&#x27;s tools");
+
+    const ready = mergeStartupSignal(connected, readyEvent);
+    const html = renderToStaticMarkup(
+      <Timeline items={[]} running agentLabel="Claude Code" startup={ready} />,
+    );
+    expect(html).toContain(
+      "Claude Code ready · claude-opus-5 · 24 Radar tools",
+    );
+    expect(html).not.toContain("Starting investigation…");
+    expect(html).not.toContain("MCP server");
+  });
+
+  it("keeps the furthest phase when the handshake lands after the init line", () => {
+    const ready = mergeStartupSignal(undefined, readyEvent);
+    const late = mergeStartupSignal(ready, { phase: "connected" });
+    expect(late).toEqual({
+      phase: "ready",
+      model: "claude-opus-5",
+      toolCount: 24,
+      mcpServers: [{ name: "radar", status: "connected" }],
+    });
+    expect(mergeStartupSignal(ready, { phase: "investigating" })).toBe(late);
+    expect(mergeStartupSignal(undefined, { phase: "unknown" })).toBeUndefined();
+  });
+
+  it("yields to the tool activity once the transcript has items", () => {
+    const html = renderToStaticMarkup(
+      <Timeline
+        items={[
+          {
+            kind: "tool",
+            id: "tool-1",
+            tool: "get_logs",
+            status: "running",
+            animate: false,
+          },
+        ]}
+        running
+        agentLabel="Claude Code"
+        startup={mergeStartupSignal(undefined, readyEvent)}
+      />,
+    );
+    expect(html).toContain("Reading logs…");
+    expect(html).not.toContain("Claude Code ready");
+  });
+
+  it("shows no startup label on a replayed finished turn", () => {
+    const html = renderToStaticMarkup(
+      <Timeline
+        items={[]}
+        running={false}
+        agentLabel="Claude Code"
+        startup={mergeStartupSignal(undefined, readyEvent)}
+      />,
+    );
+    expect(html).not.toContain("Claude Code ready");
+    expect(html).not.toContain("Starting investigation…");
+    expect(html).not.toContain("Connected to Radar");
+  });
+
+  it("renders a bare ready label when the init facts are absent", () => {
+    // Hosted transports may forward only the phase name; the label and the
+    // warning must degrade to exactly what was reported.
+    const startup = mergeStartupSignal(undefined, { phase: "ready" });
+    const html = renderToStaticMarkup(
+      <Timeline
+        items={[]}
+        running
+        agentLabel="Claude Code"
+        startup={startup}
+      />,
+    );
+    expect(html).toContain("Claude Code ready</span>");
+    expect(html).not.toContain("Radar tools");
+    expect(html).not.toContain("MCP server");
+  });
+
+  it("uses conditional wording for servers whose startup state is not final", () => {
+    const startup = mergeStartupSignal(undefined, {
+      phase: "ready",
+      model: "claude-opus-5",
+      toolCount: 24,
+      mcpServers: [
+        { name: "radar", status: "connected" },
+        { name: "github", status: "pending" },
+      ],
+    });
+    const pending = renderToStaticMarkup(
+      <Timeline
+        items={[]}
+        running
+        agentLabel="Claude Code"
+        startup={startup}
+      />,
+    );
+    expect(pending).toContain("is pending");
+    expect(pending).toContain("may not have been available");
+    expect(pending).not.toContain("ran this turn without");
+
+    const failed = renderToStaticMarkup(
+      <Timeline
+        items={[]}
+        running
+        agentLabel="Claude Code"
+        startup={mergeStartupSignal(undefined, {
+          phase: "ready",
+          mcpServers: [
+            { name: "radar", status: "connected" },
+            { name: "github", status: "failed" },
+          ],
+        })}
+      />,
+    );
+    expect(failed).toContain("failed to connect");
+    expect(failed).toContain("ran this turn without those tools");
+  });
+
+  it("warns when the CLI reports an MCP server that is not connected", () => {
+    const startup = mergeStartupSignal(undefined, {
+      phase: "ready",
+      model: "claude-opus-5",
+      toolCount: 0,
+      mcpServers: [{ name: "radar", status: "failed" }],
+    });
+    const live = renderToStaticMarkup(
+      <Timeline
+        items={[]}
+        running
+        agentLabel="Claude Code"
+        startup={startup}
+      />,
+    );
+    expect(live).toContain("Claude Code ready · claude-opus-5 · 0 Radar tools");
+    expect(live).toContain("failed to connect");
+    expect(live).toContain("had no Radar tools this turn");
+
+    // The warning is a fact of the run and survives replay; the label does not.
+    const replayed = renderToStaticMarkup(
+      <Timeline
+        items={[{ kind: "thinking", text: "done", animate: false }]}
+        running={false}
+        agentLabel="Claude Code"
+        startup={startup}
+      />,
+    );
+    expect(replayed).toContain("failed to connect");
+    expect(replayed).not.toContain("Claude Code ready");
+  });
+});
+
+describe("running status elapsed counter", () => {
+  it("is a row-level figure, never part of the phase label", () => {
+    expect(runningElapsedLabel(0)).toBeUndefined();
+    expect(runningElapsedLabel(2)).toBeUndefined();
+    expect(runningElapsedLabel(3)).toBe("3s elapsed");
+    expect(runningElapsedLabel(19)).toBe("19s elapsed");
+
+    const html = renderToStaticMarkup(
+      <Timeline
+        items={[]}
+        running
+        agentLabel="Claude Code"
+        startup={mergeStartupSignal(undefined, { phase: "connected" })}
+      />,
+    );
+    const label = html.match(/<span class="ai-shimmer[^"]*">([^<]*)</);
+    expect(label?.[1]).toBe("Connected to Radar&#x27;s tools");
+    expect(label?.[1]).not.toMatch(/\d+s/);
+  });
+});
+
+describe("tool row duration and failure reason", () => {
+  const doneStep = (
+    overrides: Partial<Extract<TimelineItem, { kind: "tool" }>>,
+  ): TimelineItem => ({
+    kind: "tool",
+    id: "tool-1",
+    tool: "get_events",
+    status: "done",
+    summary: '{"namespace":"dev"}',
+    result: '{"events":[]}',
+    isError: false,
+    animate: false,
+    ...overrides,
+  });
+
+  it("hides sub-threshold durations and shows whole seconds above it", () => {
+    expect(toolDurationLabel(undefined)).toBeUndefined();
+    expect(toolDurationLabel(125)).toBeUndefined();
+    expect(toolDurationLabel(1999)).toBeUndefined();
+    expect(toolDurationLabel(2000)).toBe("2s");
+    expect(toolDurationLabel(3400)).toBe("3s");
+    expect(toolDurationLabel(12600)).toBe("13s");
+
+    const quick = renderToStaticMarkup(
+      <ThemeProvider>
+        <Timeline items={[doneStep({ ms: 125 })]} running={false} />
+      </ThemeProvider>,
+    );
+    // The only millisecond figure is the expanded result header, not the row.
+    expect(quick.match(/125ms/g)).toHaveLength(1);
+    expect(quick.indexOf("125ms")).toBeGreaterThan(
+      quick.indexOf("Original result"),
+    );
+    expect(quick).not.toMatch(/>\d+s</);
+
+    const slow = renderToStaticMarkup(
+      <ThemeProvider>
+        <Timeline items={[doneStep({ ms: 3400 })]} running={false} />
+      </ThemeProvider>,
+    );
+    expect(slow).toContain(">3s<");
+    expect(slow.indexOf(">3s<")).toBeLessThan(slow.indexOf("Original result"));
+    expect(slow.match(/3400ms/g)).toHaveLength(1);
+  });
+
+  it("keeps the exact milliseconds in the expanded result header", () => {
+    const sourceId = investigationEvidenceSourceId(0, "tool-1");
+    const html = renderToStaticMarkup(
+      <ThemeProvider>
+        <Timeline
+          items={[doneStep({ ms: 3400 })]}
+          running={false}
+          turnIndex={0}
+          sourceRevealRequest={{ sourceId, requestId: 1 }}
+        />
+      </ThemeProvider>,
+    );
+    expect(html).toContain('aria-expanded="true"');
+    expect(html).toContain("Original result");
+    expect(html).toContain("3400ms");
+  });
+
+  it("extracts a one-line reason from the producer's error text", () => {
+    expect(
+      toolErrorReason('\ninvalid duration "30d": time: unknown unit "d"\nmore'),
+    ).toBe('invalid duration "30d": time: unknown unit "d"');
+    expect(
+      toolErrorReason(JSON.stringify({ error: 'resource not found: pod "x"' })),
+    ).toBe('resource not found: pod "x"');
+    expect(toolErrorReason("")).toBeUndefined();
+    expect(toolErrorReason("  \n ")).toBeUndefined();
+    expect(toolErrorReason('{"error":""}')).toBeUndefined();
+    // Radar's not-found hints are for the agent; the row keeps what failed.
+    expect(
+      toolErrorReason(
+        'resource not found: secret "project-infra" not found — found Deployment autopush/project-infra — retry with kind=deployment; or use search',
+      ),
+    ).toBe('resource not found: secret "project-infra" not found');
+  });
+
+  it("middle-truncates a long reason so its identifier tail survives", () => {
+    const short = 'resource not found: secret "dev/does-not-exist" not found';
+    expect(middleTruncate(short)).toBe(short);
+    const long =
+      "failed to get logs for autopush/project-infra-68c7b766dc-g2xlg: container is waiting to start: CreateContainerConfigError for pod project-infra-68c7b766dc-g2xlg";
+    const cut = middleTruncate(long);
+    expect(cut.length).toBeLessThanOrEqual(100);
+    expect(cut).toContain("…");
+    expect(cut.startsWith("failed to get logs for autopush")).toBe(true);
+    expect(cut.endsWith("project-infra-68c7b766dc-g2xlg")).toBe(true);
+    expect(middleTruncate("abcdefghij", 6, 2)).toBe("abc…ij");
+  });
+
+  it("lets the arguments give way before the reason on a collapsed failed row", () => {
+    const html = renderToStaticMarkup(
+      <ThemeProvider>
+        <Timeline
+          items={[
+            doneStep({
+              isError: true,
+              summary:
+                '{"kind":"Secret","namespace":"dev","name":"does-not-exist"}',
+              result:
+                'resource not found: secret "dev/does-not-exist" not found — found Deployment dev/api — retry with kind=deployment',
+            }),
+          ]}
+          running={false}
+        />
+      </ThemeProvider>,
+    );
+    const args = html.match(/<span class="([^"]*)">kind=Secret/);
+    expect(args?.[1]).toContain("flex-1");
+    expect(args?.[1]).toContain("truncate");
+    const reason = html.match(
+      /<span class="investigation-tool-reason ([^"]*)">([^<]*)</,
+    );
+    expect(reason?.[1]).toContain("shrink-0");
+    expect(reason?.[2]).toBe(
+      "resource not found: secret &quot;dev/does-not-exist&quot; not found",
+    );
+  });
+
+  it("shows the failure reason inline on a failed row only when the producer gave one", () => {
+    const failed = renderToStaticMarkup(
+      <ThemeProvider>
+        <Timeline
+          items={[
+            doneStep({
+              isError: true,
+              result:
+                '\nfailed to get logs for dev/api: container "api" is waiting to start: CreateContainerConfigError',
+            }),
+          ]}
+          running={false}
+        />
+      </ThemeProvider>,
+    );
+    expect(failed).toContain("investigation-tool-reason");
+    expect(failed).toContain(
+      "failed to get logs for dev/api: container &quot;api&quot; is waiting to start",
+    );
+    expect(failed.indexOf("investigation-tool-reason")).toBeGreaterThan(
+      failed.indexOf("namespace=dev"),
+    );
+
+    const silent = renderToStaticMarkup(
+      <ThemeProvider>
+        <Timeline
+          items={[doneStep({ isError: true, result: undefined })]}
+          running={false}
+        />
+      </ThemeProvider>,
+    );
+    expect(silent).toContain('aria-label="Tool failed"');
+    expect(silent).not.toContain("investigation-tool-reason");
+
+    const succeeded = renderToStaticMarkup(
+      <ThemeProvider>
+        <Timeline
+          items={[doneStep({ isError: false, result: "plain text result" })]}
+          running={false}
+        />
+      </ThemeProvider>,
+    );
+    expect(succeeded).not.toContain("investigation-tool-reason");
+  });
+});
+
 function renderAgent(
   agent: string,
   profiles: ExecutionProfile[],
@@ -579,6 +1009,72 @@ describe("ResultCard conclusion states", () => {
     expect(html).not.toContain("Key evidence");
     expect(html).toContain("border-amber-500/40");
     expect(html).not.toContain("border-emerald-500/30");
+  });
+
+  it("lists a step's commands in reading order across inline and fenced code", () => {
+    const step =
+      "Roll it with `kubectl -n dev rollout restart deploy/api`, then verify:\n```bash\nkubectl -n dev rollout status deploy/api\n```";
+    expect(remediationCommands(step)).toEqual([
+      "kubectl -n dev rollout restart deploy/api",
+      "kubectl -n dev rollout status deploy/api",
+    ]);
+  });
+
+  it("reframes the conflict banner when the agent explained every adverse card", () => {
+    const html = renderToStaticMarkup(
+      <ResultCard
+        diagnosis={diagnosis({
+          healthy: true,
+          report: "The workload appears ready.",
+        })}
+        evidenceConflict
+        evidenceConflictExplainedBy={["CrashLoopBackOff", "Error logs"]}
+      />,
+    );
+
+    // An explanation reframes Radar's finding; it never replaces it with
+    // reassurance. The banner stays a warning, still says the evidence is
+    // there, and points at the notes.
+    expect(html).toContain(
+      "Agent reports no active problem; adverse evidence remains",
+    );
+    expect(html).toContain("Radar captured evidence of an active problem");
+    expect(html).toContain("the note on CrashLoopBackOff and Error logs");
+    expect(html).not.toContain("Assessment conflicts with captured evidence");
+    expect(html).toContain("border-amber-500/40");
+    expect(html).not.toContain("border-emerald-500/30");
+    expect(html).not.toContain("bg-accent/5");
+    // Never claims a severity tier it did not check.
+    expect(html).not.toContain("warning-level");
+
+    const unexplained = renderToStaticMarkup(
+      <ResultCard
+        diagnosis={diagnosis({
+          healthy: true,
+          report: "The workload appears ready.",
+        })}
+        evidenceConflict
+        evidenceConflictExplainedBy={[]}
+      />,
+    );
+    expect(unexplained).toContain(
+      "Assessment conflicts with captured evidence",
+    );
+
+    // Coverage is a separate fact from the conflict; an explanation of the
+    // conflict must not quietly retire it.
+    const limited = renderToStaticMarkup(
+      <ResultCard
+        diagnosis={diagnosis({
+          healthy: true,
+          report: "The workload appears ready.",
+        })}
+        evidenceConflict
+        evidenceConflictExplainedBy={["CrashLoopBackOff"]}
+        coverageLimited
+      />,
+    );
+    expect(limited).toContain("Evidence coverage is also limited");
   });
 
   it("keeps a follow-up framed as an answer rather than a new conclusion", () => {
@@ -1029,5 +1525,45 @@ describe("assessment provenance disclosure", () => {
     expect(renderSources("initial-source")).not.toContain(
       'id="investigation-evidence-',
     );
+  });
+
+  it("shows a claim here when its card was withheld, instead of counting it as visible", () => {
+    // A card-placed note whose card the pane withheld renders nowhere unless
+    // this row falls back to it, while the count still claimed it was on a
+    // card — a receipt for something the reader cannot see.
+    const investigationCase = {
+      items: [
+        {
+          index: 0,
+          role: "context",
+          claim: "WITHHELD_CLAIM",
+          source: { id: "s1", tool: "issues", args: "{}" },
+          placement: "card",
+          groupId: "g-hidden",
+        },
+      ],
+    } as unknown as Parameters<
+      typeof AssessmentSources
+    >[0]["investigationCase"];
+
+    const hidden = renderToStaticMarkup(
+      <AssessmentSources
+        investigationCase={investigationCase}
+        renderedGroupIds={new Set<string>()}
+        onViewSource={noop}
+      />,
+    );
+    expect(hidden).toContain("WITHHELD_CLAIM");
+    expect(hidden).not.toContain("agent note on an evidence card");
+
+    const shown = renderToStaticMarkup(
+      <AssessmentSources
+        investigationCase={investigationCase}
+        renderedGroupIds={new Set(["g-hidden"])}
+        onViewSource={noop}
+      />,
+    );
+    expect(shown).not.toContain("WITHHELD_CLAIM");
+    expect(shown).toContain("1 agent note on an evidence card");
   });
 });

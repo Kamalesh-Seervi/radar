@@ -110,7 +110,13 @@ type diagnoseResponse struct {
 	// without adding one kube-system issue to every namespaced issue list.
 	DNSContext *diagnoseDNSContext `json:"dnsContext,omitempty"`
 	Pods       int                 `json:"pods"`
-	NarrowHint string              `json:"narrowHint,omitempty"`
+	// PodNames lists the pods the diagnosed workload controls now, by
+	// ownership, sorted and cut to the first diagnoseMetricsMaxPods with
+	// PodNamesTruncated set when more exist. They are the exact set an agent
+	// should scope its own Prometheus queries to (pod=~'^(a|b)$').
+	PodNames          []string `json:"podNames,omitempty"`
+	PodNamesTruncated bool     `json:"podNamesTruncated,omitempty"`
+	NarrowHint        string   `json:"narrowHint,omitempty"`
 	// Warnings are state-derived advisories on the diagnosed object — e.g.,
 	// "resource is being deleted", "managed by Helm, edits may revert",
 	// "condition has been False since creation". Empty when nothing notable.
@@ -118,6 +124,11 @@ type diagnoseResponse struct {
 	// GitOpsDiagnosis is set only for GitOps reconcilers (Argo Application /
 	// Flux Kustomization / HelmRelease), which have no pods — see gitopsDiagnosis.
 	GitOpsDiagnosis *gitopsDiagnosis `json:"gitopsDiagnosis,omitempty"`
+	// Metrics is the workload's cpu/memory/restarts over the diagnose window
+	// for the same pod set the rest of the bundle covers. Omitted when no
+	// Prometheus is configured, the pod set is empty, or the caller cannot get
+	// the diagnosed resource — see diagnoseMetrics.
+	Metrics *diagnoseMetrics `json:"metrics,omitempty"`
 }
 
 // diagnoseLogCoverage is structured collection metadata shared by agent and UI
@@ -315,7 +326,9 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 	}
 
 	pods, err := resolveDiagnosePods(cache, kindNorm, input.Namespace, input.Name, obj)
-	if err != nil {
+	podsNotListable := errors.Is(err, errPodsNotListable)
+	podsCacheWarming := errors.Is(err, errPodsCacheWarming)
+	if err != nil && !podsNotListable && !podsCacheWarming {
 		return nil, nil, err
 	}
 	resCtx := buildMCPResourceContextWithStaleChecks(
@@ -341,10 +354,26 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 		return nil, nil, err
 	}
 
+	// Vitals run beside the log fan-out under their own budget, gated per
+	// kind: the namespace check above only proves the caller may see the
+	// namespace, while the pod set and the object came from the shared cache.
+	var (
+		metrics   *diagnoseMetrics
+		metricsWG sync.WaitGroup
+	)
+	metricsWG.Add(1)
+	go func() {
+		defer metricsWG.Done()
+		metrics = diagnoseWorkloadMetrics(ctx, input.Group, kindNorm, input.Namespace, input.Name, pods, diagnoseMetricsSince(sinceSeconds), time.Now())
+	}()
+
+	podNames, podNamesTruncated := diagnosePodNames(pods)
 	resp := diagnoseResponse{
-		Resource:        minified,
-		ResourceContext: resCtx,
-		Pods:            len(pods),
+		Resource:          minified,
+		ResourceContext:   resCtx,
+		Pods:              len(pods),
+		PodNames:          podNames,
+		PodNamesTruncated: podNamesTruncated,
 		// Surface the issues Radar already classified for this object (subject
 		// or affected member), scoped to its namespace — so the agent sees
 		// "crashloop + missing ConfigMap" up front, not just raw logs.
@@ -461,6 +490,14 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 	}
 	resp.DNSContext = dnsContextForDiagnose(ctx, cache, obj, pods, resp.LogsCurrent, resp.LogsPrevious, resp.Events)
 	resp.Warnings = k8score.EnrichRuntimeObjectWarnings(obj)
+	if podsNotListable {
+		// Say it plainly: everything pod-derived is empty because the pods
+		// could not be listed, not because the workload has none.
+		resp.Warnings = append(resp.Warnings, "Radar cannot list pods in this namespace, so pod logs, pod events and workload metrics are missing from this bundle.")
+	}
+	if podsCacheWarming {
+		resp.Warnings = append(resp.Warnings, "Radar is still loading the caches this workload's pods are resolved through, so pod logs, pod events and workload metrics are missing from this bundle. Retry in a moment.")
+	}
 	capped, capStats := capMultiPodLogBundles(resp.LogsCurrent, resp.LogsPrevious)
 	resp.LogsCurrent = capped[0]
 	resp.LogsPrevious = capped[1]
@@ -481,6 +518,8 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 			resp.NarrowHint = capHint
 		}
 	}
+	metricsWG.Wait()
+	resp.Metrics = metrics
 	return toJSONResult(resp)
 }
 
@@ -794,12 +833,31 @@ func resolveDiagnosePods(cache *k8s.ResourceCache, kindNorm, namespace, name str
 		}
 		return []*corev1.Pod{pod}, nil
 	}
-	selector, err := k8s.GetWorkloadSelector(cache, kindNorm, namespace, name)
-	if err != nil {
-		return nil, err
+	// Membership is controller ownership, the relation kube-state-metrics
+	// records too, so the bundle, its vitals and the workload page name the
+	// same pods; a selector would also match bare pods and a sibling
+	// controller's pods during a Rollout migration.
+	pods, err := k8s.WorkloadPods(cache, kindNorm, namespace, name)
+	if errors.Is(err, k8s.ErrWorkloadCacheWarming) {
+		return nil, errPodsCacheWarming
 	}
-	return cache.GetPodsForWorkload(namespace, selector), nil
+	if errors.Is(err, k8s.ErrWorkloadAccessDenied) {
+		// The rest of the bundle — resource context, issues, events, changes —
+		// does not depend on listing pods, so an install that cannot list them
+		// still gets a useful diagnose. The caller records the denial.
+		return nil, errPodsNotListable
+	}
+	return pods, err
 }
+
+// errPodsNotListable marks the one pod-resolution failure the bundle can
+// carry rather than fail on.
+var errPodsNotListable = errors.New("pods are not listable with the current permissions")
+
+// errPodsCacheWarming is the same degradation for a cache that has not
+// finished loading. It is kept apart from errPodsNotListable so the bundle
+// never blames permissions for a wait.
+var errPodsCacheWarming = errors.New("the pod cache is still loading")
 
 // fetchEventsForResource returns up to `limit` recent dedup'd events
 // involving this resource. When pods is non-empty, also matches pod-level
@@ -1105,4 +1163,20 @@ func filterEventsByInvolvedObject(events []*corev1.Event, displayKind, group, na
 		}
 	}
 	return matched
+}
+
+// diagnosePodNames is the bundle's pod list: sorted names, capped like the
+// vitals so a large fleet does not swell every diagnose result.
+func diagnosePodNames(pods []*corev1.Pod) ([]string, bool) {
+	names := make([]string, 0, len(pods))
+	for _, p := range pods {
+		if p != nil && p.Name != "" {
+			names = append(names, p.Name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) > diagnoseMetricsMaxPods {
+		return names[:diagnoseMetricsMaxPods], true
+	}
+	return names, false
 }

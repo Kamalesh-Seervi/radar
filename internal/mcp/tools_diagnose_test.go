@@ -31,9 +31,18 @@ func setupFakeCacheForDiagnoseTests(t *testing.T) {
 	selector := map[string]string{"app": "cart"}
 	startedAt := time.Now().UTC().Add(-2 * time.Minute)
 	secretChangedAt := startedAt.Add(time.Minute)
+	// Pods belong to a workload by controller ownership, so the fixture
+	// carries the Deployment → ReplicaSet → Pod chain a real cluster has.
+	isController := true
+	rsOwner := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: deployName, Controller: &isController}
+	podOwner := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "cart-abc", Controller: &isController}
 
 	fakeClient := fake.NewClientset(
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}, Status: corev1.NamespaceStatus{Phase: corev1.NamespaceActive}},
+		&appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "cart-abc", Namespace: ns, Labels: selector, OwnerReferences: []metav1.OwnerReference{rsOwner}},
+			Spec:       appsv1.ReplicaSetSpec{Selector: &metav1.LabelSelector{MatchLabels: selector}},
+		},
 		&appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Name: deployName, Namespace: ns},
 			Spec: appsv1.DeploymentSpec{
@@ -59,9 +68,10 @@ func setupFakeCacheForDiagnoseTests(t *testing.T) {
 		},
 		&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "cart-abc123",
-				Namespace: ns,
-				Labels:    selector,
+				Name:            "cart-abc123",
+				Namespace:       ns,
+				Labels:          selector,
+				OwnerReferences: []metav1.OwnerReference{podOwner},
 			},
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{
@@ -356,6 +366,12 @@ func TestHandleDiagnose_PodNotFound(t *testing.T) {
 func TestHandleDiagnose_DeploymentResolvesPods(t *testing.T) {
 	setupFakeCacheForDiagnoseTests(t)
 	ctx := withClusterAdmin(t, "admin")
+	// The stale-Secret FYI is attached only when the caller can read the
+	// ConfigMap and Secret the Pod references; builtin kinds resolve without
+	// discovery, so the grant has to be explicit rather than fall open.
+	perms := getPermCache().Get("admin", nil)
+	perms.SetCanI("get", "", "configmaps", "alpha", true)
+	perms.SetCanI("get", "", "secrets", "alpha", true)
 
 	result, _, err := handleDiagnose(ctx, nil, testDiagnoseInput("deployment", "alpha", "cart"))
 	if err != nil {

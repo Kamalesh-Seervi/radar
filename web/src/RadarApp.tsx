@@ -42,6 +42,7 @@ import type { TimelineSourceConfig } from "./api/timelineSource";
 import { DiagnoseCustomizationProvider } from "./context/DiagnoseCustomization";
 import type {
   RenderDiagnoseAction,
+  RenderInvestigationRunActions,
   DiagnoseConsentCopy,
 } from "./context/DiagnoseCustomization";
 import { defaultDiagnoseAction } from "./components/diagnose/LocalDiagnoseAction";
@@ -113,6 +114,8 @@ export interface RadarAppProps {
    * agent-free. See ./context/DiagnoseCustomization for the render-prop shape.
    */
   renderDiagnoseAction?: RenderDiagnoseAction;
+  /** Host-owned controls for the focused investigation; absent in standalone Radar. */
+  renderInvestigationRunActions?: RenderInvestigationRunActions;
   /**
    * Replaces the first-run consent card's trust copy. REQUIRED of any host whose
    * backend runs the agent somewhere other than the user's own machine — the
@@ -135,6 +138,12 @@ export interface RadarAppProps {
    * Radar runs with `navSlots.chrome: 'none'`.
    */
   onClusterLoadStateChange?: (state: ClusterLoadState) => void;
+  /**
+   * Called after a focused investigation has been resolved by the server.
+   * Embedders whose chrome lives outside RadarApp's router can use this as a
+   * navigation hint without treating an unverified URL id as durable state.
+   */
+  onInvestigationFocus?: (runID: string) => void;
   /**
    * Selects the store backing the event timeline. Omit for the local event
    * store the Radar binary keeps (default, standalone behavior). Set
@@ -196,9 +205,11 @@ export function RadarApp({
   manageDocumentTitle = false,
   documentTitleSuffix,
   renderDiagnoseAction,
+  renderInvestigationRunActions,
   diagnoseConsent,
   initialPath,
   onClusterLoadStateChange,
+  onInvestigationFocus,
   timelineSource,
 }: RadarAppProps): React.ReactElement {
   // Apply runtime config during render so module-level singletons are set
@@ -227,8 +238,13 @@ export function RadarApp({
                 <DiagnoseCustomizationProvider
                   value={renderDiagnoseAction ?? defaultDiagnoseAction}
                   consentCopy={diagnoseConsent}
+                  renderRunActions={renderInvestigationRunActions}
                 >
-                  <DiagnoseProvider browserURLState={router !== "memory"}>
+                  <DiagnoseProvider
+                    browserURLState={router !== "memory"}
+                    forceRouterURLState={router === "memory"}
+                    onFocusedRun={onInvestigationFocus}
+                  >
                     <App
                       manageDocumentTitle={manageDocumentTitle}
                       documentTitleSuffix={documentTitleSuffix}

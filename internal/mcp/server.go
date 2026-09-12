@@ -87,7 +87,15 @@ func investigationEvidenceReferenceMiddleware(refs *investigationrefs.Registry) 
 	return func(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
 		return func(ctx context.Context, method string, req mcpsdk.Request) (mcpsdk.Result, error) {
 			result, err := next(ctx, method, req)
-			if err != nil || method != "tools/call" {
+			if err != nil {
+				return result, err
+			}
+			if method == "initialize" || method == "tools/list" {
+				if scope, _ := ctx.Value(investigationEvidenceScopeKey{}).(string); scope != "" {
+					refs.MarkConnected(scope)
+				}
+			}
+			if method != "tools/call" {
 				return result, err
 			}
 			toolResult, ok := result.(*mcpsdk.CallToolResult)

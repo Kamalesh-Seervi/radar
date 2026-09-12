@@ -52,11 +52,60 @@ export interface RootCauseEvidence {
   refs?: string[];
 }
 
+/**
+ * How the agent frames one cited Radar result. Roles order cards; they never
+ * hide one.
+ *
+ * One half of a Go↔TS contract: `evidenceRoles` in internal/ai/parse.go and
+ * EVIDENCE_ROLES in components/diagnose/investigationCase.ts must list exactly
+ * these roles. Change all three together.
+ */
+export type DiagnosisEvidenceRole =
+  "cause" | "symptom" | "context" | "benign" | "demoted" | "rules_out";
+
+/**
+ * Which observation inside one tool result a claim is about. Agent text
+ * copied verbatim by the server; the UI resolves it against captured evidence
+ * and places the claim only on an exact, unique match.
+ */
+export interface DiagnosisEvidenceSubject {
+  group?: string;
+  kind: string;
+  namespace?: string;
+  name: string;
+  container?: string;
+  stream?: "current" | "previous";
+  /** Evidence kind (resource, logs, events, changes, metrics, …). */
+  observation?: string;
+}
+
+/** One server-bound item of the agent's case. Unlinked items are never rendered. */
+export interface DiagnosisEvidenceItem {
+  status: "linked" | "unlinked";
+  ref?: string;
+  role?: DiagnosisEvidenceRole;
+  claim?: string;
+  subject?: DiagnosisEvidenceSubject;
+}
+
+export interface DiagnosisRuledOut {
+  hypothesis: string;
+  /** Index into Diagnosis.evidence of the item whose result contradicted it. */
+  evidenceIndex: number;
+}
+
 export interface Diagnosis {
   healthy?: boolean;
   inconclusive?: boolean; // investigated but couldn't determine — distinct from healthy
   rootCause: string;
   rootCauseEvidence?: RootCauseEvidence;
+  /** The agent's case over Radar's evidence; absent from hosted backends and older runs. */
+  evidence?: DiagnosisEvidenceItem[];
+  /** How many of the agent's evidence entries never reached the UI, including ones cut before they got a slot in `evidence`. */
+  unlinkedEvidence?: number;
+  /** The agent's evidence field was not a list, so none of it could be read. */
+  evidenceMalformed?: boolean;
+  ruledOut?: DiagnosisRuledOut[];
   report: string;
   remediation: string[];
   recommendedIndex?: number; // 1-based index into remediation of the step Apply performs
@@ -87,6 +136,13 @@ export interface ResourceHealthSignal {
 
 export type ApplyMutationOutcome = "confirmed" | "failed" | "unknown";
 
+// One MCP server's connection state as the agent CLI reported it at startup.
+// Only "connected" means its tools are usable.
+export interface MCPServerStatus {
+  name: string;
+  status: string;
+}
+
 export interface DiagnoseStreamEvent {
   type:
     | "turn"
@@ -98,7 +154,11 @@ export interface DiagnoseStreamEvent {
     | "closed"
     | "history_unavailable"
     | "replay_complete";
-  phase?: string;
+  phase?: string; // "investigating" | "connected" | "ready"
+  // Startup facts the agent CLI reported on the "ready" phase.
+  model?: string;
+  toolCount?: number; // Radar tools the agent registered
+  mcpServers?: MCPServerStatus[];
   step?: DiagnoseStep;
   token?: string;
   diagnosis?: Diagnosis;
@@ -250,20 +310,6 @@ export async function getRun(
     credentials: getCredentialsMode(),
     headers: getAuthHeaders(),
     signal,
-  });
-  if (!res.ok) throw new DiagnoseError(res.status, await errorText(res));
-  return res.json();
-}
-
-export async function updateRunVisibility(
-  id: string,
-  visibility: "private" | "organization",
-): Promise<RunSummary> {
-  const res = await fetch(`${RUNS()}/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    credentials: getCredentialsMode(),
-    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-    body: JSON.stringify({ visibility }),
   });
   if (!res.ok) throw new DiagnoseError(res.status, await errorText(res));
   return res.json();
