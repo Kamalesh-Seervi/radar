@@ -2018,6 +2018,18 @@ func (s *Server) preflightResourceList(r *http.Request, kind, group string, name
 		}
 	}
 
+	if (kind == "limitranges" || kind == "limitrange") && group == "" {
+		scopes := namespaces
+		if scopes == nil {
+			scopes = []string{""}
+		}
+		for _, ns := range scopes {
+			if !s.canRead(r, "", "limitranges", ns, "list") {
+				return nil, http.StatusForbidden, "insufficient permissions to list limitranges", false
+			}
+		}
+	}
+
 	return namespaces, 0, "", true
 }
 
@@ -2048,11 +2060,15 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 	// DiscoverNamespaces if needed). canRead below relies on it.
 	namespaces := s.parseNamespacesForUser(r)
 
-	// Shared RBAC gate. REST converts denies to 200 with `[]` (legacy shape
-	// the frontend tolerates and that doesn't leak kind existence); the AI path
-	// returns the explicit status.
-	finalNamespaces, _, _, ok := s.preflightResourceList(r, kind, group, namespaces)
+	// Most REST lists preserve the empty-list denial response. LimitRange
+	// lookups need an explicit denial so an unreadable namespace is not
+	// presented as having no admission rules.
+	finalNamespaces, status, msg, ok := s.preflightResourceList(r, kind, group, namespaces)
 	if !ok {
+		if kind == "limitranges" && group == "" {
+			s.writeError(w, status, msg)
+			return
+		}
 		// Denied, not empty. writeResourceList resolves columns for an empty
 		// list, and that lookup runs as Radar's own identity — so routing a
 		// denial through it would answer a caller who cannot list the kind with
@@ -2387,9 +2403,19 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err = cache.IngressClasses().List(labels.Everything())
 	case "limitranges":
-		if cache.LimitRanges() == nil {
+		if cache.IsDeferredPending("limitranges") || cache.LimitRanges() == nil {
 			notReadyOrForbidden("limitranges")
 			return
+		}
+		scopes := namespaces
+		if scopes == nil {
+			scopes = []string{""}
+		}
+		for _, ns := range scopes {
+			if !cache.KindCoversNamespace("limitranges", ns) {
+				s.writeError(w, http.StatusForbidden, "Radar does not have LimitRange visibility for the requested namespace scope")
+				return
+			}
 		}
 		result, err = listPerNs(
 			func() (any, error) { return cache.LimitRanges().List(labels.Everything()) },
@@ -2528,6 +2554,9 @@ func (s *Server) preflightResourceGet(r *http.Request, kind, namespace, name, gr
 		// handler has the matching list-SAR.
 		if (kind == "secrets" || kind == "secret") && !s.canRead(r, "", "secrets", namespace, "get") {
 			return http.StatusForbidden, fmt.Sprintf("no access to secrets in namespace %q", namespace), false
+		}
+		if (kind == "limitranges" || kind == "limitrange") && group == "" && !s.canRead(r, "", "limitranges", namespace, "get") {
+			return http.StatusForbidden, fmt.Sprintf("no access to limitranges in namespace %q", namespace), false
 		}
 	default:
 		// Empty namespace and not a recognized cluster-scoped kind: an empty
@@ -2771,8 +2800,12 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 		}
 		resource, err = cache.IngressClasses().Get(name)
 	case "limitranges", "limitrange":
-		if cache.LimitRanges() == nil {
+		if cache.IsDeferredPending("limitranges") || cache.LimitRanges() == nil {
 			notReadyOrForbiddenGet("limitranges")
+			return
+		}
+		if !cache.KindCoversNamespace("limitranges", namespace) {
+			s.writeError(w, http.StatusForbidden, "Radar does not have LimitRange visibility for the requested namespace")
 			return
 		}
 		resource, err = cache.LimitRanges().LimitRanges(namespace).Get(name)

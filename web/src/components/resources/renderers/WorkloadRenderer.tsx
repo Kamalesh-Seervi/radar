@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useScaleWorkload, fetchJSON } from '../../../api/client'
 import { useRBACSubject } from '../../../api/rbac'
 import { usePolicyResource } from '../../../api/policy'
-import { limitRangeNames, useNamespaceLimitRanges } from '../../../api/quotas'
+import { podLimitRangeNames, useNamespaceLimitRanges } from '../../../api/quotas'
 import { useQueries, useQueryClient } from '@tanstack/react-query'
 import { kindToPlural, kindToPluralWithGroup } from '@skyhook-io/k8s-ui/utils/navigation'
 import type { Relationships, ResourceRef, ResourceWithRelationships, WorkloadPodInfo } from '../../../types'
@@ -50,7 +50,7 @@ export function WorkloadRenderer({ kind, data, onNavigate, scaleBlockedBy, workl
   const { data: policyData, isLoading: policyLoading, error: policyError } = usePolicyResource(
     kindToPlural(kind), namespace, metadata.name || '', !!namespace && !!metadata.name,
   )
-  const { data: limitRanges } = useNamespaceLimitRanges(namespace, !!namespace)
+  const { data: limitRanges, isSuccess: limitRangesReady } = useNamespaceLimitRanges(namespace, !!namespace)
   const hpaRefs = (scaleBlockedBy ?? []).filter(ref => {
     const refKind = ref.kind.toLowerCase()
     return refKind === 'horizontalpodautoscaler' || refKind === 'hpa'
@@ -98,7 +98,7 @@ export function WorkloadRenderer({ kind, data, onNavigate, scaleBlockedBy, workl
       policyData={policyData ?? null}
       policyLoading={policyLoading}
       policyError={policyError as Error | null}
-      namespaceLimitRangeNames={limitRangeNames(limitRanges)}
+      namespaceLimitRangeNames={limitRangesReady ? podLimitRangeNames(limitRanges) : undefined}
       scaleBlockedBy={scaleBlockedBy}
       workloadPods={workloadPods}
       scalerDiagnostics={scalerDiagnostics}

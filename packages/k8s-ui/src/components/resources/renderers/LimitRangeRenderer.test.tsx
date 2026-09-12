@@ -83,11 +83,12 @@ describe('NamespaceLimitRangesSection', () => {
 
   it('tells an empty namespace apart from one still loading', () => {
     const empty = renderToString(<NamespaceLimitRangesSection limitRanges={[]} namespace="dev" />)
-    expect(empty).toContain('No LimitRanges here')
+    expect(empty).toContain('Limit Ranges (0)')
+    expect(empty).not.toContain('No LimitRanges found')
 
     const loading = renderToString(<NamespaceLimitRangesSection loading namespace="dev" />)
     expect(loading).toContain('Loading limit ranges')
-    expect(loading).not.toContain('No LimitRanges here')
+    expect(loading).not.toContain('No LimitRanges found')
   })
 
   // "You can't see the rules" and "there are no rules" lead to opposite
@@ -97,7 +98,26 @@ describe('NamespaceLimitRangesSection', () => {
       <NamespaceLimitRangesSection error={err('forbidden', 403)} namespace="dev" />,
     )
     expect(html).toContain('permission')
-    expect(html).not.toContain('No LimitRanges here')
+    expect(html).not.toContain('No LimitRanges found')
+  })
+
+  it('keeps cached rules visible with a stale warning when a refresh fails', () => {
+    const html = renderToString(
+      <NamespaceLimitRangesSection limitRanges={[multiType]} error={err('unavailable', 500)} namespace="dev" />,
+    )
+    expect(html).toContain('team-limits')
+    expect(html).toContain('Showing previously loaded rules')
+    expect(html).toContain('unavailable')
+    expect(html).not.toContain('This may be incomplete')
+  })
+
+  it('hides cached rules when access is denied', () => {
+    const html = renderToString(
+      <NamespaceLimitRangesSection limitRanges={[multiType]} error={err('forbidden', 403)} namespace="dev" />,
+    )
+    expect(html).toContain('permission')
+    expect(html).not.toContain('team-limits')
+    expect(html).not.toContain('No LimitRanges found')
   })
 
   it('keeps a fetch fault loud', () => {
@@ -125,11 +145,11 @@ describe('NamespaceLimitRangeLink', () => {
     expect(renderToString(<NamespaceLimitRangeLink namespace="dev" scope="pod" />)).toBe('')
   })
 
-  it('frames a workload as governing its pods, not the workload object', () => {
+  it('offers the scope explanation without adding inline prose', () => {
     const html = renderToString(
       <NamespaceLimitRangeLink namespace="dev" names={['team-limits']} scope="workload" onNavigate={() => {}} />,
     )
-    expect(html).toContain('pods')
-    expect(html).toContain('not the workload object itself')
+    expect(html).toContain('About namespace defaults and constraints')
+    expect(html).not.toContain('not the workload object itself')
   })
 })

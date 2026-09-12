@@ -29,8 +29,8 @@ export function useNamespaceLimitRanges(namespace: string, enabled = true) {
   })
 }
 
-/** Names of the LimitRanges a namespace lookup returned, for the contextual
- *  link. Empty while the read is pending or failed, so no link is shown. */
-export function limitRangeNames(limitRanges: any[] | undefined): string[] {
-  return (limitRanges ?? []).map((lr: any) => lr?.metadata?.name).filter(Boolean)
+export function podLimitRangeNames(limitRanges: any[] | undefined): string[] {
+  return (limitRanges ?? [])
+    .filter(lr => lr.spec.limits?.some((entry: { type: string }) => entry.type === 'Container' || entry.type === 'Pod'))
+    .map(lr => lr.metadata.name)
 }

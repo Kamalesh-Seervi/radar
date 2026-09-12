@@ -1,7 +1,8 @@
-import { SlidersHorizontal } from 'lucide-react'
+import { Info, SlidersHorizontal } from 'lucide-react'
 import { Section, ResourceLink } from '../../ui/drawer-components'
 import { Tooltip } from '../../ui/Tooltip'
 import { LookupFailureNote } from './LookupFailureNote'
+import { isForbiddenError } from '../../../types/fetch-error'
 
 // A LimitRange declares the defaults and constraints the API server applies to
 // pods, containers and PVCs admitted into a namespace. It has no status, so
@@ -28,7 +29,7 @@ const FACETS: LimitRangeFacet[] = [
 
 const TYPE_SCOPE: Record<string, string> = {
   Container: 'each container, individually',
-  Pod: 'the sum across all containers in a pod',
+  Pod: 'the pod’s resource requests and limits',
   PersistentVolumeClaim: 'each PersistentVolumeClaim',
 }
 
@@ -156,17 +157,34 @@ export function NamespaceLimitRangesSection({
   namespace: string
   onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
 }) {
+  const denied = isForbiddenError(error)
+  const showCached = !!error && !denied && !!limitRanges?.length
+  const empty = !error && !loading && limitRanges?.length === 0
+
   return (
-    <Section title="Limit Ranges" icon={SlidersHorizontal}>
-      {error ? (
-        <LookupFailureNote errors={[error]} what="this namespace’s LimitRanges" incomplete={!!limitRanges?.length} />
-      ) : !limitRanges ? (
+    <Section
+      key={`${namespace}-${empty ? 'empty' : 'rules'}`}
+      title={empty ? 'Limit Ranges (0)' : 'Limit Ranges'}
+      icon={SlidersHorizontal}
+      defaultExpanded={!empty}
+    >
+      {error != null && (
+        <div className="mb-2">
+          <LookupFailureNote errors={[error]} what="this namespace’s LimitRanges" />
+          {showCached && (
+            <div className="mt-1 text-xs text-theme-text-secondary">
+              Showing previously loaded rules. They may have changed.
+            </div>
+          )}
+        </div>
+      )}
+      {error && !showCached ? null : !limitRanges ? (
         <div className="text-xs text-theme-text-secondary">
           {loading ? 'Loading limit ranges…' : 'Limit ranges have not been read yet.'}
         </div>
       ) : limitRanges.length === 0 ? (
         <div className="text-xs text-theme-text-secondary">
-          No LimitRanges here — pods and PVCs are admitted with whatever they declare.
+          No LimitRanges found in this namespace. Other admission policies may still apply.
         </div>
       ) : (
         <div className="space-y-2">
@@ -243,8 +261,17 @@ export function NamespaceLimitRangeLink({
             <ResourceLink name={name} kind="limitranges" namespace={namespace} onNavigate={onNavigate} />
           </span>
         ))}
+        {' '}
+        <Tooltip content={SCOPE_CAVEAT[scope]}>
+          <button
+            type="button"
+            aria-label="About namespace defaults and constraints"
+            className="inline-flex align-middle text-theme-text-tertiary hover:text-theme-text-secondary"
+          >
+            <Info className="w-3 h-3" />
+          </button>
+        </Tooltip>
       </div>
-      <div className="mt-0.5">{SCOPE_CAVEAT[scope]}</div>
     </div>
   )
 }
