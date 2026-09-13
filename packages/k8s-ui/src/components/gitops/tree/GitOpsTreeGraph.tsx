@@ -24,6 +24,7 @@ import type { GitOpsIssue, GitOpsResourceTree, GitOpsTreeNode, GitOpsTreeRef, He
 import { displayKind } from '../../../types'
 import { healthToSeverity, SEVERITY_DOT } from '../../../utils/badge-colors'
 import { formatCompactAge } from '../../../utils/format'
+import { radarHealthNote } from '../health-provenance'
 import { getTopologyIcon } from '../../../utils/resource-icons'
 import { Tooltip } from '../../ui/Tooltip'
 import { hasGitOpsTreeFilters, matchesGitOpsTreeFilters, type GitOpsTreeFilters } from './tree-helpers'
@@ -586,6 +587,11 @@ const GitOpsResourceNode = memo(function GitOpsResourceNode({ data }: NodeProps<
   // Only unhealthy nodes carry a cause worth surfacing — a healthy node
   // matched by a stale/unrelated issue ref shouldn't show a tooltip.
   const cause = status === 'unhealthy' || status === 'degraded' ? data.cause : undefined
+  // Only declared resources can carry the controller's verdict, so only
+  // there does "this one is Radar's" mean anything. Generated children
+  // (ReplicaSets, Pods) are always Radar's read; marking each would be
+  // noise.
+  const radarNote = node.role === 'declared' ? radarHealthNote(node) : ''
 
   const card = (
       <div
@@ -668,6 +674,13 @@ const GitOpsResourceNode = memo(function GitOpsResourceNode({ data }: NodeProps<
                   {chip.label ? `${chip.label}: ` : ''}{chip.value}
                 </span>
               ))}
+              {radarNote && (
+                <Tooltip content={radarNote} delay={200}>
+                  <span className="rounded border border-theme-border bg-theme-elevated/70 px-1.5 py-0.5 text-[10px] leading-3 text-theme-text-tertiary">
+                    Found by Radar
+                  </span>
+                </Tooltip>
+              )}
             </div>
           )}
         </div>
