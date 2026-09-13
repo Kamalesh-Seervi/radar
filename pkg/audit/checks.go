@@ -1050,8 +1050,8 @@ func checkOrphanConfigMapsSecrets(tr *evalTracker, input *CheckInput) []Finding 
 		if sec.Type == "helm.sh/release.v1" {
 			continue
 		}
-		// Skip TLS secrets used by cert-manager (they may be referenced by Ingress annotations, not spec)
-		if sec.Labels != nil && sec.Labels["cert-manager.io/certificate-name"] != "" {
+		// Preserve the exemption when Certificate references are unavailable.
+		if isCertManagerCertificateSecret(sec) {
 			continue
 		}
 		if isKnownPlatformSecret(sec) {
@@ -1162,6 +1162,16 @@ func isKnownPlatformConfigMap(cm *corev1.ConfigMap) bool {
 	}
 
 	return false
+}
+
+const certManagerCertificateNameKey = "cert-manager.io/certificate-name"
+
+func isCertManagerCertificateSecret(sec *corev1.Secret) bool {
+	if sec == nil {
+		return false
+	}
+	return strings.TrimSpace(labelsValue(sec.Annotations, certManagerCertificateNameKey)) != "" ||
+		strings.TrimSpace(labelsValue(sec.Labels, certManagerCertificateNameKey)) != ""
 }
 
 func isKnownPlatformSecret(sec *corev1.Secret) bool {

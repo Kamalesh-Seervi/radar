@@ -1953,6 +1953,60 @@ func TestOrphanConfigMapSecretAdditionalRefs(t *testing.T) {
 	}
 }
 
+func TestOrphanConfigMapSecretCertManagerCertificateMetadata(t *testing.T) {
+	input := &CheckInput{
+		Secrets: []*corev1.Secret{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "api-tls-from-annotation",
+					Namespace: "app",
+					Annotations: map[string]string{
+						"cert-manager.io/certificate-name": "api-tls",
+						"cert-manager.io/issuer-name":      "letsencrypt",
+					},
+					Labels: map[string]string{
+						"controller.cert-manager.io/fao": "true",
+					},
+				},
+				Type: corev1.SecretTypeTLS,
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "api-tls-from-label",
+					Namespace: "app",
+					Labels: map[string]string{
+						"cert-manager.io/certificate-name": "api-tls-label",
+					},
+				},
+				Type: corev1.SecretTypeTLS,
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "unrelated-tls",
+					Namespace: "app",
+					Annotations: map[string]string{
+						"cert-manager.io/issuer-name": "letsencrypt",
+					},
+				},
+				Type: corev1.SecretTypeTLS,
+			},
+		},
+	}
+
+	orphans := findingResourceKeys(RunChecks(input).Findings, "orphanConfigMapSecret")
+	for _, key := range []string{
+		"Secret/app/api-tls-from-annotation",
+		"Secret/app/api-tls-from-label",
+	} {
+		if orphans[key] {
+			t.Errorf("%s should not be flagged as orphan", key)
+		}
+	}
+	if !orphans["Secret/app/unrelated-tls"] {
+		t.Errorf("Secret/app/unrelated-tls should still be flagged as orphan")
+	}
+}
+
 func TestDeprecatedAPIVersion(t *testing.T) {
 	input := &CheckInput{
 		ClusterVersion: "1.30",
