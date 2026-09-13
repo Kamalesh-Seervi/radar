@@ -29,6 +29,7 @@ import (
 	"github.com/skyhook-io/radar/internal/timeline"
 	"github.com/skyhook-io/radar/internal/traffic"
 	versionpkg "github.com/skyhook-io/radar/internal/version"
+	"github.com/skyhook-io/radar/pkg/prom"
 )
 
 var clusterConnectionProbe = k8s.TestClusterConnection
@@ -292,6 +293,9 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 	if len(cfg.PrometheusHeaders) > 0 {
 		traffic.SetMetricsHeaders(cfg.PrometheusHeaders)
 		prometheuspkg.SetHeaders(cfg.PrometheusHeaders)
+		if prom.HeadersRequireURL(cfg.PrometheusURL, cfg.PrometheusHeaders) {
+			log.Printf("[prometheus] Warning: %v", prom.ErrHeadersRequireURL)
+		}
 	}
 	cfg = persistKubecostContextBindings(cfg)
 	if err := internalopencost.ConfigureStartup(internalopencost.ManagerConfig{
@@ -319,6 +323,11 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 		prometheuspkg.Reinitialize(k8s.GetClient(), k8s.GetConfig(), k8s.GetContextName())
 		return nil
 	})
+	// Reinitialize only builds the new client; discovery for the new cluster has
+	// to be started explicitly, and the callback fires once subsystem init is
+	// done so the run sees a populated cache.
+	k8s.OnContextSwitch(func(_ string) { prometheuspkg.Prewarm() })
+	k8s.OnNamespaceRescope(func(_ string) { prometheuspkg.Prewarm() })
 	k8s.RegisterCostResetFunc(internalopencost.Reset)
 }
 
@@ -578,21 +587,7 @@ func InitializeCluster() {
 		ClusterName: k8s.GetClusterName(),
 	})
 
-	// Auto-discover Prometheus in the background so charts are ready immediately
-	go func() {
-		pt := time.Now()
-		promCtx, promCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer promCancel()
-		client := prometheuspkg.GetClient()
-		if client == nil {
-			return
-		}
-		if _, _, err := client.EnsureConnected(promCtx); err != nil {
-			log.Printf("[prometheus] Auto-discovery failed (%v): %v", time.Since(pt), err)
-		} else {
-			log.Printf("[prometheus] Auto-discovery succeeded (%v)", time.Since(pt))
-		}
-	}()
+	prometheuspkg.Prewarm()
 }
 
 // mcpPortFileDisabled suppresses port-file writes AND removals — an ephemeral

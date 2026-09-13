@@ -5549,6 +5549,22 @@ func (s *Server) handleApplyPrometheusURL(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Headers without a URL would send credentials to auto-discovered
+	// endpoints, so the pair is refused before anything is persisted. The
+	// check runs against what will actually be in effect: the submitted
+	// headers, or when they aren't being edited the running client's (which
+	// already fold in flags, env and file), plus env-sourced headers on disk
+	// that the next start resolves again regardless of what's submitted here.
+	if rawURL == "" {
+		effective := body.Headers != nil && len(headers) > 0 ||
+			body.Headers == nil && prometheuspkg.HasHeaders() ||
+			len(config.Load().PrometheusHeadersFromEnv) > 0
+		if effective {
+			s.writeError(w, http.StatusBadRequest, "Prometheus headers require a Prometheus URL: keep a URL, or clear the headers (including any prometheusHeadersFromEnv in the Helm values) before switching back to auto-discovery")
+			return
+		}
+	}
+
 	// Persist first: a failed disk write must not leave the running client
 	// pointed somewhere the on-disk config disagrees with.
 	if _, err := config.Update(func(c *config.Config) {
@@ -5562,15 +5578,22 @@ func (s *Server) handleApplyPrometheusURL(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Apply to the running client. Reset() drops the cached connection so the
-	// probe below rediscovers against the new URL instead of the old endpoint.
-	prometheuspkg.SetManualURL(rawURL)
-	traffic.SetMetricsURL(rawURL)
-	if body.Headers != nil {
-		prometheuspkg.SetHeaders(headers)
-		traffic.SetMetricsHeaders(headers)
+	// Apply URL and headers to the running client in one step, dropping the
+	// cached connection with them, so no request can probe the previous
+	// endpoint with the new credentials.
+	effectiveHeaders := headers
+	if body.Headers == nil {
+		effectiveHeaders = prometheuspkg.CurrentHeaders()
 	}
-	prometheuspkg.Reset()
+	prometheuspkg.Configure(rawURL, effectiveHeaders)
+	// A live traffic source copies URL and headers at construction and reads
+	// them lock-free afterwards, so the only way rotated or cleared
+	// credentials stop being used is to rebuild it — the same teardown a
+	// context switch performs.
+	traffic.SetMetricsConfig(rawURL, effectiveHeaders)
+	if err := k8s.RestartTrafficSubsystem(); err != nil {
+		log.Printf("[traffic] Failed to reinitialize after Prometheus config change: %v", err)
+	}
 	if s.openCostCurrency != nil {
 		s.openCostCurrency.Invalidate()
 	}
