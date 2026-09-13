@@ -640,6 +640,25 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 			// table owns "which", and the ManualDrift / StuckDriftLoop
 			// detectors own the actionable "why isn't this reconciling" cases.
 		}
+		// Argo CD 3.x no longer persists per-resource health in the
+		// Application CR by default (controller.resource.health.persist=false,
+		// status.resourceHealthSource=appTree), so status.resources[] carries
+		// no health.status for ANY kind even though Argo's own health check
+		// (built-in Lua for ClusterSecretStore and friends included) rolled
+		// the app up to Degraded. The per-resource pass above then has nothing
+		// to point at. Offer the loudest recent Warning event as a lead rather
+		// than leaving the badge unexplained. Only for an app deploying to
+		// THIS cluster: events describe local objects, and a same-named local
+		// resource is not the remote one. An informational Running/drift row
+		// is not an explanation and must not suppress this; a failed operation
+		// or a per-resource Issue is.
+		if !degradedResourcesExplained(out) && gitops.IsInClusterDestination(root) {
+			if health, _, _ := unstructured.NestedString(root.Object, "status", "health", "status"); health == "Degraded" {
+				if iss := degradedResourceFromEvents(root, resolver); iss != nil {
+					out = append(out, *iss)
+				}
+			}
+		}
 	} else {
 		for _, c := range conditions(root) {
 			if c.status == "False" && (c.typ == "Ready" || c.typ == "Healthy" || c.typ == "Released" || c.typ == "TestSuccess") {
@@ -653,7 +672,7 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 			}
 		}
 	}
-	if resourceTree != nil && resourceTree.Summary.Degraded > 0 && len(out) == 0 {
+	if resourceTree != nil && resourceTree.Summary.Degraded > 0 && !degradedResourcesExplained(out) {
 		out = append(out, Issue{Severity: SeverityWarning, Scope: ScopeTree, Reason: "DegradedResources", Message: fmt.Sprintf("%d managed %s degraded", resourceTree.Summary.Degraded, pluralizeResourcesAre(resourceTree.Summary.Degraded)), Action: "Use the graph or Resources tab to inspect affected resources."})
 	}
 	// Dedup by (scope, reason, message) — Flux carries the same failure
@@ -666,6 +685,89 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 	out = dedupeIssues(out)
 	sort.SliceStable(out, func(i, j int) bool { return severityRank(out[i].Severity) < severityRank(out[j].Severity) })
 	return out
+}
+
+// degradedResourceFromEvents picks, from the Application's declared managed
+// resources, the one with the loudest recent Warning event, as a lead when
+// nothing else identified why the app is Degraded. Events are not a health
+// verdict (a recovered resource can keep a repeated Warning inside the event
+// TTL), so the Issue is warning-tier, says "possible cause", and never counts
+// as having explained the app's health — the degraded-resources summary
+// still shows next to it. Returns nil when no managed resource has a Warning
+// event, or when resolver is nil (tests, and any caller that opts out of
+// live enrichment).
+func degradedResourceFromEvents(root *unstructured.Unstructured, resolver Resolver) *Issue {
+	if resolver == nil {
+		return nil
+	}
+	raw, _, _ := unstructured.NestedSlice(root.Object, "status", "resources")
+	var (
+		best      Ref
+		bestEvent EventSummary
+		// -1, not 0: a real, single-occurrence Warning event commonly reports
+		// Count == 0 on modern clusters (events.k8s.io/v1 only sets a count at
+		// all once an event has repeated into a series) — starting the
+		// sentinel at 0 would make that genuine signal indistinguishable from
+		// "no Warning event found," and the function would silently return no
+		// issue for exactly the first-occurrence case it exists to catch.
+		bestCount int32 = -1
+	)
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		ref := Ref{
+			Group:     gitops.StringValue(m["group"]),
+			Kind:      gitops.StringValue(m["kind"]),
+			Namespace: gitops.StringValue(m["namespace"]),
+			Name:      gitops.StringValue(m["name"]),
+		}
+		if ref.Kind == "" || ref.Name == "" {
+			continue
+		}
+		for _, ev := range resolver.RecentEvents(ref.Group, ref.Kind, ref.Namespace, ref.Name) {
+			if ev.Type != "Warning" {
+				continue
+			}
+			if ev.Count > bestCount {
+				bestCount = ev.Count
+				best = ref
+				bestEvent = ev
+			}
+		}
+	}
+	if bestCount < 0 {
+		return nil
+	}
+	return &Issue{
+		Severity:   SeverityWarning,
+		Scope:      ScopeResource,
+		Reason:     "PossibleCause",
+		Message:    fmt.Sprintf("%s %s has recent Warning events", best.Kind, best.Name),
+		RawMessage: bestEvent.Message,
+		Refs:       []Ref{best},
+		Action:     "Open the resource drawer to confirm.",
+		Cause:      fallback(bestEvent.Message, bestEvent.Reason),
+	}
+}
+
+// degradedResourcesExplained reports whether the Issues so far already
+// account for degraded managed resources: a critical per-resource Issue
+// names one, a failed sync operation is the upstream cause of all of them.
+// Informational rows (sync Running) and drift detectors (StuckDriftLoop,
+// ManualDrift — sync signals, not health) explain nothing, and neither
+// does the warning-tier events lead — it points, it doesn't conclude.
+func degradedResourcesExplained(issues []Issue) bool {
+	for _, iss := range issues {
+		if iss.Scope == ScopeResource && iss.Severity == SeverityCritical {
+			return true
+		}
+		if iss.Scope == ScopeOperation && (iss.Reason == "Failed" || iss.Reason == "Error") {
+			return true
+		}
+	}
+	return false
 }
 
 // resourceProblemCause renders a single cause line from the workload problems

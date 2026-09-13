@@ -929,13 +929,14 @@ type fakeResolver struct {
 	statuses map[string]string            // finalizer → status string
 	calls    []string                     // finalizers passed (in order)
 	problems map[string][]ResourceProblem // resource name → workload problems
+	events   map[string][]EventSummary    // resource name → recent events
 }
 
 func (f *fakeResolver) GetLive(string, string, string, string) *unstructured.Unstructured {
 	return nil
 }
-func (f *fakeResolver) RecentEvents(string, string, string, string) []EventSummary {
-	return nil
+func (f *fakeResolver) RecentEvents(_, _, _, name string) []EventSummary {
+	return f.events[name]
 }
 func (f *fakeResolver) ResourceProblems(_, _, _, name string) []ResourceProblem {
 	return f.problems[name]
@@ -984,6 +985,167 @@ func TestBuildIssues_EnrichesDegradedResourceWithWorkloadCause(t *testing.T) {
 	plain := resourceIssue(buildIssues(root, nil, "argocd", nil))
 	if plain == nil || plain.Cause != "" {
 		t.Errorf("nil resolver should yield a resource issue with empty Cause, got %+v", plain)
+	}
+}
+
+// TestBuildIssues_DegradedAppFallsBackToLoudestResourceEvent pins the
+// weakest attribution tier: an Application whose aggregate health is
+// Degraded with no per-resource health.status in status.resources[] (the
+// Argo CD 3.x default — resource health is no longer persisted in the CR),
+// and nothing classified by the issues engine for any managed resource. The
+// fallback attributes the app-level Degraded badge to the managed resource
+// with the loudest Warning event instead of leaving it unexplained.
+func TestBuildIssues_DegradedAppFallsBackToLoudestResourceEvent(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health": map[string]any{"status": "Degraded"},
+		"resources": []any{
+			map[string]any{
+				"group": "external-secrets.io", "kind": "ClusterSecretStore", "name": "platform-secret-store",
+				"status": "Synced",
+			},
+			map[string]any{
+				"kind": "Namespace", "name": "platform-secrets",
+				"status": "Synced",
+			},
+		},
+	})
+	r := &fakeResolver{events: map[string][]EventSummary{
+		"platform-secret-store": {
+			{Type: "Warning", Reason: "InvalidProviderConfig", Message: "no route to host", Count: 17},
+			{Type: "Normal", Reason: "Synced", Message: "resource synced", Count: 40},
+		},
+	}}
+	issues := buildIssues(root, nil, "argocd", r)
+	if len(issues) != 1 {
+		t.Fatalf("expected exactly 1 fallback issue, got %d: %+v", len(issues), issues)
+	}
+	got := issues[0]
+	if got.Scope != ScopeResource {
+		t.Errorf("Scope = %q, want %q", got.Scope, ScopeResource)
+	}
+	if len(got.Refs) != 1 || got.Refs[0].Name != "platform-secret-store" {
+		t.Errorf("Refs = %+v, want a single ref to platform-secret-store", got.Refs)
+	}
+	if got.Reason != "PossibleCause" || got.Severity != SeverityWarning || got.Cause != "no route to host" {
+		t.Errorf("issue = %+v, want a warning-tier PossibleCause lead carrying the winning event's message as Cause", got)
+	}
+
+	empty := buildIssues(root, nil, "argocd", &fakeResolver{})
+	if len(empty) != 0 {
+		t.Errorf("expected no issues when no resource has a Warning event, got %+v", empty)
+	}
+
+	// A nil resolver can't look up events → no fabricated issue either.
+	plain := buildIssues(root, nil, "argocd", nil)
+	if len(plain) != 0 {
+		t.Errorf("expected no issues with a nil resolver, got %+v", plain)
+	}
+}
+
+// TestBuildIssues_DegradedAppLeadIsGatedAndDoesNotExplain: the live-state
+// tier only runs for an app deploying to this cluster (Radar's engine and
+// events describe local objects), still runs alongside an informational
+// Running row, and an events lead leaves the degraded-resources summary
+// visible because it is a pointer, not an explanation.
+func TestBuildIssues_DegradedAppLeadIsGatedAndDoesNotExplain(t *testing.T) {
+	status := func() map[string]any {
+		return map[string]any{
+			"health":         map[string]any{"status": "Degraded"},
+			"operationState": map[string]any{"phase": "Running"},
+			"resources": []any{
+				map[string]any{"group": "apps", "kind": "Deployment", "namespace": "prod", "name": "web", "status": "Synced"},
+			},
+		}
+	}
+	r := &fakeResolver{events: map[string][]EventSummary{"web": {{Type: "Warning", Reason: "BackOff", Message: "restarting", Count: 3}}}}
+	tree := &gitopstree.ResourceTree{Summary: gitopstree.Summary{Degraded: 2}}
+
+	local := buildIssues(argoApp(status()), tree, "argocd", r)
+	var lead, running, summary bool
+	for _, iss := range local {
+		switch iss.Reason {
+		case "PossibleCause":
+			lead = true
+		case "Running":
+			running = true
+		case "DegradedResources":
+			summary = true
+		}
+	}
+	if !lead || !running || !summary {
+		t.Errorf("want the events lead, the Running info row AND the degraded summary together, got %+v", local)
+	}
+
+	remoteApp := argoApp(status())
+	remoteApp.Object["spec"] = map[string]any{"destination": map[string]any{"server": "https://spoke-1.example.com:6443"}}
+	for _, iss := range buildIssues(remoteApp, tree, "argocd", r) {
+		if iss.Reason == "PossibleCause" {
+			t.Errorf("remote-destination app must not get a locally derived lead, got %+v", iss)
+		}
+	}
+}
+
+// TestBuildIssues_DriftLoopDoesNotHideDegradedFallback: StuckDriftLoop is a
+// sync signal, not a health explanation; a Degraded app in a drift loop
+// still gets the live-state attribution and the tree summary.
+func TestBuildIssues_DriftLoopDoesNotHideDegradedFallback(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health":         map[string]any{"status": "Degraded"},
+		"sync":           map[string]any{"status": "OutOfSync"},
+		"reconciledAt":   time.Now().UTC().Format(time.RFC3339),
+		"operationState": map[string]any{"phase": "Succeeded", "finishedAt": time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)},
+		"resources": []any{
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "prod", "name": "web", "status": "OutOfSync"},
+		},
+	})
+	root.Object["spec"] = map[string]any{"syncPolicy": map[string]any{"automated": map[string]any{"selfHeal": true}}}
+	r := &fakeResolver{events: map[string][]EventSummary{"web": {{Type: "Warning", Reason: "BackOff", Message: "restarting", Count: 3}}}}
+	issues := buildIssues(root, &gitopstree.ResourceTree{Summary: gitopstree.Summary{Degraded: 1}}, "argocd", r)
+	var drift, lead, summary bool
+	for _, iss := range issues {
+		switch iss.Reason {
+		case "StuckDriftLoop":
+			drift = true
+		case "PossibleCause":
+			lead = true
+		case "DegradedResources":
+			summary = true
+		}
+	}
+	if !drift {
+		t.Fatalf("fixture did not trigger the StuckDriftLoop detector, got %+v", issues)
+	}
+	if !lead || !summary {
+		t.Errorf("drift loop must suppress neither the events lead nor the degraded summary, got %+v", issues)
+	}
+}
+
+// TestBuildIssues_DegradedAppFallsBackEvenWhenEventCountIsZero pins that a
+// genuine single-occurrence Warning event isn't treated as "no signal" just
+// because it has no explicit Count — the events.k8s.io/v1 API only sets a
+// count once an event has repeated into a series, so a real, first-time
+// Warning commonly reports Count == 0 on modern clusters.
+func TestBuildIssues_DegradedAppFallsBackEvenWhenEventCountIsZero(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health": map[string]any{"status": "Degraded"},
+		"resources": []any{
+			map[string]any{
+				"group": "external-secrets.io", "kind": "ClusterSecretStore", "name": "platform-secret-store",
+				"status": "Synced",
+			},
+		},
+	})
+	r := &fakeResolver{events: map[string][]EventSummary{
+		"platform-secret-store": {
+			{Type: "Warning", Reason: "InvalidProviderConfig", Message: "no route to host", Count: 0},
+		},
+	}}
+	issues := buildIssues(root, nil, "argocd", r)
+	if len(issues) != 1 {
+		t.Fatalf("expected exactly 1 fallback issue for a zero-count Warning, got %d: %+v", len(issues), issues)
+	}
+	if issues[0].Cause != "no route to host" {
+		t.Errorf("Cause = %q, want the zero-count event's message", issues[0].Cause)
 	}
 }
 
