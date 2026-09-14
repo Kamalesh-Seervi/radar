@@ -96,6 +96,23 @@ func TestExplain(t *testing.T) {
 			effect: Admits, reason: "from addresses in 203.0.113.0/24",
 		},
 		{
+			// The reference implementation matches a pod's address against a
+			// range; Cilium by default never does. A hit on a pod source is
+			// therefore no evidence of admission.
+			name: "ipBlock containing a pod source is undecidable on ingress",
+			np: policy("monitoring", "from-pod-range", promLabels, ingressT,
+				[]networkingv1.NetworkPolicyIngressRule{{From: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.0/8"}}}}}, nil),
+			dir: DirectionIngress, sel: dst.Pod, peer: radar(), port: 9090,
+			effect: Undecidable, reason: "plugins disagree",
+		},
+		{
+			name: "ipBlock containing an unresolved pod source's address is undecidable too",
+			np: policy("monitoring", "from-pod-range", promLabels, ingressT,
+				[]networkingv1.NetworkPolicyIngressRule{{From: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.0/8"}}}}}, nil),
+			dir: DirectionIngress, sel: dst.Pod, peer: Peer{IP: "10.0.0.5"}, port: 9090,
+			effect: Undecidable, reason: "plugins disagree",
+		},
+		{
 			name: "ipBlock missing the source is undecidable on ingress",
 			np: policy("monitoring", "cidr", promLabels, ingressT,
 				[]networkingv1.NetworkPolicyIngressRule{{From: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "192.0.2.0/24"}}}}}, nil),
@@ -114,7 +131,7 @@ func TestExplain(t *testing.T) {
 			np: policy("radar", "egress-cidr", radarLabels, egressT, nil,
 				[]networkingv1.NetworkPolicyEgressRule{{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.2.0/24"}}}}}),
 			dir: DirectionEgress, sel: src.Pod, peer: dst.Peer, port: 9090,
-			effect: Undecidable, reason: "may check the Service address",
+			effect: Undecidable, reason: "plugins disagree",
 		},
 		{
 			name: "an unresolved pod peer is undecidable",
@@ -198,6 +215,13 @@ func TestExplain(t *testing.T) {
 				[]networkingv1.NetworkPolicyEgressRule{{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "203.0.113.0/24", Except: []string{"not-a-cidr"}}}}}}),
 			dir: DirectionEgress, sel: src.Pod, peer: external, port: 443,
 			effect: Undecidable, reason: "not a valid CIDR",
+		},
+		{
+			name: "a node or host-network peer is undecidable even for a rule that admits everyone",
+			np: policy("monitoring", "open", promLabels, ingressT,
+				[]networkingv1.NetworkPolicyIngressRule{{}}, nil),
+			dir: DirectionIngress, sel: dst.Pod, peer: Peer{Host: true, IP: "10.0.0.3"}, port: 9090,
+			effect: Undecidable, reason: "host network",
 		},
 		{
 			name: "hostNetwork selected pod is undecidable",
