@@ -716,7 +716,7 @@ func TestValuesPreviewApplyFailsClosedWhenDependencyBodiesUnavailable(t *testing
 		_, err := (&Client{}).chartForUpgradeTargetWithLoader(nil, rel, "1.0.4", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
 			return nil, errors.New("chart not found in configured sources")
 		})
-		if err == nil || !strings.Contains(err.Error(), "could not reconstruct complete chart umbrella version 1.0.4") {
+		if err == nil || !strings.Contains(err.Error(), "Radar could not rebuild the full chart") || !strings.Contains(err.Error(), "umbrella version 1.0.4") {
 			t.Fatalf("error = %v, want fail-closed reconstruction error", err)
 		}
 	})
@@ -725,7 +725,7 @@ func TestValuesPreviewApplyFailsClosedWhenDependencyBodiesUnavailable(t *testing
 		_, err := (&Client{}).chartForUpgradeTargetWithLoader(nil, rel, "1.0.4", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
 			return stored, nil
 		})
-		if err == nil || !strings.Contains(err.Error(), "refusing to render incomplete chart") || !strings.Contains(err.Error(), "dependency body \"child\"") {
+		if err == nil || !strings.Contains(err.Error(), "declares subcharts but does not include them") || !strings.Contains(err.Error(), "dependency body \"child\"") {
 			t.Fatalf("error = %v, want explicit missing-dependency refusal", err)
 		}
 	})
@@ -1860,4 +1860,172 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// Helm lets one vendored subchart body satisfy several dependency declarations
+// that differ only by alias: charts/redis is present once, and Chart.yaml names
+// it twice under two aliases. chartutil.ProcessDependencies clones the body per
+// alias at render time, so a complete, valid chart has fewer bodies than
+// declarations. Dependency validation must not treat a body as consumed by the
+// first declaration that matches it, or it refuses charts Helm renders happily.
+func TestValidateChartDependencyBodiesAcceptsSharedBodyAcrossAliases(t *testing.T) {
+	shared := &chart.Chart{
+		Metadata: &chart.Metadata{Name: "redis", Version: "1.0.0", Type: "application"},
+	}
+	parent := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{
+				{Name: "redis", Version: "1.0.0", Alias: "cache-a"},
+				{Name: "redis", Version: "1.0.0", Alias: "cache-b"},
+			},
+		},
+	}
+	parent.AddDependency(shared)
+
+	if got := len(parent.Dependencies()); got != 1 {
+		t.Fatalf("test precondition failed: bodies=%d, want the single vendored redis body", got)
+	}
+	if err := validateChartDependencyBodies(parent); err != nil {
+		t.Fatalf("valid chart refused: %v", err)
+	}
+}
+
+// The same shape reaches the shared selection path, so the refusal would also
+// break ordinary version upgrades and upgrade preview, not just values editing.
+func TestChartForUpgradeTargetAcceptsSharedBodyAcrossAliases(t *testing.T) {
+	shared := &chart.Chart{
+		Metadata: &chart.Metadata{Name: "redis", Version: "1.0.0", Type: "application"},
+	}
+	complete := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{
+				{Name: "redis", Version: "1.0.0", Alias: "cache-a"},
+				{Name: "redis", Version: "1.0.0", Alias: "cache-b"},
+			},
+		},
+	}
+	complete.AddDependency(shared)
+
+	rel := helmTestRelease("umbrella", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart = complete
+	client := &Client{}
+	loadCalls := 0
+	selected, err := client.chartForUpgradeTargetWithLoader(nil, rel, "", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
+		loadCalls++
+		return nil, fmt.Errorf("resolver must not be reached for a complete chart")
+	})
+	if err != nil {
+		t.Fatalf("complete aliased chart refused: %v", err)
+	}
+	if loadCalls != 0 || selected != complete {
+		t.Fatalf("loader calls=%d selected=%p, want zero calls and the stored chart %p", loadCalls, selected, complete)
+	}
+}
+
+// Reconstruction resolves by name and version only, and the values-apply path
+// passes no repository hint, so a cluster with two sources publishing the same
+// name and version can hand back a chart the release was never installed from.
+// Release storage keeps the parent's own templates, so that mismatch is
+// detectable and must fail closed rather than be applied.
+func TestChartForUpgradeTargetRefusesReconstructedChartFromWrongSource(t *testing.T) {
+	stored := roundTripStoredChart(t, valuesIsolationUmbrellaChart())
+	rel := helmTestRelease("umbrella", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart = stored
+
+	imposter := valuesIsolationUmbrellaChart()
+	for _, tpl := range imposter.Templates {
+		tpl.Data = append(tpl.Data, []byte("\n# injected by an unrelated chart of the same name and version\n")...)
+	}
+
+	client := &Client{}
+	_, err := client.chartForUpgradeTargetWithLoader(nil, rel, "", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
+		return imposter, nil
+	})
+	if err == nil {
+		t.Fatal("mismatched chart accepted; a values apply would have rendered someone else's chart")
+	}
+	if !strings.Contains(err.Error(), "does not match the chart this release was installed from") {
+		t.Fatalf("unexpected error, want the source-mismatch refusal: %v", err)
+	}
+}
+
+// The identity check is limited to what Helm leaves intact in release storage:
+// the parent's templates and values schema. Anything altered there means the
+// candidate is not the chart the release was installed from.
+func TestStoredChartMatchesReconstructedRefusesAlteredParentContent(t *testing.T) {
+	base := func() *chart.Chart {
+		return &chart.Chart{
+			Metadata: &chart.Metadata{
+				Name: "umbrella", Version: "1.0.0", Type: "application",
+				Dependencies: []*chart.Dependency{{Name: "child", Version: "2.0.0", Repository: "https://charts.example.com"}},
+			},
+			Templates: []*chart.File{{Name: "templates/parent.yaml", Data: []byte("kind: ConfigMap")}},
+			Schema:    []byte(`{"type":"object"}`),
+		}
+	}
+
+	if err := storedChartMatchesReconstructed(base(), base()); err != nil {
+		t.Fatalf("identical charts reported as different: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*chart.Chart)
+		want   string
+	}{
+		{"different parent template", func(c *chart.Chart) {
+			c.Templates = []*chart.File{{Name: "templates/parent.yaml", Data: []byte("# injected")}}
+		}, "parent template"},
+		{"different values schema", func(c *chart.Chart) { c.Schema = []byte(`{"type":"string"}`) }, "values schema"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			imposter := base()
+			tc.mutate(imposter)
+			if err := storedChartMatchesReconstructed(base(), imposter); err == nil {
+				t.Fatalf("%s accepted; a values apply would have rendered another source's chart", tc.name)
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error does not name the mismatch (want %q): %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// Helm mutates a chart on the way into release storage: it sets
+// Dependency.Enabled while resolving conditions, and it coalesces subchart
+// defaults plus a global key into the parent Values. A stored release therefore
+// never matches its own package on those fields, so the comparison must ignore
+// them or every umbrella release becomes uneditable.
+func TestStoredChartMatchesReconstructedIgnoresHelmRenderTimeMutations(t *testing.T) {
+	packaged := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{{Name: "child", Version: "2.0.0"}},
+		},
+		Values: map[string]any{"parentTag": "1.0.0"},
+	}
+	asStored := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{{Name: "child", Version: "2.0.0", Enabled: true}},
+		},
+		Values: map[string]any{
+			"parentTag": "1.0.0",
+			"child":     map[string]any{"imageTag": "2.0.0", "global": map[string]any{}},
+		},
+	}
+	if err := storedChartMatchesReconstructed(asStored, packaged); err != nil {
+		t.Fatalf("a stored release rejected against its own package: %v", err)
+	}
+}
+
+// A JSON round-trip through release storage turns YAML integers into float64.
+// The comparison must not read that as a different chart.
+func TestStoredChartMatchesReconstructedToleratesStorageRoundTrip(t *testing.T) {
+	loaded := valuesIsolationUmbrellaChart()
+	stored := roundTripStoredChart(t, loaded)
+	if err := storedChartMatchesReconstructed(stored, loaded); err != nil {
+		t.Fatalf("a chart compared against its own stored form reported as different: %v", err)
+	}
 }
