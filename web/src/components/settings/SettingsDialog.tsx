@@ -698,6 +698,8 @@ export function SettingsDialog({
                 envManaged={configData?.argoCdEnvManaged ?? false}
                 envError={configData?.argoCdEnvError}
                 cliSession={configData?.argoCdCliSession}
+                anonymous={argoSectionStatus?.connected && argoSectionStatus.anonymous}
+                active={section === 'argocd'}
                 statusReason={
                   argoSectionStatus?.configured && !argoSectionStatus.connected
                     ? argoSectionStatus.reason
@@ -716,6 +718,12 @@ export function SettingsDialog({
                       : prev
                   )
                   void refetchArgoSectionStatus()
+                  // The GitOps detail page the user came from doesn't poll
+                  // when idle; without this the notice that sent them here
+                  // would still be up when they get back.
+                  void queryClient.invalidateQueries({
+                    predicate: (query) => typeof query.queryKey[0] === 'string' && query.queryKey[0].startsWith('gitops-'),
+                  })
                 }}
               />
             </SectionPane>
@@ -1127,7 +1135,7 @@ function OverviewPanel({ active, onNavigate }: { active: boolean; onNavigate: (s
       // Configured-but-not-connected is often a permanently rejected/expired
       // token, not a transient reconnect — "Not reachable" matches Prometheus and
       // doesn't imply it will recover on its own.
-      value: argo?.connected ? 'Connected' : argo?.configured ? 'Not reachable' : 'Not connected',
+      value: argo?.connected ? (argo.anonymous ? 'Connected · no token needed' : 'Connected') : argo?.configured ? 'Not reachable' : 'Not connected',
       detail: argo?.connected ? argo.address : argo?.reason,
     },
     {
@@ -2128,6 +2136,8 @@ function ArgoCDConfigField({
   envError,
   cliSession,
   statusReason,
+  anonymous,
+  active,
   onChangeUrl,
   onChangeInsecureTls,
   onApplied,
@@ -2139,6 +2149,8 @@ function ArgoCDConfigField({
   envError?: string
   cliSession?: { server: string; user: string; insecure?: boolean }
   statusReason?: string
+  anonymous?: boolean
+  active?: boolean
   onChangeUrl: (value: string) => void
   onChangeInsecureTls: (value: boolean) => void
   onApplied?: (v: { url: string; insecureTls: boolean; tokenSet: boolean }) => void
@@ -2153,6 +2165,8 @@ function ArgoCDConfigField({
       tokenSet={tokenSet}
       cliSession={cliSession}
       statusReason={statusReason}
+      anonymous={anonymous}
+      active={active}
       onChangeUrl={onChangeUrl}
       onChangeInsecureTls={onChangeInsecureTls}
       onApplied={onApplied}
@@ -2246,6 +2260,8 @@ function ArgoCDEditableField({
   tokenSet,
   cliSession,
   statusReason,
+  anonymous,
+  active,
   onChangeUrl,
   onChangeInsecureTls,
   onApplied,
@@ -2255,6 +2271,8 @@ function ArgoCDEditableField({
   tokenSet: boolean
   cliSession?: { server: string; user: string; insecure?: boolean }
   statusReason?: string
+  anonymous?: boolean
+  active?: boolean
   onChangeUrl: (value: string) => void
   onChangeInsecureTls: (value: boolean) => void
   onApplied?: (v: { url: string; insecureTls: boolean; tokenSet: boolean }) => void
@@ -2348,20 +2366,37 @@ function ArgoCDEditableField({
 
   const showConfiguredPlaceholder = effectiveTokenSet && !tokenTouched && !tokenCleared
   const connecting = state.status === 'connecting'
+  // Opening this section with nothing set up (typically from the GitOps
+  // page's "connect Radar to your Argo CD server") starts the user at the
+  // token — unless a CLI session offers a one-click connect, or reads
+  // already work anonymously.
+  const tokenInputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (active && !effectiveTokenSet && !cliSession && !anonymous) tokenInputRef.current?.focus()
+  }, [active, effectiveTokenSet, cliSession, anonymous])
 
   return (
     <div>
       <p className="text-xs text-theme-text-tertiary mb-3">
         Connect your Argo CD server for the full Git-rendered desired-vs-live diff on GitOps
-        Application pages — what Git declares vs what's actually running. Without it, Radar falls
-        back to a lighter annotation-based drift that can miss fields.
+        Application pages — what Git declares vs what's actually running — and, on Argo CD 3, for
+        Argo's own health verdict on each resource. Without it, Radar falls back to a lighter
+        annotation-based drift that can miss fields, and to its own read of each resource.
       </p>
+
+      {anonymous && state.status !== 'connected' && (
+        <p className="mb-3 flex items-center gap-1.5 text-xs text-theme-text-secondary">
+          <Check className="w-3.5 h-3.5 shrink-0 text-green-600 dark:text-green-400/80" />
+          Your Argo CD server lets Radar read without a token, so it's already connected. Add a token only if
+          anonymous access gets restricted, or a URL to point Radar at a specific server.
+        </p>
+      )}
 
       {statusReason && state.status !== 'connected' && (
         <div className="mb-3 rounded-md border border-theme-border bg-theme-elevated p-3">
           <p className="flex items-center gap-1.5 text-sm font-medium text-warning-text">
             <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-            Argo CD token needs attention
+            Argo CD connection needs attention
           </p>
           <p className="mt-1 text-xs text-theme-text-secondary">{statusReason}</p>
         </div>
@@ -2419,6 +2454,7 @@ function ArgoCDEditableField({
       </p>
       <div className="flex items-center gap-2">
         <input
+          ref={tokenInputRef}
           type="password"
           value={showConfiguredPlaceholder ? '' : token}
           onChange={(e) => { setToken(e.target.value); setTokenTouched(true); setTokenCleared(false); clearStatus() }}

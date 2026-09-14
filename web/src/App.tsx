@@ -2351,7 +2351,9 @@ function AppInner({ manageDocumentTitle = false, documentTitleSuffix, onClusterL
               navigateToResource(resource)
             }}
             onClearNamespaces={clearAllNamespaces}
-            onOpenSettings={() => openSettings()}
+            // Every GitOps "open Settings" ask is about the Argo CD connection
+            // (diff CTA, per-resource health notice), so land on that section.
+            onOpenSettings={() => openSettings('argocd')}
           />
         )}
 

@@ -74,6 +74,12 @@ type Summary struct {
 	// RemoteDestination: the Application deploys to another cluster. Radar
 	// derives nothing about its resources from here.
 	RemoteDestination bool `json:"remoteDestination,omitempty"`
+	// ResourceHealthFromAPI: per-resource health came from the controller's
+	// API server, so in appTree mode the verdicts shown are still Argo's.
+	ResourceHealthFromAPI bool `json:"resourceHealthFromApi,omitempty"`
+	// ResourceHealthAPIError: the controller's API server was asked and
+	// didn't answer usefully — why, in the user's words.
+	ResourceHealthAPIError string `json:"resourceHealthApiError,omitempty"`
 }
 
 // IgnoredDifferencesSummary is the comparison-coverage disclosure for an Argo
@@ -380,6 +386,8 @@ func Build(root *unstructured.Unstructured, resourceTree *gitopstree.ResourceTre
 	if resourceTree != nil {
 		out.Summary.ResourceHealthMode = string(resourceTree.HealthMode)
 		out.Summary.RemoteDestination = resourceTree.RemoteDestination
+		out.Summary.ResourceHealthFromAPI = resourceTree.HealthFromAPI
+		out.Summary.ResourceHealthAPIError = resourceTree.HealthAPIError
 	}
 	return out
 }
@@ -1177,6 +1185,12 @@ func argoResourceChanges(root *unstructured.Unstructured, resourceTree *gitopstr
 		}
 		healthSource, healthReason, healthSeverity := "", "", ""
 		message := nestedMessage(m["health"])
+		// When the host filled the tree from the controller's API, that is
+		// the current verdict; a value the CR still carries inline is older.
+		fromAPI := resourceTree != nil && resourceTree.HealthFromAPI
+		if fromAPI {
+			health, message = "", ""
+		}
 		if health != "" {
 			healthSource = string(gitopstree.HealthSourceController)
 		} else if n, ok := treeHealth[healthRefKey(ref.Group, ref.Kind, ref.Namespace, ref.Name)]; ok {
